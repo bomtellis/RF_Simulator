@@ -1,0 +1,4 @@
+PySide6>=6.6
+numpy>=1.24
+ifcopenshell>=0.8.0
+shapely>=2.0
