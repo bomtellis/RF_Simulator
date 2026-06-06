@@ -2,12 +2,13 @@
 RF Attenuation Simulator - IFC Wi-Fi RSSI planning tool.
 
 Run:
-    pip install PySide6 numpy ifcopenshell shapely
+    pip install PySide6 numpy ifcopenshell shapely contourpy
     python rf_simulator.py
 """
 from __future__ import annotations
 
 import csv
+import json
 import math
 import os
 import sys
@@ -16,16 +17,23 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
+try:
+    import contourpy
+except Exception:
+    contourpy = None
+
 from PySide6.QtCore import QObject, QPointF, QRunnable, QThreadPool, Qt, Signal, Slot
-from PySide6.QtGui import QAction, QColor, QBrush, QFont, QPen, QPolygonF
+from PySide6.QtGui import QAction, QColor, QBrush, QFont, QPen, QPolygonF, QPainterPath
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QGraphicsEllipseItem,
     QGraphicsItem,
+    QGraphicsPathItem,
     QGraphicsPolygonItem,
     QGraphicsRectItem,
     QGraphicsScene,
@@ -50,7 +58,8 @@ except Exception:  # pragma: no cover
     ifcopenshell = None
 
 try:
-    from shapely.geometry import LineString, Polygon
+    from shapely.geometry import LineString, Polygon, box
+    from shapely.ops import unary_union
 except Exception as exc:  # pragma: no cover
     raise SystemExit("Install shapely: pip install shapely") from exc
 
@@ -192,6 +201,24 @@ class FloorModel:
     elevation: float
     walls: List[Wall2D] = field(default_factory=list)
     spaces: List[Space2D] = field(default_factory=list)
+    slab_attenuation_by_band_db: Dict[float, float] = field(default_factory=lambda: {2400.0: 12.0, 5000.0: 18.0, 6000.0: 22.0})
+
+    def slab_attenuation_db_for_frequency(self, frequency_mhz: float) -> float:
+        """Return floor/slab penetration attenuation for the selected band."""
+        if not self.slab_attenuation_by_band_db:
+            return 0.0
+        bands = sorted(float(k) for k in self.slab_attenuation_by_band_db.keys())
+        if frequency_mhz <= bands[0]:
+            return float(self.slab_attenuation_by_band_db[bands[0]])
+        if frequency_mhz >= bands[-1]:
+            return float(self.slab_attenuation_by_band_db[bands[-1]])
+        for lo, hi in zip(bands, bands[1:]):
+            if lo <= frequency_mhz <= hi:
+                lo_v = float(self.slab_attenuation_by_band_db[lo])
+                hi_v = float(self.slab_attenuation_by_band_db[hi])
+                t = (frequency_mhz - lo) / (hi - lo)
+                return lo_v + (hi_v - lo_v) * t
+        return float(self.slab_attenuation_by_band_db[bands[-1]])
 
 
 @dataclass
@@ -201,7 +228,105 @@ class SimulationResult:
     rssi: np.ndarray
 
 
-# ----------------------------- IFC loading -----------------------------
+@dataclass
+class RSSIZone:
+    name: str
+    min_dbm: float
+    max_dbm: float
+    colour: str
+    alpha: int = 135
+
+
+@dataclass
+class HeatmapSettings:
+    minimum_client_rssi_dbm: float = -82.0
+    # True contour levels. Positive values in the JSON are treated as RSSI magnitudes
+    # and converted to negative dBm, e.g. 70 -> -70 dBm.
+    isoline_bands_dbm: List[float] = field(default_factory=lambda: [
+        -10.0, -20.0, -30.0, -40.0, -55.0, -60.0, -65.0, -70.0,
+        -75.0, -80.0, -85.0, -90.0, -95.0, -100.0, -105.0, -110.0,
+    ])
+    # CSV pattern files can be listed in the settings file. Relative paths are
+    # resolved relative to the settings JSON location.
+    rf_pattern_files: List[str] = field(default_factory=list)
+    contour_label_font_size: int = 4
+    sample_label_font_size: int = 4
+    sample_cross_size: float = 0.22
+    sample_stride_x: int = 8
+    sample_stride_y: int = 6
+    zones: List[RSSIZone] = field(default_factory=lambda: [
+        RSSIZone("Excellent", -55.0, 0.0, "#00AA50", 135),
+        RSSIZone("Good", -67.0, -55.0, "#A0C800", 135),
+        RSSIZone("Marginal", -75.0, -67.0, "#FFAA00", 135),
+        RSSIZone("Poor", -82.0, -75.0, "#DC0000", 135),
+        RSSIZone("Disconnect", -200.0, -82.0, "#555555", 95),
+    ])
+
+    @classmethod
+    def default(cls) -> "HeatmapSettings":
+        return cls()
+
+    @classmethod
+    def _normalise_band(cls, value: float) -> float:
+        value = float(value)
+        return -abs(value) if value > 0 else value
+
+    @classmethod
+    def from_json_file(cls, path: Path) -> "HeatmapSettings":
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        minimum = float(data.get("minimum_client_rssi_dbm", data.get("disconnect_threshold_dbm", -82.0)))
+        zones = []
+        for z in data.get("zones", []):
+            zones.append(RSSIZone(
+                name=str(z.get("name", "RSSI zone")),
+                min_dbm=cls._normalise_band(float(z.get("min_dbm", -200.0))),
+                max_dbm=cls._normalise_band(float(z.get("max_dbm", 0.0))) if float(z.get("max_dbm", 0.0)) != 0.0 else 0.0,
+                colour=str(z.get("colour", z.get("color", "#555555"))),
+                alpha=int(z.get("alpha", 135)),
+            ))
+        settings = cls(minimum_client_rssi_dbm=minimum)
+        raw_bands = data.get("isoline_bands_dbm", data.get("isoline_bands", data.get("contour_bands_dbm", [])))
+        if raw_bands:
+            settings.isoline_bands_dbm = sorted(
+                {cls._normalise_band(float(v)) for v in raw_bands},
+                reverse=True,
+            )
+        settings.rf_pattern_files = [str(v) for v in data.get("rf_pattern_files", data.get("antenna_pattern_files", []))]
+        settings.contour_label_font_size = int(data.get("contour_label_font_size", 4))
+        settings.sample_label_font_size = int(data.get("sample_label_font_size", 4))
+        settings.sample_cross_size = float(data.get("sample_cross_size", 0.22))
+        settings.sample_stride_x = max(1, int(data.get("sample_stride_x", 8)))
+        settings.sample_stride_y = max(1, int(data.get("sample_stride_y", 6)))
+        if zones:
+            # Highest RSSI first, so -55 to 0 is before -67 to -55.
+            settings.zones = sorted(zones, key=lambda z: z.min_dbm, reverse=True)
+        settings.ensure_disconnect_zone()
+        return settings
+
+    def ensure_disconnect_zone(self):
+        has_disconnect = any(z.max_dbm <= self.minimum_client_rssi_dbm for z in self.zones)
+        if not has_disconnect:
+            self.zones.append(RSSIZone("Disconnect", -200.0, self.minimum_client_rssi_dbm, "#555555", 95))
+        self.zones = sorted(self.zones, key=lambda z: z.min_dbm, reverse=True)
+        self.isoline_bands_dbm = sorted({self._normalise_band(v) for v in self.isoline_bands_dbm}, reverse=True)
+
+    def zone_for_rssi(self, rssi: float) -> RSSIZone:
+        for zone in self.zones:
+            if zone.min_dbm <= rssi < zone.max_dbm:
+                return zone
+        if rssi >= max(z.max_dbm for z in self.zones):
+            return self.zones[0]
+        return self.zones[-1]
+
+    def colour_for_rssi(self, rssi: float) -> QColor:
+        zone = self.zone_for_rssi(rssi)
+        colour = QColor(zone.colour)
+        if not colour.isValid():
+            colour = QColor("#555555")
+        colour.setAlpha(zone.alpha)
+        return colour
+
 
 class IFCModelLoader:
     """Extracts storeys and wall plan polygons from an IFC file.
@@ -395,17 +520,51 @@ class CombinedIFCModel:
 # ----------------------------- RF engine -----------------------------
 
 class RFEngine:
+
     @staticmethod
-    def rssi_at(x: float, y: float, ap: AccessPoint, walls: Iterable[Wall2D], patterns: Optional[Dict[str, AntennaPattern]] = None) -> float:
+    def free_space_loss_db_at_1m(frequency_mhz: float) -> float:
+        """Free-space path loss at 1 metre for the selected Wi-Fi band.
+
+        FSPL(dB) = 32.44 + 20 log10(distance_km) + 20 log10(frequency_MHz).
+        At 1 m, distance_km is 0.001.
+        """
+        frequency_mhz = max(float(frequency_mhz), 1.0)
+        return 32.44 + 20.0 * math.log10(0.001) + 20.0 * math.log10(frequency_mhz)
+    @staticmethod
+    def rssi_at(
+        x: float,
+        y: float,
+        receiver_floor: FloorModel,
+        ap: AccessPoint,
+        floors: Dict[str, FloorModel],
+        patterns: Optional[Dict[str, AntennaPattern]] = None,
+        include_inter_floor: bool = True,
+    ) -> float:
+        """Calculate RSSI at a receiver point on receiver_floor.
+
+        This is a 3D link-budget approximation. For same-floor links it behaves
+        like the original model. For inter-floor links it adds:
+        - vertical separation between AP mounting height and receiver height;
+        - floor/slab penetration loss for every storey boundary crossed;
+        - wall intersections on both the AP floor and receiver floor.
+        """
+        ap_floor = floors.get(ap.floor)
+        if ap_floor is None:
+            return -120.0
+        if ap.floor != receiver_floor.name and not include_inter_floor:
+            return -120.0
+
         horizontal_d = max(math.hypot(x - ap.x, y - ap.y), 0.1)
-        dz = float(ap.mount_height_m) - float(ap.rx_height_m)
+        ap_z = float(ap_floor.elevation) + float(ap.mount_height_m)
+        rx_z = float(receiver_floor.elevation) + float(ap.rx_height_m)
+        dz = ap_z - rx_z
         d_3d = max(math.hypot(horizontal_d, dz), 1.0)
         reference_loss = RFEngine.free_space_loss_db_at_1m(ap.frequency_mhz)
         path_loss = reference_loss + 10.0 * ap.path_loss_exponent * math.log10(d_3d)
 
         bearing = math.degrees(math.atan2(y - ap.y, x - ap.x))
         az_rel = AntennaPattern._wrap_deg(bearing - ap.azimuth_deg)
-        elev_angle = math.degrees(math.atan2((ap.rx_height_m - ap.mount_height_m), horizontal_d))
+        elev_angle = math.degrees(math.atan2((rx_z - ap_z), horizontal_d))
         elev_rel = elev_angle + ap.downtilt_deg
         pattern_gain = 0.0
         if patterns:
@@ -415,32 +574,66 @@ class RFEngine:
 
         line = LineString([(ap.x, ap.y), (x, y)])
         wall_loss = 0.0
-        for wall in walls:
-            if wall.polygon.intersects(line):
+        checked_wall_guids = set()
+        for wall in receiver_floor.walls:
+            if wall.guid not in checked_wall_guids and wall.polygon.intersects(line):
                 wall_loss += wall.attenuation_db_for_frequency(ap.frequency_mhz)
-        return ap.tx_power_dbm + pattern_gain - path_loss - wall_loss
+                checked_wall_guids.add(wall.guid)
+        if ap_floor.name != receiver_floor.name:
+            for wall in ap_floor.walls:
+                if wall.guid not in checked_wall_guids and wall.polygon.intersects(line):
+                    wall_loss += wall.attenuation_db_for_frequency(ap.frequency_mhz)
+                    checked_wall_guids.add(wall.guid)
+
+        floor_loss = RFEngine.floor_penetration_loss_db(receiver_floor, ap_floor, floors, ap.frequency_mhz)
+        return ap.tx_power_dbm + pattern_gain - path_loss - wall_loss - floor_loss
 
     @staticmethod
-    def free_space_loss_db_at_1m(frequency_mhz: float) -> float:
-        # FSPL(dB) = 32.44 + 20log10(f_MHz) + 20log10(d_km).
-        # At 1 m, d_km = 0.001, so this becomes -27.56 + 20log10(f_MHz).
-        return -27.56 + 20.0 * math.log10(max(frequency_mhz, 1.0))
+    def floor_penetration_loss_db(receiver_floor: FloorModel, ap_floor: FloorModel, floors: Dict[str, FloorModel], frequency_mhz: float) -> float:
+        if receiver_floor.name == ap_floor.name:
+            return 0.0
+        ordered = sorted(floors.values(), key=lambda f: (f.elevation, f.name))
+        try:
+            rx_i = next(i for i, f in enumerate(ordered) if f.name == receiver_floor.name)
+            ap_i = next(i for i, f in enumerate(ordered) if f.name == ap_floor.name)
+        except StopIteration:
+            # Fallback when floor references are incomplete: one slab loss per
+            # approximate 3.5 m of vertical separation, minimum one slab.
+            crossed = max(1, int(round(abs(receiver_floor.elevation - ap_floor.elevation) / 3.5)))
+            return crossed * receiver_floor.slab_attenuation_db_for_frequency(frequency_mhz)
+        lo, hi = sorted((rx_i, ap_i))
+        crossed_boundaries = ordered[lo + 1:hi + 1]
+        if not crossed_boundaries:
+            crossed_boundaries = [receiver_floor]
+        return sum(f.slab_attenuation_db_for_frequency(frequency_mhz) for f in crossed_boundaries)
 
     @staticmethod
-    def simulate(floor: FloorModel, aps: List[AccessPoint], resolution_m: float = 2.0, patterns: Optional[Dict[str, AntennaPattern]] = None) -> Optional[SimulationResult]:
-        if not floor.walls or not aps:
+    def simulate(
+        floor: FloorModel,
+        floors: Dict[str, FloorModel],
+        aps: List[AccessPoint],
+        resolution_m: float = 2.0,
+        patterns: Optional[Dict[str, AntennaPattern]] = None,
+        include_inter_floor: bool = True,
+    ) -> Optional[SimulationResult]:
+        if not floor.walls and not floor.spaces:
+            return None
+        if not aps:
             return None
         bounds = RFEngine._floor_bounds(floor, aps)
         minx, miny, maxx, maxy = bounds
         xs = np.arange(minx, maxx + resolution_m, resolution_m)
         ys = np.arange(miny, maxy + resolution_m, resolution_m)
         grid = np.full((len(ys), len(xs)), -120.0)
-        floor_aps = [a for a in aps if a.floor == floor.name]
-        if not floor_aps:
+        candidate_aps = [a for a in aps if include_inter_floor or a.floor == floor.name]
+        if not candidate_aps:
             return None
         for iy, yy in enumerate(ys):
             for ix, xx in enumerate(xs):
-                grid[iy, ix] = max(RFEngine.rssi_at(xx, yy, ap, floor.walls, patterns) for ap in floor_aps)
+                grid[iy, ix] = max(
+                    RFEngine.rssi_at(xx, yy, floor, ap, floors, patterns, include_inter_floor)
+                    for ap in candidate_aps
+                )
         return SimulationResult(xs=xs, ys=ys, rssi=grid)
 
     @staticmethod
@@ -525,8 +718,17 @@ class MainWindow(QMainWindow):
         self._load_errors: List[str] = []
         self._loading_replace = False
         self._loading_active = False
+        self.heatmap_settings = HeatmapSettings.default()
+        self.heatmap_settings_path: Optional[Path] = None
 
         self.view = PlanView(self)
+        self.rssi_legend = QLabel()
+        self.rssi_legend.setWordWrap(True)
+        self.rssi_legend.setMinimumHeight(72)
+        self.rssi_legend.setTextFormat(Qt.RichText)
+        self.rssi_legend.setStyleSheet(
+            "QLabel { background: #f6f6f6; border-top: 1px solid #b8b8b8; padding: 8px; }"
+        )
         self.floor_combo = QComboBox()
         self.wall_table = QTableWidget(0, 7)
         self.wall_table.setHorizontalHeaderLabels([
@@ -580,6 +782,25 @@ class MainWindow(QMainWindow):
         self.ple = QDoubleSpinBox()
         self.ple.setRange(1.6, 5.0)
         self.ple.setValue(2.2)
+        self.min_client_rssi = QDoubleSpinBox()
+        self.min_client_rssi.setRange(-100.0, -40.0)
+        self.min_client_rssi.setValue(self.heatmap_settings.minimum_client_rssi_dbm)
+        self.min_client_rssi.setSuffix(" dBm")
+        self.min_client_rssi.valueChanged.connect(self._minimum_rssi_changed)
+        self.include_inter_floor = QCheckBox("Include APs from other floors")
+        self.include_inter_floor.setChecked(True)
+        self.slab_att_24 = QDoubleSpinBox()
+        self.slab_att_24.setRange(0.0, 80.0)
+        self.slab_att_24.setValue(12.0)
+        self.slab_att_24.setSuffix(" dB")
+        self.slab_att_5 = QDoubleSpinBox()
+        self.slab_att_5.setRange(0.0, 80.0)
+        self.slab_att_5.setValue(18.0)
+        self.slab_att_5.setSuffix(" dB")
+        self.slab_att_6 = QDoubleSpinBox()
+        self.slab_att_6.setRange(0.0, 80.0)
+        self.slab_att_6.setValue(22.0)
+        self.slab_att_6.setSuffix(" dB")
 
         controls = QWidget()
         form = QFormLayout(controls)
@@ -593,6 +814,11 @@ class MainWindow(QMainWindow):
         form.addRow("AP mount height", self.mount_height)
         form.addRow("Receiver height", self.rx_height)
         form.addRow("Path loss exponent", self.ple)
+        form.addRow("Client disconnect RSSI", self.min_client_rssi)
+        form.addRow("Inter-floor RF", self.include_inter_floor)
+        form.addRow("Slab loss 2.4 GHz", self.slab_att_24)
+        form.addRow("Slab loss 5 GHz", self.slab_att_5)
+        form.addRow("Slab loss 6 GHz", self.slab_att_6)
         form.addRow(QLabel("Double-click the model to place an AP using the selected pattern/orientation."))
 
         side = QWidget()
@@ -603,11 +829,19 @@ class MainWindow(QMainWindow):
         side_layout.addWidget(QLabel("Wall attenuation values"))
         side_layout.addWidget(self.wall_table)
 
+        model_panel = QWidget()
+        model_layout = QVBoxLayout(model_panel)
+        model_layout.setContentsMargins(0, 0, 0, 0)
+        model_layout.setSpacing(0)
+        model_layout.addWidget(self.view, 1)
+        model_layout.addWidget(self.rssi_legend, 0)
+
         split = QSplitter()
-        split.addWidget(self.view)
+        split.addWidget(model_panel)
         split.addWidget(side)
         split.setSizes([1000, 400])
         self.setCentralWidget(split)
+        self._update_rssi_legend()
 
         tb = QToolBar("Main")
         self.addToolBar(tb)
@@ -623,8 +857,11 @@ class MainWindow(QMainWindow):
         self.clear_ap_action.triggered.connect(self.clear_aps)
         self.load_pattern_action = QAction("Load pattern CSV", self)
         self.load_pattern_action.triggered.connect(self.load_pattern_csv)
-        tb.addActions([self.open_action, self.add_action, self.sim_action, self.export_action, self.clear_ap_action, self.load_pattern_action])
+        self.load_heatmap_settings_action = QAction("Load heatmap settings", self)
+        self.load_heatmap_settings_action.triggered.connect(self.load_heatmap_settings)
+        tb.addActions([self.open_action, self.add_action, self.sim_action, self.export_action, self.clear_ap_action, self.load_pattern_action, self.load_heatmap_settings_action])
         self.floor_combo.currentTextChanged.connect(self.select_floor)
+        self.include_inter_floor.stateChanged.connect(lambda *_: self.draw_floor())
 
     def open_ifc(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "Open IFC file(s)", "", "IFC files (*.ifc);;All files (*.*)")
@@ -732,6 +969,7 @@ class MainWindow(QMainWindow):
     def select_floor(self, name: str):
         self.floor = self.floors.get(name)
         self.last_result = None
+        self._load_slab_attenuation_to_ui()
         self.draw_floor()
         self.populate_ap_table()
         self.populate_wall_table()
@@ -800,46 +1038,277 @@ class MainWindow(QMainWindow):
             item.setZValue(10)
             item.setFlag(QGraphicsItem.ItemIsSelectable, True)
             scene.addItem(item)
-        for ap in [a for a in self.aps if a.floor == self.floor.name]:
-            dot = QGraphicsEllipseItem(ap.x - 0.75, ap.y - 0.75, 1.5, 1.5)
-            dot.setBrush(QBrush(QColor(0, 80, 255)))
+        visible_aps = [a for a in self.aps if a.floor == self.floor.name or self.include_inter_floor.isChecked()]
+        for ap in visible_aps:
+            same_floor = ap.floor == self.floor.name
+            radius = 0.75 if same_floor else 0.45
+            colour = QColor(0, 80, 255) if same_floor else QColor(120, 0, 180)
+            dot = QGraphicsEllipseItem(ap.x - radius, ap.y - radius, radius * 2.0, radius * 2.0)
+            dot.setBrush(QBrush(colour))
             dot.setPen(QPen(QColor(0, 0, 80), 0.2))
+            dot.setZValue(30 if same_floor else 25)
             scene.addItem(dot)
             # Draw a short boresight arrow so directional antenna orientation can be checked.
-            length = 5.0
+            length = 5.0 if same_floor else 3.0
             ang = math.radians(ap.azimuth_deg)
             x2 = ap.x + length * math.cos(ang)
             y2 = ap.y + length * math.sin(ang)
-            scene.addLine(ap.x, ap.y, x2, y2, QPen(QColor(0, 80, 255), 0.25))
+            scene.addLine(ap.x, ap.y, x2, y2, QPen(colour, 0.25))
+            if not same_floor:
+                label = QGraphicsSimpleTextItem(ap.floor)
+                label.setBrush(QBrush(colour))
+                label.setFont(QFont("Arial", 7))
+                label.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
+                label.setZValue(31)
+                label.setPos(QPointF(ap.x + 0.8, ap.y + 0.8))
+                scene.addItem(label)
         scene.setSceneRect(scene.itemsBoundingRect().adjusted(-10, -10, 10, 10))
         self.view.fitInView(scene.sceneRect(), Qt.KeepAspectRatio)
 
     def _draw_heatmap(self, result: SimulationResult):
+        """Draw smooth filled RSSI contours, isolines and sampled RSSI points.
+
+        contourpy is used so the coloured fill follows the interpolated contour
+        boundary rather than being drawn as square grid-cell blocks. Text sizes
+        and sample marker size are controlled by rf_heatmap_settings.json.
+        """
         scene = self.view.scene()
         if len(result.xs) < 2 or len(result.ys) < 2:
             return
-        dx = float(result.xs[1] - result.xs[0])
-        dy = float(result.ys[1] - result.ys[0])
-        for iy, y in enumerate(result.ys):
-            for ix, x in enumerate(result.xs):
-                val = float(result.rssi[iy, ix])
-                c = self._rssi_colour(val)
-                rect = QGraphicsRectItem(x - dx / 2, y - dy / 2, dx, dy)
-                rect.setBrush(QBrush(c))
-                rect.setPen(Qt.NoPen)
-                rect.setZValue(-10)
-                scene.addItem(rect)
+        if contourpy is None:
+            QMessageBox.warning(self, "Missing dependency", "contourpy is required for smooth filled contours. Run: pip install contourpy")
+            return
 
-    @staticmethod
-    def _rssi_colour(rssi: float) -> QColor:
-        # Blue/green/yellow/red style without external colormaps.
-        if rssi >= -55:
-            return QColor(0, 170, 80, 120)
-        if rssi >= -67:
-            return QColor(160, 200, 0, 120)
-        if rssi >= -75:
-            return QColor(255, 170, 0, 120)
-        return QColor(220, 0, 0, 120)
+        grid = np.asarray(result.rssi, dtype=float)
+        rows, cols = grid.shape
+        if rows < 2 or cols < 2:
+            return
+
+        levels = sorted({float(v) for v in self.heatmap_settings.isoline_bands_dbm}, reverse=True)
+        if not levels:
+            return
+
+        finite = grid[np.isfinite(grid)]
+        if finite.size == 0:
+            return
+        data_min = float(np.nanmin(finite))
+        data_max = float(np.nanmax(finite))
+        fill_low = min(data_min, min(levels)) - 0.1
+        fill_high = max(data_max, max(levels)) + 0.1
+
+        try:
+            cg = contourpy.contour_generator(
+                x=np.asarray(result.xs, dtype=float),
+                y=np.asarray(result.ys, dtype=float),
+                z=grid,
+                name="serial",
+                line_type=contourpy.LineType.Separate,
+                fill_type=contourpy.FillType.OuterOffset,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Contour generation failed", str(exc))
+            return
+
+        def path_from_outer_offset(polygons, offsets) -> QPainterPath:
+            path = QPainterPath()
+            for points, offs in zip(polygons, offsets):
+                if points is None or offs is None:
+                    continue
+                pts = np.asarray(points, dtype=float)
+                off = np.asarray(offs, dtype=int)
+                for i in range(len(off) - 1):
+                    ring = pts[off[i]:off[i + 1]]
+                    if len(ring) < 3:
+                        continue
+                    path.moveTo(QPointF(float(ring[0, 0]), float(ring[0, 1])))
+                    for x, y in ring[1:]:
+                        path.lineTo(QPointF(float(x), float(y)))
+                    path.closeSubpath()
+            return path
+
+        def add_filled_band(lower: float, upper: float, colour_ref: float):
+            if upper <= data_min or lower >= data_max:
+                return
+            lower_c = max(lower, fill_low)
+            upper_c = min(upper, fill_high)
+            if upper_c <= lower_c:
+                return
+            try:
+                polygons, offsets = cg.filled(lower_c, upper_c)
+            except Exception:
+                return
+            path = path_from_outer_offset(polygons, offsets)
+            if path.isEmpty():
+                return
+            item = QGraphicsPathItem(path)
+            item.setBrush(QBrush(self.heatmap_settings.colour_for_rssi(colour_ref)))
+            item.setPen(QPen(Qt.NoPen))
+            item.setZValue(-20)
+            scene.addItem(item)
+
+        # Smooth filled bands between configured isoline thresholds.
+        bounds = [fill_low] + sorted(levels) + [fill_high]
+        for lower, upper in zip(bounds[:-1], bounds[1:]):
+            add_filled_band(lower, upper, (lower + upper) / 2.0)
+
+        contour_font_size = max(1, int(self.heatmap_settings.contour_label_font_size))
+        contour_label_limit = 5
+        contour_min_spacing = 18.0
+
+        for level in levels:
+            if level < data_min or level > data_max:
+                continue
+            line_colour = self.heatmap_settings.colour_for_rssi(level)
+            line_colour.setAlpha(245)
+            pen = QPen(line_colour, 0.36)
+            pen.setCosmetic(True)
+            pen.setStyle(Qt.SolidLine)
+
+            try:
+                lines = cg.lines(level)
+            except Exception:
+                continue
+
+            label_positions: List[Tuple[float, float]] = []
+            labels_on_level = 0
+            for line in lines:
+                pts = np.asarray(line, dtype=float)
+                if len(pts) < 2:
+                    continue
+                path = QPainterPath(QPointF(float(pts[0, 0]), float(pts[0, 1])))
+                for x, y in pts[1:]:
+                    path.lineTo(QPointF(float(x), float(y)))
+                item = QGraphicsPathItem(path)
+                item.setPen(pen)
+                item.setBrush(QBrush(Qt.NoBrush))
+                item.setZValue(-4)
+                scene.addItem(item)
+
+                if labels_on_level >= contour_label_limit:
+                    continue
+                seg = np.diff(pts, axis=0)
+                seg_len = np.hypot(seg[:, 0], seg[:, 1])
+                total_len = float(np.sum(seg_len))
+                if total_len < 4.0:
+                    continue
+                target = total_len * 0.5
+                acc = 0.0
+                chosen = None
+                for i, length in enumerate(seg_len):
+                    if acc + length >= target and length > 0:
+                        t = (target - acc) / length
+                        x = pts[i, 0] + (pts[i + 1, 0] - pts[i, 0]) * t
+                        y = pts[i, 1] + (pts[i + 1, 1] - pts[i, 1]) * t
+                        angle = math.degrees(math.atan2(seg[i, 1], seg[i, 0]))
+                        chosen = (float(x), float(y), angle)
+                        break
+                    acc += float(length)
+                if chosen is None:
+                    continue
+                x, y, angle = chosen
+                if any(math.hypot(x - px, y - py) < contour_min_spacing for px, py in label_positions):
+                    continue
+                label = QGraphicsSimpleTextItem(f"{level:.0f} dBm")
+                label.setBrush(QBrush(QColor(15, 15, 15)))
+                label.setFont(QFont("Arial", contour_font_size, QFont.Bold))
+                label.setZValue(-2)
+                label.setPos(QPointF(x, y))
+                label.setRotation(angle)
+                scene.addItem(label)
+                label_positions.append((x, y))
+                labels_on_level += 1
+
+        # Small blue + markers showing sample locations only.
+        stride_x = max(1, int(self.heatmap_settings.sample_stride_x))
+        stride_y = max(1, int(self.heatmap_settings.sample_stride_y))
+        sample_font_size = max(1, int(self.heatmap_settings.sample_label_font_size))
+        cross_size = max(0.05, float(self.heatmap_settings.sample_cross_size))
+        sample_pen = QPen(QColor(0, 80, 255), 0.0)
+        sample_pen.setCosmetic(True)
+        for iy in range(0, rows, stride_y):
+            for ix in range(0, cols, stride_x):
+                rssi = float(grid[iy, ix])
+                if not math.isfinite(rssi):
+                    continue
+                x = float(result.xs[ix])
+                y = float(result.ys[iy])
+                h = scene.addLine(x - cross_size, y, x + cross_size, y, sample_pen)
+                vline = scene.addLine(x, y - cross_size, x, y + cross_size, sample_pen)
+                h.setZValue(35)
+                vline.setZValue(35)
+                label = QGraphicsSimpleTextItem(f"{rssi:.0f} dBm")
+                label.setBrush(QBrush(QColor(0, 80, 255)))
+                label.setFont(QFont("Arial", sample_font_size))
+                label.setZValue(36)
+                label.setPos(QPointF(x + cross_size * 1.8, y + cross_size * 1.2))
+                scene.addItem(label)
+
+    def _update_rssi_legend(self):
+        """Render the RSSI zone key in a fixed panel below the IFC view.
+
+        The legend is deliberately outside the QGraphicsScene so it does not
+        pan/zoom with the IFC model and does not obscure floor geometry.
+        """
+        if not hasattr(self, "rssi_legend"):
+            return
+        if not self.heatmap_settings.zones:
+            self.rssi_legend.setText("<b>RSSI zones</b>: no heatmap settings loaded")
+            return
+
+        band_text = ", ".join(f"{v:.0f}" for v in self.heatmap_settings.isoline_bands_dbm)
+        pattern_count = len(self.heatmap_settings.rf_pattern_files)
+        pieces = [
+            f"<b>RSSI isolines</b> &nbsp; "
+            f"<span style='color:#555;'>Bands: {band_text} dBm. "
+            f"Clients disconnect below {self.heatmap_settings.minimum_client_rssi_dbm:.0f} dBm. "
+            f"Pattern files in settings: {pattern_count}</span>"
+        ]
+        for zone in self.heatmap_settings.zones:
+            colour = QColor(zone.colour)
+            if not colour.isValid():
+                colour = QColor("#555555")
+            fg = "#ffffff" if colour.lightness() < 130 else "#202020"
+            pieces.append(
+                "<span style='display:inline-block; margin-left:10px; "
+                f"padding:3px 7px; border:1px solid #666; background:{colour.name()}; color:{fg};'>"
+                f"{zone.name}: {zone.min_dbm:.0f} to {zone.max_dbm:.0f} dBm"
+                "</span>"
+            )
+        self.rssi_legend.setText(" &nbsp; ".join(pieces))
+
+    def _rssi_colour(self, rssi: float) -> QColor:
+        return self.heatmap_settings.colour_for_rssi(rssi)
+
+    def _minimum_rssi_changed(self, value: float):
+        self.heatmap_settings.minimum_client_rssi_dbm = float(value)
+        self.heatmap_settings.ensure_disconnect_zone()
+        self._update_rssi_legend()
+        if self.last_result is not None:
+            self.draw_floor()
+
+    def load_heatmap_settings(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Load heatmap settings", "rf_heatmap_settings.json", "JSON files (*.json);;All files (*.*)")
+        if not path:
+            return
+        try:
+            self.heatmap_settings = HeatmapSettings.from_json_file(Path(path))
+            self.heatmap_settings_path = Path(path)
+            self.min_client_rssi.blockSignals(True)
+            self.min_client_rssi.setValue(self.heatmap_settings.minimum_client_rssi_dbm)
+            self.min_client_rssi.blockSignals(False)
+            loaded_patterns = []
+            base_dir = Path(path).parent
+            for pattern_file in self.heatmap_settings.rf_pattern_files:
+                pattern_path = Path(pattern_file)
+                if not pattern_path.is_absolute():
+                    pattern_path = base_dir / pattern_path
+                loaded_patterns.append(self.load_pattern_csv_path(pattern_path))
+            self._update_rssi_legend()
+            self.draw_floor()
+            extra = f"\nLoaded RF pattern files: {', '.join(loaded_patterns)}" if loaded_patterns else ""
+            QMessageBox.information(self, "Heatmap settings loaded", f"Loaded RSSI isoline settings from {Path(path).name}{extra}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Heatmap settings failed", str(exc))
 
     def populate_ap_table(self):
         self.ap_table.blockSignals(True)
@@ -920,19 +1389,79 @@ class MainWindow(QMainWindow):
                 wall.attenuation_by_band_db[float(band)] = val
                 break
 
+    def _sync_slab_attenuation_from_ui(self):
+        if not self.floor:
+            return
+        self.floor.slab_attenuation_by_band_db = {
+            2400.0: float(self.slab_att_24.value()),
+            5000.0: float(self.slab_att_5.value()),
+            6000.0: float(self.slab_att_6.value()),
+        }
+
+    def _load_slab_attenuation_to_ui(self):
+        if not self.floor:
+            return
+        self.slab_att_24.blockSignals(True)
+        self.slab_att_5.blockSignals(True)
+        self.slab_att_6.blockSignals(True)
+        self.slab_att_24.setValue(float(self.floor.slab_attenuation_by_band_db.get(2400.0, 12.0)))
+        self.slab_att_5.setValue(float(self.floor.slab_attenuation_by_band_db.get(5000.0, 18.0)))
+        self.slab_att_6.setValue(float(self.floor.slab_attenuation_by_band_db.get(6000.0, 22.0)))
+        self.slab_att_24.blockSignals(False)
+        self.slab_att_5.blockSignals(False)
+        self.slab_att_6.blockSignals(False)
+
     def simulate(self):
         if not self.floor:
             return
-        floor_aps = [a for a in self.aps if a.floor == self.floor.name]
-        if not floor_aps:
+        self._sync_slab_attenuation_from_ui()
+        if not self.aps:
             QMessageBox.information(self, "No APs", "Double-click the floor plan to place at least one AP.")
             return
-        for ap in floor_aps:
+        for ap in self.aps:
             ap.path_loss_exponent = float(self.ple.value())
             # Keep per-AP TX/frequency/pattern edits from the AP table.
             ap.rx_height_m = float(self.rx_height.value())
-        self.last_result = RFEngine.simulate(self.floor, self.aps, self.resolution.value(), self.antenna_patterns)
+        self.last_result = RFEngine.simulate(
+            self.floor,
+            self.floors,
+            self.aps,
+            self.resolution.value(),
+            self.antenna_patterns,
+            include_inter_floor=self.include_inter_floor.isChecked(),
+        )
         self.draw_floor()
+
+    def load_pattern_csv_path(self, path: Path) -> str:
+        """Load one antenna pattern CSV and return the pattern name."""
+        azimuth_points: List[Tuple[float, float]] = []
+        elevation_points: List[Tuple[float, float]] = []
+        with open(path, "r", newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                plane = (row.get("plane") or "").strip().lower()
+                angle = float(row.get("angle_deg") or row.get("angle") or 0.0)
+                gain = float(row.get("gain_dbi") or row.get("gain") or 0.0)
+                if plane.startswith("az"):
+                    azimuth_points.append((angle, gain))
+                elif plane.startswith("el"):
+                    elevation_points.append((angle, gain))
+        if not azimuth_points and not elevation_points:
+            raise ValueError(f"No azimuth/elevation points found in {path}")
+        name = path.stem
+        peak = max([g for _, g in azimuth_points + elevation_points] or [0.0])
+        self.antenna_patterns[name] = AntennaPattern(
+            name=name,
+            peak_gain_dbi=peak,
+            azimuth_points=azimuth_points,
+            elevation_points=elevation_points,
+        )
+        if hasattr(self, "pattern_combo"):
+            current = self.pattern_combo.currentText()
+            self.pattern_combo.clear()
+            self.pattern_combo.addItems(list(self.antenna_patterns.keys()))
+            self.pattern_combo.setCurrentText(current if current in self.antenna_patterns else name)
+        return name
 
     def load_pattern_csv(self):
         """Load a manufacturer-style antenna pattern CSV.
@@ -944,26 +1473,8 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Load antenna pattern CSV", "", "CSV files (*.csv);;All files (*.*)")
         if not path:
             return
-        azimuth_points: List[Tuple[float, float]] = []
-        elevation_points: List[Tuple[float, float]] = []
         try:
-            with open(path, "r", newline="", encoding="utf-8-sig") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    plane = (row.get("plane") or "").strip().lower()
-                    angle = float(row.get("angle_deg") or row.get("angle") or 0.0)
-                    gain = float(row.get("gain_dbi") or row.get("gain") or 0.0)
-                    if plane.startswith("az"):
-                        azimuth_points.append((angle, gain))
-                    elif plane.startswith("el"):
-                        elevation_points.append((angle, gain))
-            if not azimuth_points and not elevation_points:
-                raise ValueError("No azimuth/elevation points found")
-            name = Path(path).stem
-            peak = max([g for _, g in azimuth_points + elevation_points] or [0.0])
-            self.antenna_patterns[name] = AntennaPattern(name=name, peak_gain_dbi=peak, azimuth_points=azimuth_points, elevation_points=elevation_points)
-            self.pattern_combo.clear()
-            self.pattern_combo.addItems(list(self.antenna_patterns.keys()))
+            name = self.load_pattern_csv_path(Path(path))
             self.pattern_combo.setCurrentText(name)
             QMessageBox.information(self, "Pattern loaded", f"Loaded antenna pattern: {name}")
         except Exception as exc:
@@ -978,10 +1489,12 @@ class MainWindow(QMainWindow):
             return
         with open(path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["x", "y", "frequency_mhz", "rssi_dbm", "ap_count", "patterns_used"])
+            writer.writerow(["floor", "x", "y", "frequency_mhz", "rssi_dbm", "rssi_zone", "client_connected", "disconnect_threshold_dbm", "ap_count", "include_inter_floor", "slab_loss_24_db", "slab_loss_5_db", "slab_loss_6_db", "patterns_used"])
             for iy, y in enumerate(self.last_result.ys):
                 for ix, x in enumerate(self.last_result.xs):
-                    writer.writerow([x, y, float(self.freq.value()), float(self.last_result.rssi[iy, ix]), len([a for a in self.aps if self.floor and a.floor == self.floor.name]), ";".join(sorted({a.antenna_pattern for a in self.aps if self.floor and a.floor == self.floor.name}))])
+                    rssi = float(self.last_result.rssi[iy, ix])
+                    zone = self.heatmap_settings.zone_for_rssi(rssi)
+                    writer.writerow([self.floor.name if self.floor else "", x, y, float(self.freq.value()), rssi, zone.name, rssi >= self.heatmap_settings.minimum_client_rssi_dbm, self.heatmap_settings.minimum_client_rssi_dbm, len(self.aps), self.include_inter_floor.isChecked(), float(self.slab_att_24.value()), float(self.slab_att_5.value()), float(self.slab_att_6.value()), ";".join(sorted({a.antenna_pattern for a in self.aps}))])
 
 
 def main():
