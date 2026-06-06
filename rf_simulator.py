@@ -18,12 +18,16 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 try:
+    from scipy.ndimage import zoom as scipy_zoom
+except Exception:
+    scipy_zoom = None
+try:
     import contourpy
 except Exception:
     contourpy = None
 
 from PySide6.QtCore import QObject, QPointF, QRunnable, QThreadPool, Qt, Signal, Slot
-from PySide6.QtGui import QAction, QColor, QBrush, QFont, QPen, QPolygonF, QPainterPath
+from PySide6.QtGui import QAction, QColor, QBrush, QFont, QPen, QPolygonF, QPainterPath, QPalette, QTransform
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -249,9 +253,76 @@ class HeatmapSettings:
     # CSV pattern files can be listed in the settings file. Relative paths are
     # resolved relative to the settings JSON location.
     rf_pattern_files: List[str] = field(default_factory=list)
-    contour_label_font_size: int = 4
-    sample_label_font_size: int = 4
-    sample_cross_size: float = 0.22
+    # Text uses model-scaled scene units so it zooms naturally with the IFC view.
+    # The numeric font sizes below are small logical sizes which are multiplied
+    # by text_model_scale before drawing. Increase text_model_scale if labels
+    # are too small at your normal zoom level.
+    contour_label_font_size: int = 6
+    sample_label_font_size: int = 5
+    space_label_font_size: int = 7
+    ap_label_font_size: int = 7
+    text_model_scale: float = 0.035
+    sample_cross_size: float = 0.08
+    contour_line_width: float = 1.25
+    contour_line_cosmetic: bool = True
+    contour_line_colour: str = "#111111"
+    contour_line_colour_light: str = "#111111"
+    contour_line_colour_dark: str = "#FFFFFF"
+    contour_line_alpha: int = 255
+    use_band_colour_for_contour_lines: bool = False
+    sample_cross_line_width: float = 1.0
+    wall_line_width: float = 0.18
+
+    # All non-RSSI-band display colours are configurable in the settings JSON.
+    # Both British (colour) and US (color) spellings are accepted when loading.
+    colours_light: Dict[str, str] = field(default_factory=lambda: {
+        "background": "#FAFAFA",
+        "legend_background": "#F5F5F5",
+        "legend_text": "#202020",
+        "legend_border": "#BBBBBB",
+        "space_pen": "#5F5F5F",
+        "space_fill": "#E1E1E1",
+        "space_text": "#282828",
+        "wall_pen": "#191919",
+        "ifc_wall_fill": "#D7D7D7",
+        "ifc_linked_wall_fill": "#B9C3CD",
+        "contour_text": "#141414",
+        "sample_cross": "#0055FF",
+        "sample_text": "#0055FF",
+        "ap_same_floor": "#0050FF",
+        "ap_other_floor": "#7800B4",
+        "ap_outline": "#000050"
+    })
+    colours_dark: Dict[str, str] = field(default_factory=lambda: {
+        "background": "#2A2A2A",
+        "legend_background": "#2F2F2F",
+        "legend_text": "#EEEEEE",
+        "legend_border": "#555555",
+        "space_pen": "#969696",
+        "space_fill": "#3A3A3A",
+        "space_text": "#DCDCDC",
+        "wall_pen": "#EBEBEB",
+        "ifc_wall_fill": "#1E1E1E",
+        "ifc_linked_wall_fill": "#414146",
+        "contour_text": "#F0F0F0",
+        "sample_cross": "#55A0FF",
+        "sample_text": "#55A0FF",
+        "ap_same_floor": "#4D8DFF",
+        "ap_other_floor": "#C77DFF",
+        "ap_outline": "#D8E4FF"
+    })
+    alpha_light: Dict[str, int] = field(default_factory=lambda: {
+        "space_fill": 45,
+        "ifc_wall_fill": 255,
+        "ifc_linked_wall_fill": 255
+    })
+    alpha_dark: Dict[str, int] = field(default_factory=lambda: {
+        "space_fill": 38,
+        "ifc_wall_fill": 255,
+        "ifc_linked_wall_fill": 255
+    })
+
+    contour_interpolation_factor: int = 4
     sample_stride_x: int = 8
     sample_stride_y: int = 6
     zones: List[RSSIZone] = field(default_factory=lambda: [
@@ -293,9 +364,43 @@ class HeatmapSettings:
                 reverse=True,
             )
         settings.rf_pattern_files = [str(v) for v in data.get("rf_pattern_files", data.get("antenna_pattern_files", []))]
-        settings.contour_label_font_size = int(data.get("contour_label_font_size", 4))
-        settings.sample_label_font_size = int(data.get("sample_label_font_size", 4))
-        settings.sample_cross_size = float(data.get("sample_cross_size", 0.22))
+        # Font sizes are logical values converted to model-scaled scene text.
+        # Text follows the view transform, so it enlarges when zooming in.
+        settings.contour_label_font_size = int(data.get("contour_label_font_size", 6))
+        settings.sample_label_font_size = int(data.get("sample_label_font_size", 5))
+        settings.space_label_font_size = int(data.get("space_label_font_size", 7))
+        settings.ap_label_font_size = int(data.get("ap_label_font_size", 7))
+        settings.text_model_scale = float(data.get("text_model_scale", 0.035))
+        settings.sample_cross_size = float(data.get("sample_cross_size", 0.08))
+        settings.contour_line_width = float(data.get("contour_line_width", 1.25))
+        settings.contour_line_cosmetic = bool(data.get("contour_line_cosmetic", True))
+        settings.contour_line_colour = str(data.get("contour_line_colour", data.get("contour_line_color", "#111111")))
+        settings.contour_line_colour_light = str(data.get("contour_line_colour_light", data.get("contour_line_color_light", settings.contour_line_colour)))
+        settings.contour_line_colour_dark = str(data.get("contour_line_colour_dark", data.get("contour_line_color_dark", "#FFFFFF")))
+        settings.contour_line_alpha = int(data.get("contour_line_alpha", 255))
+        settings.use_band_colour_for_contour_lines = bool(data.get("use_band_colour_for_contour_lines", False))
+        settings.sample_cross_line_width = float(data.get("sample_cross_line_width", 1.0))
+        settings.wall_line_width = float(data.get("wall_line_width", 0.18))
+
+        # Display colours. Supports either:
+        #   "colours": {"light": {...}, "dark": {...}, "alpha_light": {...}, "alpha_dark": {...}}
+        # or US spelling "colors". Top-level legacy keys still work for contour lines.
+        colour_block = data.get("colours", data.get("colors", {}))
+        if isinstance(colour_block, dict):
+            light = colour_block.get("light", colour_block.get("Light", {}))
+            dark = colour_block.get("dark", colour_block.get("Dark", {}))
+            alpha_light = colour_block.get("alpha_light", colour_block.get("light_alpha", {}))
+            alpha_dark = colour_block.get("alpha_dark", colour_block.get("dark_alpha", {}))
+            if isinstance(light, dict):
+                settings.colours_light.update({str(k): str(v) for k, v in light.items()})
+            if isinstance(dark, dict):
+                settings.colours_dark.update({str(k): str(v) for k, v in dark.items()})
+            if isinstance(alpha_light, dict):
+                settings.alpha_light.update({str(k): int(v) for k, v in alpha_light.items()})
+            if isinstance(alpha_dark, dict):
+                settings.alpha_dark.update({str(k): int(v) for k, v in alpha_dark.items()})
+
+        settings.contour_interpolation_factor = max(1, int(data.get("contour_interpolation_factor", 4)))
         settings.sample_stride_x = max(1, int(data.get("sample_stride_x", 8)))
         settings.sample_stride_y = max(1, int(data.get("sample_stride_y", 6)))
         if zones:
@@ -325,6 +430,38 @@ class HeatmapSettings:
         if not colour.isValid():
             colour = QColor("#555555")
         colour.setAlpha(zone.alpha)
+        return colour
+
+    def contour_line_qcolour(self, rssi: float, dark_theme: bool = False) -> QColor:
+        """Return the independent contour boundary colour.
+
+        By default this deliberately does not use the filled band colour, because
+        matching the line to the fill can make isolines invisible. Set
+        use_band_colour_for_contour_lines=true in the settings JSON if you want
+        the old behaviour.
+        """
+        if self.use_band_colour_for_contour_lines:
+            colour = self.colour_for_rssi(rssi)
+            colour.setAlpha(max(0, min(255, int(self.contour_line_alpha))))
+            return colour
+        colour_name = self.contour_line_colour_dark if dark_theme else self.contour_line_colour_light
+        if not colour_name:
+            colour_name = self.contour_line_colour
+        colour = QColor(colour_name)
+        if not colour.isValid():
+            colour = QColor("#111111")
+        colour.setAlpha(max(0, min(255, int(self.contour_line_alpha))))
+        return colour
+
+    def display_qcolour(self, key: str, dark_theme: bool = False, fallback: str = "#000000") -> QColor:
+        """Return a configured display colour by key for the current theme."""
+        palette = self.colours_dark if dark_theme else self.colours_light
+        alpha_map = self.alpha_dark if dark_theme else self.alpha_light
+        colour = QColor(str(palette.get(key, fallback)))
+        if not colour.isValid():
+            colour = QColor(fallback)
+        if key in alpha_map:
+            colour.setAlpha(max(0, min(255, int(alpha_map[key]))))
         return colour
 
 
@@ -678,6 +815,19 @@ class IFCLoadWorker(QRunnable):
         except Exception as exc:
             self.signals.error.emit(self.path, str(exc))
 
+# ----------------------------- Drawing layers -----------------------------
+# Higher z-values are drawn above lower z-values. Keep heatmap colour below IFC
+# geometry, but keep contour boundaries, sample markers and text readable above it.
+Z_HEATMAP_FILL = -30
+Z_IFC_SPACE_FILL = -20
+Z_IFC_SPACE_OUTLINE = -10
+Z_IFC_WALL = 0
+Z_CONTOUR_LINE = 20
+Z_SAMPLE_MARK = 30
+Z_TEXT = 40
+Z_AP = 50
+Z_AP_LABEL = 55
+
 # ----------------------------- GUI -----------------------------
 
 class PlanView(QGraphicsView):
@@ -687,6 +837,8 @@ class PlanView(QGraphicsView):
         self.setScene(QGraphicsScene(self))
         self.setRenderHints(self.renderHints())
         self.setDragMode(QGraphicsView.ScrollHandDrag)
+        # Keep cosmetic pens and device-independent text crisp on high-DPI screens.
+        self.setOptimizationFlag(QGraphicsView.DontAdjustForAntialiasing, False)
         self.setMouseTracking(True)
         self.scale(1, -1)  # IFC Y-up style plan view
 
@@ -720,15 +872,14 @@ class MainWindow(QMainWindow):
         self._loading_active = False
         self.heatmap_settings = HeatmapSettings.default()
         self.heatmap_settings_path: Optional[Path] = None
+        self.dark_theme = self._detect_dark_theme()
 
         self.view = PlanView(self)
         self.rssi_legend = QLabel()
         self.rssi_legend.setWordWrap(True)
         self.rssi_legend.setMinimumHeight(72)
         self.rssi_legend.setTextFormat(Qt.RichText)
-        self.rssi_legend.setStyleSheet(
-            "QLabel { background: #f6f6f6; border-top: 1px solid #b8b8b8; padding: 8px; }"
-        )
+        self._apply_theme_styles()
         self.floor_combo = QComboBox()
         self.wall_table = QTableWidget(0, 7)
         self.wall_table.setHorizontalHeaderLabels([
@@ -749,15 +900,15 @@ class MainWindow(QMainWindow):
         self.ap_table.itemChanged.connect(self._ap_table_changed)
 
         self.resolution = QDoubleSpinBox()
-        self.resolution.setRange(0.5, 10.0)
-        self.resolution.setValue(2.0)
+        self.resolution.setRange(0.3, 10.0)
+        self.resolution.setValue(0.3)
         self.resolution.setSuffix(" m")
         self.tx_power = QDoubleSpinBox()
         self.tx_power.setRange(-10.0, 40.0)
-        self.tx_power.setValue(20.0)
+        self.tx_power.setValue(17.0)
         self.tx_power.setSuffix(" dBm")
         self.freq = QDoubleSpinBox()
-        self.freq.setRange(2400.0, 7125.0)
+        self.freq.setRange(433.0, 7125.0)
         self.freq.setValue(2400.0)
         self.freq.setSingleStep(100.0)
         self.freq.setSuffix(" MHz")
@@ -862,6 +1013,119 @@ class MainWindow(QMainWindow):
         tb.addActions([self.open_action, self.add_action, self.sim_action, self.export_action, self.clear_ap_action, self.load_pattern_action, self.load_heatmap_settings_action])
         self.floor_combo.currentTextChanged.connect(self.select_floor)
         self.include_inter_floor.stateChanged.connect(lambda *_: self.draw_floor())
+
+    def _detect_dark_theme(self) -> bool:
+        """Return True when the active Qt/OS palette appears to be dark."""
+        app = QApplication.instance()
+        palette = app.palette() if app is not None else self.palette()
+        window_colour = palette.color(QPalette.Window)
+        luminance = (0.299 * window_colour.red() + 0.587 * window_colour.green() + 0.114 * window_colour.blue())
+        return luminance < 128
+
+    def _theme_colours(self) -> Dict[str, QColor]:
+        """Colours used by the scene, loaded from rf_heatmap_settings.json."""
+        dark = bool(getattr(self, "dark_theme", False))
+        hs = getattr(self, "heatmap_settings", HeatmapSettings.default())
+        return {
+            "background": hs.display_qcolour("background", dark, "#2A2A2A" if dark else "#FAFAFA"),
+            "legend_background": hs.display_qcolour("legend_background", dark, "#2F2F2F" if dark else "#F5F5F5"),
+            "legend_text": hs.display_qcolour("legend_text", dark, "#EEEEEE" if dark else "#202020"),
+            "legend_border": hs.display_qcolour("legend_border", dark, "#555555" if dark else "#BBBBBB"),
+            "space_pen": hs.display_qcolour("space_pen", dark, "#969696" if dark else "#5F5F5F"),
+            "space_fill": hs.display_qcolour("space_fill", dark, "#3A3A3A" if dark else "#E1E1E1"),
+            "space_text": hs.display_qcolour("space_text", dark, "#DCDCDC" if dark else "#282828"),
+            "wall_pen": hs.display_qcolour("wall_pen", dark, "#EBEBEB" if dark else "#191919"),
+            "wall_fill": hs.display_qcolour("ifc_wall_fill", dark, "#1E1E1E" if dark else "#D7D7D7"),
+            "wall_alt_fill": hs.display_qcolour("ifc_linked_wall_fill", dark, "#414146" if dark else "#B9C3CD"),
+            "contour_text": hs.display_qcolour("contour_text", dark, "#F0F0F0" if dark else "#141414"),
+            "sample_cross": hs.display_qcolour("sample_cross", dark, "#55A0FF" if dark else "#0055FF"),
+            "sample_text": hs.display_qcolour("sample_text", dark, "#55A0FF" if dark else "#0055FF"),
+            "ap_same_floor": hs.display_qcolour("ap_same_floor", dark, "#4D8DFF" if dark else "#0050FF"),
+            "ap_other_floor": hs.display_qcolour("ap_other_floor", dark, "#C77DFF" if dark else "#7800B4"),
+            "ap_outline": hs.display_qcolour("ap_outline", dark, "#D8E4FF" if dark else "#000050"),
+        }
+
+    def _apply_theme_styles(self):
+        """Apply non-scene styling that depends on the OS theme."""
+        colours = self._theme_colours()
+        if hasattr(self, "view") and self.view.scene() is not None:
+            self.view.scene().setBackgroundBrush(QBrush(colours["background"]))
+        if hasattr(self, "rssi_legend"):
+            self.rssi_legend.setStyleSheet(
+                "QLabel {{ background: {bg}; color: {fg}; border-top: 1px solid {border}; padding: 4px; }}".format(
+                    bg=colours["legend_background"].name(),
+                    fg=colours["legend_text"].name(),
+                    border=colours["legend_border"].name(),
+                )
+            )
+
+    def _normalise_text_angle(self, angle_deg: float) -> float:
+        """Keep text rotation readable on screen.
+
+        The scene is displayed with a flipped Y axis to make IFC plans appear the
+        right way up. Text ignores the view transform, so any optional line-label
+        rotation must be clamped in screen space instead of model space.
+        """
+        angle = float(angle_deg or 0.0)
+        while angle <= -180.0:
+            angle += 360.0
+        while angle > 180.0:
+            angle -= 360.0
+        if angle > 90.0:
+            angle -= 180.0
+        elif angle < -90.0:
+            angle += 180.0
+        return angle
+
+    def _font_point_size(self, configured_size: int) -> float:
+        """Return a small logical font size before model scaling.
+
+        Text is intentionally allowed to follow the QGraphicsView transform so
+        it grows when the user zooms in and shrinks when they zoom out.  The
+        separate text_model_scale setting converts the Qt font glyph size into
+        sensible IFC/model units so labels are not building-sized.
+        """
+        return max(1.0, float(configured_size))
+
+    def _add_upright_text(self, scene: QGraphicsScene, text: str, x: float, y: float, colour: QColor,
+                          font_size: int, z_value: float, bold: bool = False, rotation_deg: float = 0.0):
+        """Add model-scaled text that zooms with the plan but remains upright.
+
+        The view uses ``scale(1, -1)`` so normal text would be mirrored/upside
+        down.  Each text item is locally flipped in Y to cancel the view flip.
+        Unlike the previous patch, the item does *not* use
+        ItemIgnoresTransformations; therefore camera zoom behaves naturally and
+        makes labels larger when zooming in.
+        """
+        item = QGraphicsSimpleTextItem(text)
+        font = QFont(QApplication.font())
+        font.setPointSizeF(self._font_point_size(font_size))
+        font.setBold(bool(bold))
+        item.setFont(font)
+        item.setBrush(QBrush(colour))
+        item.setZValue(z_value)
+        item.setFlag(QGraphicsItem.ItemIsSelectable, False)
+        item.setAcceptedMouseButtons(Qt.NoButton)
+        scene.addItem(item)
+
+        rect = item.boundingRect()
+        scale = max(0.001, float(getattr(self.heatmap_settings, "text_model_scale", 0.035)))
+        angle = self._normalise_text_angle(rotation_deg)
+
+        # Build a local transform about the text centre:
+        #   1. move to desired scene position,
+        #   2. scale the glyph dimensions down to model units,
+        #   3. rotate if this is a contour label,
+        #   4. flip in local Y so the global view flip does not invert the text,
+        #   5. centre the text on the requested point.
+        t = QTransform()
+        t.translate(float(x), float(y))
+        t.scale(scale, scale)
+        t.rotate(angle)
+        t.scale(1.0, -1.0)
+        t.translate(-rect.width() / 2.0, -rect.height() / 2.0)
+        item.setTransform(t)
+        return item
 
     def open_ifc(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "Open IFC file(s)", "", "IFC files (*.ifc);;All files (*.*)")
@@ -1009,70 +1273,72 @@ class MainWindow(QMainWindow):
         if self.last_result:
             self._draw_heatmap(self.last_result)
 
+        colours = self._theme_colours()
         # Draw spaces/floor areas with a stronger outline and subtle fill so the
         # extent of the floor remains readable even before a simulation is run.
         for space in self.floor.spaces:
             coords = list(space.polygon.exterior.coords)
             poly = QPolygonF([QPointF(x, y) for x, y in coords])
             item = QGraphicsPolygonItem(poly)
-            item.setPen(QPen(QColor(70, 110, 160), 0.35))
-            item.setBrush(QBrush(QColor(210, 230, 250, 55)))
+            pen = QPen(colours["space_pen"], 0.12)
+            pen.setCosmetic(True)
+            item.setPen(pen)
+            item.setBrush(QBrush(colours["space_fill"]))
+            item.setZValue(Z_IFC_SPACE_FILL)
             scene.addItem(item)
 
             if space.name:
                 centroid = space.polygon.representative_point()
-                label = QGraphicsSimpleTextItem(str(space.name))
-                label.setBrush(QBrush(QColor(25, 45, 70)))
-                label.setFont(QFont("Arial", 8))
-                label.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
-                label.setZValue(20)
-                label.setPos(QPointF(centroid.x(), centroid.y()))
-                scene.addItem(label)
+                self._add_upright_text(
+                    scene, str(space.name), centroid.x(), centroid.y(),
+                    colours["space_text"], self.heatmap_settings.space_label_font_size, Z_TEXT, bold=True
+                )
 
         for wall in self.floor.walls:
             coords = list(wall.polygon.exterior.coords)
             poly = QPolygonF([QPointF(x, y) for x, y in coords])
             item = QGraphicsPolygonItem(poly)
-            item.setPen(QPen(QColor(20, 20, 20), 0.45))
-            item.setBrush(QBrush(QColor(105, 105, 105, 215)))
-            item.setZValue(10)
+            wall_pen = QPen(colours["wall_pen"], self.heatmap_settings.wall_line_width)
+            wall_pen.setCosmetic(True)
+            item.setPen(wall_pen)
+            fill_key = "wall_alt_fill" if wall.source_file else "wall_fill"
+            item.setBrush(QBrush(colours[fill_key]))
+            item.setZValue(Z_IFC_WALL)
             item.setFlag(QGraphicsItem.ItemIsSelectable, True)
             scene.addItem(item)
         visible_aps = [a for a in self.aps if a.floor == self.floor.name or self.include_inter_floor.isChecked()]
         for ap in visible_aps:
             same_floor = ap.floor == self.floor.name
             radius = 0.75 if same_floor else 0.45
-            colour = QColor(0, 80, 255) if same_floor else QColor(120, 0, 180)
+            colour = colours["ap_same_floor"] if same_floor else colours["ap_other_floor"]
             dot = QGraphicsEllipseItem(ap.x - radius, ap.y - radius, radius * 2.0, radius * 2.0)
             dot.setBrush(QBrush(colour))
-            dot.setPen(QPen(QColor(0, 0, 80), 0.2))
-            dot.setZValue(30 if same_floor else 25)
+            dot.setPen(QPen(colours["ap_outline"], 0.2))
+            dot.setZValue(Z_AP if same_floor else Z_AP - 5)
             scene.addItem(dot)
             # Draw a short boresight arrow so directional antenna orientation can be checked.
             length = 5.0 if same_floor else 3.0
             ang = math.radians(ap.azimuth_deg)
             x2 = ap.x + length * math.cos(ang)
             y2 = ap.y + length * math.sin(ang)
-            scene.addLine(ap.x, ap.y, x2, y2, QPen(colour, 0.25))
+            arrow = scene.addLine(ap.x, ap.y, x2, y2, QPen(colour, 0.25))
+            arrow.setZValue(Z_AP)
             if not same_floor:
-                label = QGraphicsSimpleTextItem(ap.floor)
-                label.setBrush(QBrush(colour))
-                label.setFont(QFont("Arial", 7))
-                label.setFlag(QGraphicsItem.ItemIgnoresTransformations, True)
-                label.setZValue(31)
-                label.setPos(QPointF(ap.x + 0.8, ap.y + 0.8))
-                scene.addItem(label)
+                self._add_upright_text(scene, ap.floor, ap.x + 0.8, ap.y + 0.8, colour, self.heatmap_settings.ap_label_font_size, Z_AP_LABEL)
         scene.setSceneRect(scene.itemsBoundingRect().adjusted(-10, -10, 10, 10))
         self.view.fitInView(scene.sceneRect(), Qt.KeepAspectRatio)
 
     def _draw_heatmap(self, result: SimulationResult):
         """Draw smooth filled RSSI contours, isolines and sampled RSSI points.
 
-        contourpy is used so the coloured fill follows the interpolated contour
-        boundary rather than being drawn as square grid-cell blocks. Text sizes
-        and sample marker size are controlled by rf_heatmap_settings.json.
+        The filled colour now follows interpolated contour polygons rather than
+        square grid cells. scipy is used, when available, to upsample the RSSI
+        grid before contourpy generates the filled bands and contour lines.
+        Text is drawn as screen-sized upright text so it does not become huge or
+        upside down when the IFC view is zoomed/flipped.
         """
         scene = self.view.scene()
+        colours = self._theme_colours()
         if len(result.xs) < 2 or len(result.ys) < 2:
             return
         if contourpy is None:
@@ -1084,11 +1350,30 @@ class MainWindow(QMainWindow):
         if rows < 2 or cols < 2:
             return
 
+        factor = max(1, int(getattr(self.heatmap_settings, "contour_interpolation_factor", 4)))
+        xs = np.asarray(result.xs, dtype=float)
+        ys = np.asarray(result.ys, dtype=float)
+        z = grid
+        if factor > 1:
+            fine_xs = np.linspace(float(xs[0]), float(xs[-1]), (len(xs) - 1) * factor + 1)
+            fine_ys = np.linspace(float(ys[0]), float(ys[-1]), (len(ys) - 1) * factor + 1)
+            if scipy_zoom is not None:
+                z = scipy_zoom(grid, (factor, factor), order=3)
+                # scipy_zoom can produce one or two extra samples depending on shape.
+                z = z[:len(fine_ys), :len(fine_xs)]
+                if z.shape != (len(fine_ys), len(fine_xs)):
+                    z = np.resize(z, (len(fine_ys), len(fine_xs)))
+            else:
+                # Fallback: two-pass linear interpolation using numpy only.
+                temp = np.vstack([np.interp(fine_xs, xs, row) for row in grid])
+                z = np.vstack([np.interp(fine_ys, ys, temp[:, ix]) for ix in range(temp.shape[1])]).T
+            xs, ys = fine_xs, fine_ys
+
         levels = sorted({float(v) for v in self.heatmap_settings.isoline_bands_dbm}, reverse=True)
         if not levels:
             return
 
-        finite = grid[np.isfinite(grid)]
+        finite = z[np.isfinite(z)]
         if finite.size == 0:
             return
         data_min = float(np.nanmin(finite))
@@ -1098,9 +1383,9 @@ class MainWindow(QMainWindow):
 
         try:
             cg = contourpy.contour_generator(
-                x=np.asarray(result.xs, dtype=float),
-                y=np.asarray(result.ys, dtype=float),
-                z=grid,
+                x=xs,
+                y=ys,
+                z=z,
                 name="serial",
                 line_type=contourpy.LineType.Separate,
                 fill_type=contourpy.FillType.OuterOffset,
@@ -1143,25 +1428,30 @@ class MainWindow(QMainWindow):
             item = QGraphicsPathItem(path)
             item.setBrush(QBrush(self.heatmap_settings.colour_for_rssi(colour_ref)))
             item.setPen(QPen(Qt.NoPen))
-            item.setZValue(-20)
+            item.setZValue(Z_HEATMAP_FILL)
             scene.addItem(item)
 
-        # Smooth filled bands between configured isoline thresholds.
         bounds = [fill_low] + sorted(levels) + [fill_high]
         for lower, upper in zip(bounds[:-1], bounds[1:]):
             add_filled_band(lower, upper, (lower + upper) / 2.0)
 
         contour_font_size = max(1, int(self.heatmap_settings.contour_label_font_size))
-        contour_label_limit = 5
-        contour_min_spacing = 18.0
+        contour_label_limit = 3
+        contour_min_spacing = 35.0
+        line_width = max(0.01, float(getattr(self.heatmap_settings, "contour_line_width", 1.25)))
+        contour_line_cosmetic = bool(getattr(self.heatmap_settings, "contour_line_cosmetic", True))
+        # Cosmetic pens use screen pixels. Values below 1 px can disappear on
+        # some Qt backends, which made the contour lines look as though they
+        # were hidden even when their z-order was correct.
+        if contour_line_cosmetic:
+            line_width = max(1.0, line_width)
 
         for level in levels:
             if level < data_min or level > data_max:
                 continue
-            line_colour = self.heatmap_settings.colour_for_rssi(level)
-            line_colour.setAlpha(245)
-            pen = QPen(line_colour, 0.36)
-            pen.setCosmetic(True)
+            line_colour = self.heatmap_settings.contour_line_qcolour(level, bool(getattr(self, "dark_theme", False)))
+            pen = QPen(line_colour, line_width)
+            pen.setCosmetic(contour_line_cosmetic)
             pen.setStyle(Qt.SolidLine)
 
             try:
@@ -1181,7 +1471,7 @@ class MainWindow(QMainWindow):
                 item = QGraphicsPathItem(path)
                 item.setPen(pen)
                 item.setBrush(QBrush(Qt.NoBrush))
-                item.setZValue(-4)
+                item.setZValue(Z_CONTOUR_LINE)
                 scene.addItem(item)
 
                 if labels_on_level >= contour_label_limit:
@@ -1189,7 +1479,7 @@ class MainWindow(QMainWindow):
                 seg = np.diff(pts, axis=0)
                 seg_len = np.hypot(seg[:, 0], seg[:, 1])
                 total_len = float(np.sum(seg_len))
-                if total_len < 4.0:
+                if total_len < 6.0:
                     continue
                 target = total_len * 0.5
                 acc = 0.0
@@ -1208,22 +1498,21 @@ class MainWindow(QMainWindow):
                 x, y, angle = chosen
                 if any(math.hypot(x - px, y - py) < contour_min_spacing for px, py in label_positions):
                     continue
-                label = QGraphicsSimpleTextItem(f"{level:.0f} dBm")
-                label.setBrush(QBrush(QColor(15, 15, 15)))
-                label.setFont(QFont("Arial", contour_font_size, QFont.Bold))
-                label.setZValue(-2)
-                label.setPos(QPointF(x, y))
-                label.setRotation(angle)
-                scene.addItem(label)
+                self._add_upright_text(
+                    scene, f"{level:.0f} dBm", x, y, colours["contour_text"],
+                    contour_font_size, Z_TEXT, bold=True, rotation_deg=angle
+                )
                 label_positions.append((x, y))
                 labels_on_level += 1
 
-        # Small blue + markers showing sample locations only.
+        # Small blue + markers showing the original sample locations only.
         stride_x = max(1, int(self.heatmap_settings.sample_stride_x))
         stride_y = max(1, int(self.heatmap_settings.sample_stride_y))
         sample_font_size = max(1, int(self.heatmap_settings.sample_label_font_size))
-        cross_size = max(0.05, float(self.heatmap_settings.sample_cross_size))
-        sample_pen = QPen(QColor(0, 80, 255), 0.0)
+        cross_size = max(0.01, float(self.heatmap_settings.sample_cross_size))
+        sample_colour = colours["sample_text"]
+        sample_cross_colour = colours["sample_cross"]
+        sample_pen = QPen(sample_cross_colour, max(1.0, float(getattr(self.heatmap_settings, "sample_cross_line_width", 1.0))))
         sample_pen.setCosmetic(True)
         for iy in range(0, rows, stride_y):
             for ix in range(0, cols, stride_x):
@@ -1234,14 +1523,12 @@ class MainWindow(QMainWindow):
                 y = float(result.ys[iy])
                 h = scene.addLine(x - cross_size, y, x + cross_size, y, sample_pen)
                 vline = scene.addLine(x, y - cross_size, x, y + cross_size, sample_pen)
-                h.setZValue(35)
-                vline.setZValue(35)
-                label = QGraphicsSimpleTextItem(f"{rssi:.0f} dBm")
-                label.setBrush(QBrush(QColor(0, 80, 255)))
-                label.setFont(QFont("Arial", sample_font_size))
-                label.setZValue(36)
-                label.setPos(QPointF(x + cross_size * 1.8, y + cross_size * 1.2))
-                scene.addItem(label)
+                h.setZValue(Z_SAMPLE_MARK)
+                vline.setZValue(Z_SAMPLE_MARK)
+                self._add_upright_text(
+                    scene, f"{rssi:.0f} dBm", x + cross_size * 1.8, y + cross_size * 1.2,
+                    sample_colour, sample_font_size, Z_TEXT
+                )
 
     def _update_rssi_legend(self):
         """Render the RSSI zone key in a fixed panel below the IFC view.
@@ -1255,12 +1542,15 @@ class MainWindow(QMainWindow):
             self.rssi_legend.setText("<b>RSSI zones</b>: no heatmap settings loaded")
             return
 
+        colours = self._theme_colours()
         band_text = ", ".join(f"{v:.0f}" for v in self.heatmap_settings.isoline_bands_dbm)
         pattern_count = len(self.heatmap_settings.rf_pattern_files)
+        legend_text = colours["legend_text"].name()
+        legend_border = colours["legend_border"].name()
         pieces = [
             f"<b>RSSI isolines</b> &nbsp; "
-            f"<span style='color:#555;'>Bands: {band_text} dBm. "
-            f"Clients disconnect below {self.heatmap_settings.minimum_client_rssi_dbm:.0f} dBm. "
+            f"<span style='color:{legend_text};'>Bands: {band_text} dBm. "
+            f"Clients disconnect below {self.heatmap_settings.minimum_client_rssi_dbm:.0f} dBm. <br/>"
             f"Pattern files in settings: {pattern_count}</span>"
         ]
         for zone in self.heatmap_settings.zones:
@@ -1270,7 +1560,7 @@ class MainWindow(QMainWindow):
             fg = "#ffffff" if colour.lightness() < 130 else "#202020"
             pieces.append(
                 "<span style='display:inline-block; margin-left:10px; "
-                f"padding:3px 7px; border:1px solid #666; background:{colour.name()}; color:{fg};'>"
+                f"padding:3px 7px; border:1px solid {legend_border}; background:{colour.name()}; color:{fg};'>"
                 f"{zone.name}: {zone.min_dbm:.0f} to {zone.max_dbm:.0f} dBm"
                 "</span>"
             )

@@ -27,40 +27,101 @@
       "min_dbm": -55,
       "max_dbm": 0,
       "colour": "#00AA50",
-      "alpha": 230
+      "alpha": 220
     },
     {
       "name": "Good",
       "min_dbm": -67,
       "max_dbm": -55,
       "colour": "#A0C800",
-      "alpha": 230
+      "alpha": 220
     },
     {
       "name": "Marginal",
       "min_dbm": -75,
       "max_dbm": -67,
       "colour": "#FFAA00",
-      "alpha": 230
+      "alpha": 220
     },
     {
       "name": "Poor",
       "min_dbm": -82,
       "max_dbm": -75,
       "colour": "#DC0000",
-      "alpha": 230
+      "alpha": 220
     },
     {
       "name": "Disconnect",
       "min_dbm": -200,
       "max_dbm": -82,
       "colour": "#555555",
-      "alpha": 210
+      "alpha": 185
     }
   ],
-  "contour_label_font_size": 0.01,
-  "sample_label_font_size": 0.01,
-  "sample_cross_size": 0.22,
+  "contour_interpolation_factor": 4,
+  "contour_line_width": 1.25,
+  "wall_line_width": 0.06,
+  "contour_label_font_size": 3,
+  "sample_label_font_size": 2,
+  "space_label_font_size": 4,
+  "ap_label_font_size": 4,
+  "sample_cross_size": 0.02,
   "sample_stride_x": 8,
-  "sample_stride_y": 6
+  "sample_stride_y": 6,
+  "text_model_scale": 0.02,
+  "contour_line_colour": "#111111",
+  "contour_line_alpha": 255,
+  "use_band_colour_for_contour_lines": false,
+  "contour_line_cosmetic": true,
+  "sample_cross_line_width": 1.0,
+  "contour_line_colour_light": "#111111",
+  "contour_line_colour_dark": "#FFFFFF",
+  "colours": {
+    "light": {
+      "background": "#FAFAFA",
+      "legend_background": "#F5F5F5",
+      "legend_text": "#202020",
+      "legend_border": "#BBBBBB",
+      "space_pen": "#5F5F5F",
+      "space_fill": "#E1E1E1",
+      "space_text": "#282828",
+      "wall_pen": "#191919",
+      "ifc_wall_fill": "#D7D7D7",
+      "ifc_linked_wall_fill": "#B9C3CD",
+      "contour_text": "#141414",
+      "sample_cross": "#0055FF",
+      "sample_text": "#0055FF",
+      "ap_same_floor": "#0050FF",
+      "ap_other_floor": "#7800B4",
+      "ap_outline": "#000050"
+    },
+    "dark": {
+      "background": "#2A2A2A",
+      "legend_background": "#2F2F2F",
+      "legend_text": "#EEEEEE",
+      "legend_border": "#555555",
+      "space_pen": "#969696",
+      "space_fill": "#3A3A3A",
+      "space_text": "#DCDCDC",
+      "wall_pen": "#EBEBEB",
+      "ifc_wall_fill": "#1E1E1E",
+      "ifc_linked_wall_fill": "#414146",
+      "contour_text": "#F0F0F0",
+      "sample_cross": "#55A0FF",
+      "sample_text": "#55A0FF",
+      "ap_same_floor": "#4D8DFF",
+      "ap_other_floor": "#C77DFF",
+      "ap_outline": "#D8E4FF"
+    },
+    "alpha_light": {
+      "space_fill": 45,
+      "ifc_wall_fill": 255,
+      "ifc_linked_wall_fill": 255
+    },
+    "alpha_dark": {
+      "space_fill": 38,
+      "ifc_wall_fill": 255,
+      "ifc_linked_wall_fill": 255
+    }
+  }
 }
