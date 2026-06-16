@@ -8,9 +8,12 @@ Run:
 from __future__ import annotations
 
 import csv
+import concurrent.futures
 import json
 import math
+import multiprocessing
 import os
+from rf_dxf_prealign import DxfPreAlignDialog, SimilarityTransform2D, two_point_transform
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,12 +29,14 @@ try:
 except Exception:
     contourpy = None
 
-from PySide6.QtCore import QObject, QPointF, QRunnable, QThreadPool, Qt, Signal, Slot
+from PySide6.QtCore import QPointF, Qt, Slot, QTimer
 from PySide6.QtGui import QAction, QColor, QBrush, QFont, QPen, QPolygonF, QPainterPath, QPalette, QTransform
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -47,12 +52,15 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
-        QSplitter,
+    QProgressDialog,
+    QPushButton,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QToolBar,
     QVBoxLayout,
     QWidget,
+    QProgressDialog,
 )
 
 try:
@@ -62,8 +70,14 @@ except Exception:  # pragma: no cover
     ifcopenshell = None
 
 try:
+    import ezdxf
+except Exception:  # pragma: no cover
+    ezdxf = None
+
+try:
     from shapely.geometry import LineString, Polygon, box
     from shapely.ops import unary_union
+    from shapely.affinity import affine_transform
 except Exception as exc:  # pragma: no cover
     raise SystemExit("Install shapely: pip install shapely") from exc
 
@@ -79,6 +93,19 @@ class Wall2D:
     type_name: str
     material: str
     polygon: Polygon
+    # Vertical extent in project/model metres. IFC containment often assigns an
+    # element to only one storey, but shafts, curtain walls, risers and facade
+    # elements may physically span several storeys. These values allow the UI
+    # and RF engine to include the same construction on every floor it crosses.
+    z_min: float = 0.0
+    z_max: float = 0.0
+    source_storey: str = ""
+    # True when the object has been projected onto this floor because it forms
+    # part of the building envelope and physically spans several storeys.
+    # Normal internal walls/partitions/spaces remain visible only on their
+    # assigned storey to avoid cluttering every floor view.
+    projected_to_floor: bool = False
+    envelope_wall: bool = False
     attenuation_by_band_db: Dict[float, float] = field(default_factory=lambda: {2400.0: 5.0, 5000.0: 7.0, 6000.0: 8.0})
 
     @property
@@ -174,11 +201,30 @@ def built_in_antenna_patterns() -> Dict[str, AntennaPattern]:
 
 
 @dataclass
+class APRadio:
+    """One RF radio fitted to an AP.
+
+    A physical access point can expose several radios, for example 2.4 GHz,
+    5 GHz and 6 GHz Wi-Fi, or non-Wi-Fi planning bands such as 433 MHz and
+    868 MHz. Each radio has its own link budget and antenna pattern.
+    """
+
+    name: str = "Radio-1"
+    frequency_mhz: float = 2400.0
+    tx_power_dbm: float = 20.0
+    antenna_pattern: str = "Omni ceiling AP"
+    enabled: bool = True
+    cutoff_radius_m: float = 0.0  # 0 means use settings/default; samples outside this radius are disconnected/skipped
+
+
+@dataclass
 class AccessPoint:
     name: str
     x: float
     y: float
     floor: str
+    # Legacy/default radio fields are retained for backwards compatibility with
+    # existing saved APs and older table-edit logic. New calculations use radios.
     tx_power_dbm: float = 20.0
     frequency_mhz: float = 2400.0
     reference_loss_db_at_1m: float = 40.0
@@ -188,6 +234,19 @@ class AccessPoint:
     downtilt_deg: float = 0.0
     mount_height_m: float = 2.7
     rx_height_m: float = 1.2
+    radios: List[APRadio] = field(default_factory=list)
+
+    def active_radios(self) -> List[APRadio]:
+        if not self.radios:
+            return [APRadio(
+                name="Radio-1",
+                frequency_mhz=float(self.frequency_mhz),
+                tx_power_dbm=float(self.tx_power_dbm),
+                antenna_pattern=self.antenna_pattern,
+                enabled=True,
+                cutoff_radius_m=0.0,
+            )]
+        return [r for r in self.radios if getattr(r, "enabled", True)]
 
 
 @dataclass
@@ -197,6 +256,9 @@ class Space2D:
     floor: str
     source_file: str
     polygon: Polygon
+    z_min: float = 0.0
+    z_max: float = 0.0
+    source_storey: str = ""
 
 
 @dataclass
@@ -253,6 +315,49 @@ class HeatmapSettings:
     # CSV pattern files can be listed in the settings file. Relative paths are
     # resolved relative to the settings JSON location.
     rf_pattern_files: List[str] = field(default_factory=list)
+    # Common RF planning frequencies. These values drive default attenuation
+    # profiles, AP radio presets, and frequency selectors in the GUI.
+    common_frequencies_mhz: List[float] = field(default_factory=lambda: [433.0, 868.0, 2400.0, 5000.0, 6000.0])
+    # RF performance cut-off. When enabled, expensive wall/floor intersection
+    # calculations are skipped for AP radios that cannot physically contribute
+    # to a sample point. If a grid point is outside all active AP/radio cut-off
+    # zones it remains at the disconnected RSSI value.
+    enable_ap_cutoff_zones: bool = True
+    disconnected_rssi_dbm: float = -120.0
+    default_ap_cutoff_radius_m: float = 45.0
+    ap_cutoff_radius_by_frequency_m: Dict[float, float] = field(default_factory=lambda: {
+        433.0: 120.0,
+        868.0: 90.0,
+        2400.0: 45.0,
+        5000.0: 35.0,
+        6000.0: 30.0,
+    })
+    show_ap_cutoff_zones: bool = True
+    ap_cutoff_zone_line_width: float = 0.12
+    ap_cutoff_zone_alpha: int = 120
+    default_floor_attenuation_by_frequency_db: Dict[float, float] = field(default_factory=lambda: {
+        433.0: 8.0,
+        868.0: 10.0,
+        2400.0: 12.0,
+        5000.0: 18.0,
+        6000.0: 22.0,
+    })
+    default_wall_attenuation_by_material_db: Dict[str, Dict[float, float]] = field(default_factory=lambda: {
+        "default": {433.0: 2.0, 868.0: 3.0, 2400.0: 5.0, 5000.0: 7.0, 6000.0: 8.0},
+        "concrete": {433.0: 5.0, 868.0: 7.0, 2400.0: 12.0, 5000.0: 16.0, 6000.0: 20.0},
+        "brick": {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 11.0, 6000.0: 14.0},
+        "masonry": {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 11.0, 6000.0: 14.0},
+        "glass": {433.0: 1.0, 868.0: 2.0, 2400.0: 3.0, 5000.0: 5.0, 6000.0: 7.0},
+        "plasterboard": {433.0: 1.0, 868.0: 1.5, 2400.0: 3.0, 5000.0: 4.0, 6000.0: 5.0},
+        "partition": {433.0: 1.0, 868.0: 1.5, 2400.0: 3.0, 5000.0: 4.0, 6000.0: 5.0},
+        "metal": {433.0: 12.0, 868.0: 16.0, 2400.0: 20.0, 5000.0: 28.0, 6000.0: 35.0},
+        "steel": {433.0: 12.0, 868.0: 16.0, 2400.0: 20.0, 5000.0: 28.0, 6000.0: 35.0}
+    })
+    default_ap_radios: List[Dict[str, object]] = field(default_factory=lambda: [
+        {"name": "2.4 GHz", "frequency_mhz": 2400.0, "tx_power_dbm": 20.0, "antenna_pattern": "Omni ceiling AP", "enabled": True, "cutoff_radius_m": 45.0},
+        {"name": "5 GHz", "frequency_mhz": 5000.0, "tx_power_dbm": 20.0, "antenna_pattern": "Omni ceiling AP", "enabled": True, "cutoff_radius_m": 35.0},
+        {"name": "6 GHz", "frequency_mhz": 6000.0, "tx_power_dbm": 20.0, "antenna_pattern": "Omni ceiling AP", "enabled": False, "cutoff_radius_m": 30.0}
+    ])
     # Text uses model-scaled scene units so it zooms naturally with the IFC view.
     # The numeric font sizes below are small logical sizes which are multiplied
     # by text_model_scale before drawing. Increase text_model_scale if labels
@@ -264,6 +369,39 @@ class HeatmapSettings:
     text_model_scale: float = 0.035
     sample_cross_size: float = 0.08
     contour_line_width: float = 1.25
+    # Multiprocessing options. IFC loading now uses process workers only; Qt
+    # thread-pool based IFC loading has been removed to avoid mixed concurrency
+    # paths and last-file batch completion issues.
+    enable_ifc_multiprocessing: bool = True
+    max_ifc_loader_processes: int = 0
+    # Safety watchdog for process-based IFC loading. Large files can legitimately
+    # take time, so this is intentionally generous. Set to 0 to disable.
+    ifc_load_timeout_seconds: int = 900
+    # For very large single IFC files, do a lightweight index pass and split
+    # geometry extraction into GlobalId chunks processed by multiple processes.
+    enable_chunked_ifc_geometry_extraction: bool = True
+    chunk_ifc_files_over_mb: float = 100.0
+    ifc_geometry_chunk_size: int = 250
+    # Large IFC safety guard. Chunking by GlobalId can improve smaller/medium
+    # models, but for 500-1000 MB IFCs it is unsafe because every worker process
+    # reopens the entire model. That multiplies RAM and can crash ifcopenshell/OCC.
+    huge_ifc_single_process_threshold_mb: float = 512.0
+    max_parallel_huge_ifc_processes: int = 1
+    # Keep all IFC parsing out of the GUI process by default. If a worker dies,
+    # the GUI reports the error instead of falling back to an in-process parse.
+    allow_blocking_ifc_fallback: bool = False
+    enable_rf_multiprocessing: bool = True
+    max_rf_worker_processes: int = 0
+    rf_multiprocessing_min_points: int = 5000
+    rf_tile_rows: int = 16
+    # Multi-storey model handling. Normal model elements are drawn only on their
+    # assigned/nearest storey. External/envelope walls may be projected through
+    # all intersected storeys so the RF model still sees a complete external
+    # envelope on each floor slice.
+    project_external_walls_across_floors: bool = True
+    external_wall_keywords: List[str] = field(default_factory=lambda: [
+        "external", "exterior", "outer", "facade", "façade", "curtain", "envelope", "perimeter"
+    ])
     contour_line_cosmetic: bool = True
     contour_line_colour: str = "#111111"
     contour_line_colour_light: str = "#111111"
@@ -272,6 +410,14 @@ class HeatmapSettings:
     use_band_colour_for_contour_lines: bool = False
     sample_cross_line_width: float = 1.0
     wall_line_width: float = 0.18
+    # DXF unit handling. By default the loader reads $INSUNITS from the DXF
+    # and converts the overlay to metres to match IFC/project coordinates.
+    # dxf_unit_scale is an additional manual multiplier for unusual exports.
+    dxf_auto_unit_scale: bool = True
+    dxf_unit_scale: float = 1.0
+    dxf_unit_name: str = "auto"
+    dxf_overlay_line_width: float = 0.08
+    dxf_overlay_alpha: int = 190
 
     # All non-RSSI-band display colours are configurable in the settings JSON.
     # Both British (colour) and US (color) spellings are accepted when loading.
@@ -291,7 +437,9 @@ class HeatmapSettings:
         "sample_text": "#0055FF",
         "ap_same_floor": "#0050FF",
         "ap_other_floor": "#7800B4",
-        "ap_outline": "#000050"
+        "ap_outline": "#000050",
+        "ap_cutoff_zone": "#0050FF",
+        "dxf_overlay": "#0096FF"
     })
     colours_dark: Dict[str, str] = field(default_factory=lambda: {
         "background": "#2A2A2A",
@@ -309,7 +457,9 @@ class HeatmapSettings:
         "sample_text": "#55A0FF",
         "ap_same_floor": "#4D8DFF",
         "ap_other_floor": "#C77DFF",
-        "ap_outline": "#D8E4FF"
+        "ap_outline": "#D8E4FF",
+        "ap_cutoff_zone": "#4D8DFF",
+        "dxf_overlay": "#62B7FF"
     })
     alpha_light: Dict[str, int] = field(default_factory=lambda: {
         "space_fill": 45,
@@ -364,6 +514,36 @@ class HeatmapSettings:
                 reverse=True,
             )
         settings.rf_pattern_files = [str(v) for v in data.get("rf_pattern_files", data.get("antenna_pattern_files", []))]
+        settings.common_frequencies_mhz = [float(v) for v in data.get("common_frequencies_mhz", data.get("common_frequencies", settings.common_frequencies_mhz))]
+        settings.enable_ap_cutoff_zones = bool(data.get("enable_ap_cutoff_zones", data.get("enable_ap_cutoff_zone", True)))
+        settings.disconnected_rssi_dbm = float(data.get("disconnected_rssi_dbm", -120.0))
+        settings.default_ap_cutoff_radius_m = float(data.get("default_ap_cutoff_radius_m", 45.0))
+        settings.show_ap_cutoff_zones = bool(data.get("show_ap_cutoff_zones", True))
+        settings.ap_cutoff_zone_line_width = float(data.get("ap_cutoff_zone_line_width", 0.12))
+        settings.ap_cutoff_zone_alpha = int(data.get("ap_cutoff_zone_alpha", 120))
+        def _freq_dict(raw, fallback):
+            if not isinstance(raw, dict):
+                return fallback
+            return {float(k): float(v) for k, v in raw.items()}
+        settings.ap_cutoff_radius_by_frequency_m = _freq_dict(
+            data.get("ap_cutoff_radius_by_frequency_m", data.get("ap_cutoff_radius_by_frequency", {})),
+            settings.ap_cutoff_radius_by_frequency_m,
+        )
+        settings.default_floor_attenuation_by_frequency_db = _freq_dict(
+            data.get("default_floor_attenuation_by_frequency_db", data.get("floor_attenuation_by_frequency_db", {})),
+            settings.default_floor_attenuation_by_frequency_db,
+        )
+        raw_materials = data.get("default_wall_attenuation_by_material_db", data.get("wall_attenuation_by_material_db", {}))
+        if isinstance(raw_materials, dict):
+            parsed = {}
+            for mat, profile in raw_materials.items():
+                if isinstance(profile, dict):
+                    parsed[str(mat).lower()] = {float(k): float(v) for k, v in profile.items()}
+            if parsed:
+                settings.default_wall_attenuation_by_material_db = parsed
+        raw_radios = data.get("default_ap_radios", settings.default_ap_radios)
+        if isinstance(raw_radios, list):
+            settings.default_ap_radios = [dict(r) for r in raw_radios if isinstance(r, dict)]
         # Font sizes are logical values converted to model-scaled scene text.
         # Text follows the view transform, so it enlarges when zooming in.
         settings.contour_label_font_size = int(data.get("contour_label_font_size", 6))
@@ -373,6 +553,23 @@ class HeatmapSettings:
         settings.text_model_scale = float(data.get("text_model_scale", 0.035))
         settings.sample_cross_size = float(data.get("sample_cross_size", 0.08))
         settings.contour_line_width = float(data.get("contour_line_width", 1.25))
+        settings.enable_ifc_multiprocessing = bool(data.get("enable_ifc_multiprocessing", data.get("ifc_loading_multiprocessing", True)))
+        settings.max_ifc_loader_processes = max(0, int(data.get("max_ifc_loader_processes", data.get("ifc_loader_processes", 0))))
+        settings.ifc_load_timeout_seconds = max(0, int(data.get("ifc_load_timeout_seconds", data.get("ifc_loader_timeout_seconds", 900))))
+        settings.enable_chunked_ifc_geometry_extraction = bool(data.get("enable_chunked_ifc_geometry_extraction", data.get("chunked_ifc_geometry_extraction", True)))
+        settings.chunk_ifc_files_over_mb = max(0.0, float(data.get("chunk_ifc_files_over_mb", data.get("ifc_chunk_files_over_mb", 100.0))))
+        settings.ifc_geometry_chunk_size = max(25, int(data.get("ifc_geometry_chunk_size", data.get("ifc_chunk_size", 250))))
+        settings.huge_ifc_single_process_threshold_mb = max(0.0, float(data.get("huge_ifc_single_process_threshold_mb", data.get("ifc_huge_file_single_process_threshold_mb", 512.0))))
+        settings.max_parallel_huge_ifc_processes = max(1, int(data.get("max_parallel_huge_ifc_processes", data.get("ifc_max_parallel_huge_processes", 1))))
+        settings.allow_blocking_ifc_fallback = bool(data.get("allow_blocking_ifc_fallback", False))
+        settings.enable_rf_multiprocessing = bool(data.get("enable_rf_multiprocessing", data.get("rf_multiprocessing", True)))
+        settings.max_rf_worker_processes = max(0, int(data.get("max_rf_worker_processes", data.get("rf_worker_processes", 0))))
+        settings.rf_multiprocessing_min_points = max(1, int(data.get("rf_multiprocessing_min_points", 5000)))
+        settings.rf_tile_rows = max(1, int(data.get("rf_tile_rows", 16)))
+        settings.project_external_walls_across_floors = bool(data.get("project_external_walls_across_floors", True))
+        raw_external_keywords = data.get("external_wall_keywords", data.get("envelope_wall_keywords", settings.external_wall_keywords))
+        if isinstance(raw_external_keywords, list):
+            settings.external_wall_keywords = [str(v).strip().lower() for v in raw_external_keywords if str(v).strip()]
         settings.contour_line_cosmetic = bool(data.get("contour_line_cosmetic", True))
         settings.contour_line_colour = str(data.get("contour_line_colour", data.get("contour_line_color", "#111111")))
         settings.contour_line_colour_light = str(data.get("contour_line_colour_light", data.get("contour_line_color_light", settings.contour_line_colour)))
@@ -381,6 +578,11 @@ class HeatmapSettings:
         settings.use_band_colour_for_contour_lines = bool(data.get("use_band_colour_for_contour_lines", False))
         settings.sample_cross_line_width = float(data.get("sample_cross_line_width", 1.0))
         settings.wall_line_width = float(data.get("wall_line_width", 0.18))
+        settings.dxf_auto_unit_scale = bool(data.get("dxf_auto_unit_scale", data.get("dxf_auto_units", True)))
+        settings.dxf_unit_scale = float(data.get("dxf_unit_scale", 1.0))
+        settings.dxf_unit_name = str(data.get("dxf_unit_name", "auto"))
+        settings.dxf_overlay_line_width = float(data.get("dxf_overlay_line_width", 0.08))
+        settings.dxf_overlay_alpha = int(data.get("dxf_overlay_alpha", 190))
 
         # Display colours. Supports either:
         #   "colours": {"light": {...}, "dark": {...}, "alpha_light": {...}, "alpha_dark": {...}}
@@ -474,59 +676,117 @@ class IFCModelLoader:
     the same project coordinates, their walls will line up automatically.
     """
 
-    def __init__(self, path: Path, dx: float = 0.0, dy: float = 0.0, dz: float = 0.0):
+    def __init__(self, path: Path, dx: float = 0.0, dy: float = 0.0, dz: float = 0.0,
+                 project_external_walls_across_floors: bool = True,
+                 external_wall_keywords: Optional[List[str]] = None):
         if ifcopenshell is None:
             raise RuntimeError("ifcopenshell is not installed. Run: pip install ifcopenshell")
         self.path = path
         self.dx = dx
         self.dy = dy
         self.dz = dz
+        self.project_external_walls_across_floors = bool(project_external_walls_across_floors)
+        self.external_wall_keywords = [
+            str(v).strip().lower() for v in (external_wall_keywords or [
+                "external", "exterior", "outer", "facade", "façade", "curtain", "envelope", "perimeter"
+            ]) if str(v).strip()
+        ]
         self.ifc = ifcopenshell.open(str(path))
         self.settings = ifcopenshell.geom.settings()
         self.settings.set(self.settings.USE_WORLD_COORDS, True)
 
     def load(self) -> Dict[str, FloorModel]:
-        storeys = self._storeys()
+        return self.load_filtered()
+
+    def load_filtered(
+        self,
+        wall_guids: Optional[Iterable[str]] = None,
+        space_guids: Optional[Iterable[str]] = None,
+        storeys_override: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, FloorModel]:
+        """Load only selected wall/space GlobalIds.
+
+        This is used by the large-file multiprocessing path. Each worker
+        reopens the same IFC and extracts geometry only for its assigned
+        GlobalIds, while the initial index/storey pass remains lightweight.
+        """
+        storeys = dict(storeys_override or self._storeys())
         floors = {name: FloorModel(name=name, elevation=elev) for name, elev in storeys.items()}
         if not floors:
             floors["Default"] = FloorModel(name="Default", elevation=0.0)
 
+        wanted_walls = set(wall_guids or [])
+        wanted_spaces = set(space_guids or [])
+        filter_walls = bool(wall_guids is not None)
+        filter_spaces = bool(space_guids is not None)
+
+        seen_wall_guids = set()
         for wall in list(self.ifc.by_type("IfcWall")) + list(self.ifc.by_type("IfcWallStandardCase")):
-            floor_name = self._container_storey_name(wall) or self._nearest_floor_name(floors, 0.0)
-            poly = self._plan_polygon_from_geometry(wall)
+            guid = getattr(wall, "GlobalId", "") or ""
+            if guid in seen_wall_guids:
+                continue
+            seen_wall_guids.add(guid)
+            if filter_walls and guid not in wanted_walls:
+                continue
+            source_floor = self._container_storey_name(wall)
+            geom = self._plan_polygon_from_geometry(wall)
+            if geom is None:
+                continue
+            poly, z_min, z_max = geom
             if poly is None or poly.area <= 0:
                 continue
             mat = self._material_name(wall)
             type_name = self._type_name(wall)
-            floors.setdefault(floor_name, FloorModel(name=floor_name, elevation=0.0)).walls.append(
-                Wall2D(
-                    guid=getattr(wall, "GlobalId", ""),
-                    name=getattr(wall, "Name", "") or "Wall",
-                    floor=floor_name,
-                    source_file=self.path.name,
-                    type_name=type_name,
-                    material=mat,
-                    polygon=poly,
-                    attenuation_by_band_db=self._default_attenuation_profile(mat, type_name),
+            assigned_floor = source_floor or self._nearest_floor_name(floors, z_min)
+            is_envelope = self._is_external_or_envelope_wall(wall, mat, type_name)
+            if is_envelope and self.project_external_walls_across_floors:
+                floor_names = self._floor_names_for_z_span(floors, z_min, z_max, assigned_floor)
+            else:
+                floor_names = [assigned_floor]
+            for floor_name in floor_names:
+                floors.setdefault(floor_name, FloorModel(name=floor_name, elevation=0.0)).walls.append(
+                    Wall2D(
+                        guid=guid,
+                        name=getattr(wall, "Name", "") or "Wall",
+                        floor=floor_name,
+                        source_file=self.path.name,
+                        type_name=type_name,
+                        material=mat,
+                        polygon=poly,
+                        z_min=z_min,
+                        z_max=z_max,
+                        source_storey=source_floor or "",
+                        projected_to_floor=(floor_name != assigned_floor),
+                        envelope_wall=is_envelope,
+                        attenuation_by_band_db=self._default_attenuation_profile(mat, type_name),
+                    )
                 )
-            )
 
-        # Extract IfcSpace footprints so room/space names can be shown on the plan.
-        # Missing/invalid space geometry is ignored so models without spaces still load.
         for space in self.ifc.by_type("IfcSpace"):
-            floor_name = self._container_storey_name(space) or self._nearest_floor_name(floors, 0.0)
-            poly = self._plan_polygon_from_geometry(space)
+            guid = getattr(space, "GlobalId", "") or ""
+            if filter_spaces and guid not in wanted_spaces:
+                continue
+            source_floor = self._container_storey_name(space)
+            geom = self._plan_polygon_from_geometry(space)
+            if geom is None:
+                continue
+            poly, z_min, z_max = geom
             if poly is None or poly.area <= 0:
                 continue
-            floors.setdefault(floor_name, FloorModel(name=floor_name, elevation=0.0)).spaces.append(
-                Space2D(
-                    guid=getattr(space, "GlobalId", ""),
-                    name=getattr(space, "LongName", None) or getattr(space, "Name", "") or "Space",
-                    floor=floor_name,
-                    source_file=self.path.name,
-                    polygon=poly,
+            floor_names = [source_floor or self._nearest_floor_name(floors, z_min)]
+            for floor_name in floor_names:
+                floors.setdefault(floor_name, FloorModel(name=floor_name, elevation=0.0)).spaces.append(
+                    Space2D(
+                        guid=guid,
+                        name=getattr(space, "LongName", None) or getattr(space, "Name", "") or "Space",
+                        floor=floor_name,
+                        source_file=self.path.name,
+                        polygon=poly,
+                        z_min=z_min,
+                        z_max=z_max,
+                        source_storey=source_floor or "",
+                    )
                 )
-            )
         return floors
 
     def _storeys(self) -> Dict[str, float]:
@@ -547,8 +807,8 @@ class IFCModelLoader:
     def _nearest_floor_name(floors: Dict[str, FloorModel], z: float) -> str:
         return min(floors.values(), key=lambda f: abs(f.elevation - z)).name
 
-    def _plan_polygon_from_geometry(self, product) -> Optional[Polygon]:
-        """Project wall mesh vertices onto XY and make a rectangle/bbox footprint."""
+    def _plan_polygon_from_geometry(self, product) -> Optional[Tuple[Polygon, float, float]]:
+        """Project product mesh vertices onto XY and return footprint plus Z span."""
         try:
             shape = ifcopenshell.geom.create_shape(self.settings, product)
             verts = np.array(shape.geometry.verts, dtype=float).reshape((-1, 3))
@@ -559,6 +819,8 @@ class IFCModelLoader:
         verts[:, 0] += self.dx
         verts[:, 1] += self.dy
         verts[:, 2] += self.dz
+        z_min = float(np.min(verts[:, 2]))
+        z_max = float(np.max(verts[:, 2]))
         xy = verts[:, :2]
         # Use oriented min rectangle if possible; it is more useful than axis-aligned bbox.
         hull = Polygon(xy).convex_hull
@@ -569,7 +831,73 @@ class IFCModelLoader:
             minx, miny = xy.min(axis=0)
             maxx, maxy = xy.max(axis=0)
             rect = Polygon([(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy)])
-        return rect
+        return rect, z_min, z_max
+
+    @staticmethod
+    def _floor_names_for_z_span(
+        floors: Dict[str, FloorModel],
+        z_min: float,
+        z_max: float,
+        fallback_floor: Optional[str] = None,
+        tolerance_m: float = 0.15,
+    ) -> List[str]:
+        """Return every storey slice intersected by an element's vertical extent.
+
+        IFC containment can be misleading for multi-storey items. This method
+        uses actual geometry Z extents and storey elevations so items such as
+        lift shafts, risers, facade panels, curtain walls and stair-core walls
+        are visible and attenuate RF on each floor they pass through.
+        """
+        if not floors:
+            return [fallback_floor or "Default"]
+        ordered = sorted(floors.values(), key=lambda f: (f.elevation, f.name))
+        names: List[str] = []
+        # Estimate a top slice height from neighbouring storeys.
+        deltas = [ordered[i + 1].elevation - ordered[i].elevation for i in range(len(ordered) - 1) if ordered[i + 1].elevation > ordered[i].elevation]
+        default_height = float(np.median(deltas)) if deltas else 3.5
+        for i, floor in enumerate(ordered):
+            lower = float(floor.elevation) - tolerance_m
+            upper = (float(ordered[i + 1].elevation) if i + 1 < len(ordered) else float(floor.elevation) + default_height) + tolerance_m
+            if z_max >= lower and z_min <= upper:
+                names.append(floor.name)
+        if not names and fallback_floor:
+            names.append(fallback_floor)
+        if not names:
+            names.append(IFCModelLoader._nearest_floor_name(floors, z_min))
+        return list(dict.fromkeys(names))
+
+    def _ifc_is_external_property(self, product) -> Optional[bool]:
+        """Return IFC IsExternal when present on the product/type property sets."""
+        try:
+            import ifcopenshell.util.element as element_util
+            for obj in [product] + [getattr(rel, "RelatingType", None) for rel in (getattr(product, "IsTypedBy", []) or [])]:
+                if obj is None:
+                    continue
+                psets = element_util.get_psets(obj) or {}
+                for props in psets.values():
+                    if isinstance(props, dict) and "IsExternal" in props:
+                        return bool(props.get("IsExternal"))
+        except Exception:
+            pass
+        return None
+
+    def _is_external_or_envelope_wall(self, product, material: str, type_name: str) -> bool:
+        """Classify walls that may be safely projected through intersected floors.
+
+        Only external/envelope constructions are projected to complete the
+        building RF envelope. Internal partitions and other tall objects remain
+        on their assigned storey so floor plans are not overloaded.
+        """
+        ext = self._ifc_is_external_property(product)
+        if ext is not None:
+            return bool(ext)
+        text = " ".join([
+            str(getattr(product, "Name", "") or ""),
+            str(getattr(product, "ObjectType", "") or ""),
+            str(material or ""),
+            str(type_name or ""),
+        ]).lower()
+        return any(keyword in text for keyword in self.external_wall_keywords)
 
     def _type_name(self, product) -> str:
         try:
@@ -608,18 +936,16 @@ class IFCModelLoader:
         """
         text = f"{material} {type_name}".lower()
         if "concrete" in text or "block" in text:
-            return {2400.0: 12.0, 5000.0: 16.0, 6000.0: 20.0}
+            return {433.0: 5.0, 868.0: 7.0, 2400.0: 12.0, 5000.0: 16.0, 6000.0: 20.0}
         if "brick" in text or "masonry" in text:
-            return {2400.0: 8.0, 5000.0: 11.0, 6000.0: 14.0}
+            return {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 11.0, 6000.0: 14.0}
         if "glass" in text:
-            return {2400.0: 3.0, 5000.0: 5.0, 6000.0: 7.0}
+            return {433.0: 1.0, 868.0: 2.0, 2400.0: 3.0, 5000.0: 5.0, 6000.0: 7.0}
         if "plaster" in text or "drywall" in text or "partition" in text:
-            return {2400.0: 3.0, 5000.0: 4.0, 6000.0: 5.0}
+            return {433.0: 1.0, 868.0: 1.5, 2400.0: 3.0, 5000.0: 4.0, 6000.0: 5.0}
         if "metal" in text or "steel" in text:
-            return {2400.0: 20.0, 5000.0: 28.0, 6000.0: 35.0}
-        return {2400.0: 5.0, 5000.0: 7.0, 6000.0: 8.0}
-
-
+            return {433.0: 12.0, 868.0: 16.0, 2400.0: 20.0, 5000.0: 28.0, 6000.0: 35.0}
+        return {433.0: 2.0, 868.0: 3.0, 2400.0: 5.0, 5000.0: 7.0, 6000.0: 8.0}
 
 
 class CombinedIFCModel:
@@ -667,6 +993,44 @@ class RFEngine:
         """
         frequency_mhz = max(float(frequency_mhz), 1.0)
         return 32.44 + 20.0 * math.log10(0.001) + 20.0 * math.log10(frequency_mhz)
+
+    @staticmethod
+    def cutoff_radius_m_for_radio(radio: APRadio, settings: Optional[HeatmapSettings] = None) -> float:
+        """Return the effective planning cut-off radius for one AP radio.
+
+        A radio-specific value wins. If omitted/zero, the settings frequency
+        table is used, falling back to default_ap_cutoff_radius_m. Values <= 0
+        disable the cut-off for that radio.
+        """
+        explicit = float(getattr(radio, "cutoff_radius_m", 0.0) or 0.0)
+        if explicit > 0.0:
+            return explicit
+        if settings is None:
+            return 0.0
+        table = getattr(settings, "ap_cutoff_radius_by_frequency_m", {}) or {}
+        if table:
+            bands = sorted(float(k) for k in table.keys())
+            freq = float(radio.frequency_mhz)
+            closest = min(bands, key=lambda b: abs(b - freq))
+            return float(table.get(closest, settings.default_ap_cutoff_radius_m))
+        return float(getattr(settings, "default_ap_cutoff_radius_m", 0.0) or 0.0)
+
+    @staticmethod
+    def point_is_inside_radio_cutoff(x: float, y: float, receiver_floor: FloorModel, ap: AccessPoint, floors: Dict[str, FloorModel], radio: APRadio, settings: Optional[HeatmapSettings]) -> bool:
+        if not settings or not getattr(settings, "enable_ap_cutoff_zones", True):
+            return True
+        radius = RFEngine.cutoff_radius_m_for_radio(radio, settings)
+        if radius <= 0.0:
+            return True
+        ap_floor = floors.get(ap.floor)
+        if ap_floor is None:
+            return False
+        horizontal_d = math.hypot(x - ap.x, y - ap.y)
+        ap_z = float(ap_floor.elevation) + float(ap.mount_height_m)
+        rx_z = float(receiver_floor.elevation) + float(ap.rx_height_m)
+        d_3d = math.hypot(horizontal_d, ap_z - rx_z)
+        return d_3d <= radius
+
     @staticmethod
     def rssi_at(
         x: float,
@@ -675,7 +1039,9 @@ class RFEngine:
         ap: AccessPoint,
         floors: Dict[str, FloorModel],
         patterns: Optional[Dict[str, AntennaPattern]] = None,
+        radio: Optional[APRadio] = None,
         include_inter_floor: bool = True,
+        heatmap_settings: Optional[HeatmapSettings] = None,
     ) -> float:
         """Calculate RSSI at a receiver point on receiver_floor.
 
@@ -685,18 +1051,22 @@ class RFEngine:
         - floor/slab penetration loss for every storey boundary crossed;
         - wall intersections on both the AP floor and receiver floor.
         """
+        radio = radio or ap.active_radios()[0]
         ap_floor = floors.get(ap.floor)
         if ap_floor is None:
             return -120.0
+        disconnected = float(getattr(heatmap_settings, "disconnected_rssi_dbm", -120.0) if heatmap_settings else -120.0)
         if ap.floor != receiver_floor.name and not include_inter_floor:
-            return -120.0
+            return disconnected
+        if not RFEngine.point_is_inside_radio_cutoff(x, y, receiver_floor, ap, floors, radio, heatmap_settings):
+            return disconnected
 
         horizontal_d = max(math.hypot(x - ap.x, y - ap.y), 0.1)
         ap_z = float(ap_floor.elevation) + float(ap.mount_height_m)
         rx_z = float(receiver_floor.elevation) + float(ap.rx_height_m)
         dz = ap_z - rx_z
         d_3d = max(math.hypot(horizontal_d, dz), 1.0)
-        reference_loss = RFEngine.free_space_loss_db_at_1m(ap.frequency_mhz)
+        reference_loss = RFEngine.free_space_loss_db_at_1m(radio.frequency_mhz)
         path_loss = reference_loss + 10.0 * ap.path_loss_exponent * math.log10(d_3d)
 
         bearing = math.degrees(math.atan2(y - ap.y, x - ap.x))
@@ -705,25 +1075,40 @@ class RFEngine:
         elev_rel = elev_angle + ap.downtilt_deg
         pattern_gain = 0.0
         if patterns:
-            pattern = patterns.get(ap.antenna_pattern)
+            pattern = patterns.get(radio.antenna_pattern)
             if pattern:
                 pattern_gain = pattern.gain_dbi(az_rel, elev_rel)
 
         line = LineString([(ap.x, ap.y), (x, y)])
         wall_loss = 0.0
         checked_wall_guids = set()
-        for wall in receiver_floor.walls:
-            if wall.guid not in checked_wall_guids and wall.polygon.intersects(line):
-                wall_loss += wall.attenuation_db_for_frequency(ap.frequency_mhz)
-                checked_wall_guids.add(wall.guid)
-        if ap_floor.name != receiver_floor.name:
-            for wall in ap_floor.walls:
-                if wall.guid not in checked_wall_guids and wall.polygon.intersects(line):
-                    wall_loss += wall.attenuation_db_for_frequency(ap.frequency_mhz)
-                    checked_wall_guids.add(wall.guid)
+        # Include walls on every floor crossed by the 3D path. This matters for
+        # multi-storey elements which have been copied into each intersected
+        # storey slice during IFC loading, such as lift shafts, riser walls,
+        # atrium glazing and external facade elements. A GUID is counted only
+        # once so the same spanning object does not multiply its attenuation.
+        for path_floor in RFEngine.floors_between_inclusive(receiver_floor, ap_floor, floors):
+            for wall in path_floor.walls:
+                wall_key = wall.guid or f"{wall.source_file}:{wall.name}:{wall.z_min:.3f}:{wall.z_max:.3f}"
+                if wall_key not in checked_wall_guids and wall.polygon.intersects(line):
+                    wall_loss += wall.attenuation_db_for_frequency(radio.frequency_mhz)
+                    checked_wall_guids.add(wall_key)
 
-        floor_loss = RFEngine.floor_penetration_loss_db(receiver_floor, ap_floor, floors, ap.frequency_mhz)
-        return ap.tx_power_dbm + pattern_gain - path_loss - wall_loss - floor_loss
+        floor_loss = RFEngine.floor_penetration_loss_db(receiver_floor, ap_floor, floors, radio.frequency_mhz)
+        return radio.tx_power_dbm + pattern_gain - path_loss - wall_loss - floor_loss
+
+    @staticmethod
+    def floors_between_inclusive(receiver_floor: FloorModel, ap_floor: FloorModel, floors: Dict[str, FloorModel]) -> List[FloorModel]:
+        if receiver_floor.name == ap_floor.name:
+            return [receiver_floor]
+        ordered = sorted(floors.values(), key=lambda f: (f.elevation, f.name))
+        try:
+            rx_i = next(i for i, f in enumerate(ordered) if f.name == receiver_floor.name)
+            ap_i = next(i for i, f in enumerate(ordered) if f.name == ap_floor.name)
+        except StopIteration:
+            return [receiver_floor, ap_floor]
+        lo, hi = sorted((rx_i, ap_i))
+        return ordered[lo:hi + 1]
 
     @staticmethod
     def floor_penetration_loss_db(receiver_floor: FloorModel, ap_floor: FloorModel, floors: Dict[str, FloorModel], frequency_mhz: float) -> float:
@@ -752,6 +1137,8 @@ class RFEngine:
         resolution_m: float = 2.0,
         patterns: Optional[Dict[str, AntennaPattern]] = None,
         include_inter_floor: bool = True,
+        heatmap_settings: Optional[HeatmapSettings] = None,
+        progress_callback=None,
     ) -> Optional[SimulationResult]:
         if not floor.walls and not floor.spaces:
             return None
@@ -761,16 +1148,55 @@ class RFEngine:
         minx, miny, maxx, maxy = bounds
         xs = np.arange(minx, maxx + resolution_m, resolution_m)
         ys = np.arange(miny, maxy + resolution_m, resolution_m)
-        grid = np.full((len(ys), len(xs)), -120.0)
+        disconnected = float(getattr(heatmap_settings, "disconnected_rssi_dbm", -120.0) if heatmap_settings else -120.0)
+        grid = np.full((len(ys), len(xs)), disconnected)
         candidate_aps = [a for a in aps if include_inter_floor or a.floor == floor.name]
         if not candidate_aps:
             return None
+        total_points = int(len(xs) * len(ys))
+        use_mp = bool(getattr(heatmap_settings, "enable_rf_multiprocessing", False)) if heatmap_settings else False
+        min_points = int(getattr(heatmap_settings, "rf_multiprocessing_min_points", 5000) if heatmap_settings else 5000)
+        if use_mp and total_points >= min_points and len(ys) > 1:
+            requested = int(getattr(heatmap_settings, "max_rf_worker_processes", 0) or 0)
+            process_count = min(_logical_process_count(requested), max(1, len(ys)))
+            tile_rows = max(1, int(getattr(heatmap_settings, "rf_tile_rows", 16) or 16))
+            jobs = []
+            for start in range(0, len(ys), tile_rows):
+                jobs.append((
+                    floor, floors, aps, patterns, include_inter_floor, heatmap_settings,
+                    xs, ys[start:start + tile_rows], start, disconnected,
+                ))
+            try:
+                with concurrent.futures.ProcessPoolExecutor(max_workers=process_count) as executor:
+                    completed_rows = 0
+                    for start, tile in executor.map(_rf_grid_tile_worker, jobs):
+                        grid[start:start + tile.shape[0], :] = tile
+                        completed_rows += tile.shape[0]
+                        if progress_callback:
+                            progress_callback(min(completed_rows, len(ys)), len(ys))
+                return SimulationResult(xs=xs, ys=ys, rssi=grid)
+            except Exception:
+                # Fall back to single-process calculation if a model object is not
+                # pickleable on a particular platform/build. The UI still gets a
+                # result rather than failing the survey.
+                pass
+
+        if progress_callback:
+            progress_callback(0, len(ys))
+
         for iy, yy in enumerate(ys):
             for ix, xx in enumerate(xs):
-                grid[iy, ix] = max(
-                    RFEngine.rssi_at(xx, yy, floor, ap, floors, patterns, include_inter_floor)
-                    for ap in candidate_aps
-                )
+                values = []
+                for ap in candidate_aps:
+                    for radio in ap.active_radios():
+                        # Fast cut-off test avoids expensive wall/floor intersection
+                        # calculations when this radio cannot contribute to the
+                        # sample point. This is the main large-IFC speed-up.
+                        if RFEngine.point_is_inside_radio_cutoff(xx, yy, floor, ap, floors, radio, heatmap_settings):
+                            values.append(RFEngine.rssi_at(xx, yy, floor, ap, floors, patterns, radio, include_inter_floor, heatmap_settings))
+                grid[iy, ix] = max(values) if values else disconnected
+                if progress_callback:
+                    progress_callback(iy + 1, len(ys))
         return SimulationResult(xs=xs, ys=ys, rssi=grid)
 
     @staticmethod
@@ -788,32 +1214,424 @@ class RFEngine:
         return minx, miny, maxx, maxy
 
 
+# ----------------------------- DXF overlay and IFC alignment -----------------------------
 
-# ----------------------------- Threaded IFC loading -----------------------------
+@dataclass
+class DxfPrimitive:
+    kind: str
+    layer: str
+    points: List[Tuple[float, float]]
 
-class IFCLoadSignals(QObject):
-    finished = Signal(object, object, str)  # path, floors, source name
-    error = Signal(object, str)
+
+@dataclass
+class DxfOverlay:
+    path: str
+    primitives: List[DxfPrimitive] = field(default_factory=list)
+    visible: bool = True
+    source_units_code: int = 0
+    source_units_name: str = "unitless"
+    metres_per_dxf_unit: float = 1.0
+    manual_scale: float = 1.0
+    effective_scale_to_metres: float = 1.0
 
 
-class IFCLoadWorker(QRunnable):
-    """Loads one IFC file away from the Qt GUI thread."""
+DXF_INSUNITS_TO_METRES: Dict[int, Tuple[str, float]] = {
+    0: ("unitless", 1.0),
+    1: ("inches", 0.0254),
+    2: ("feet", 0.3048),
+    3: ("miles", 1609.344),
+    4: ("millimetres", 0.001),
+    5: ("centimetres", 0.01),
+    6: ("metres", 1.0),
+    7: ("kilometres", 1000.0),
+    8: ("microinches", 0.0000000254),
+    9: ("mils", 0.0000254),
+    10: ("yards", 0.9144),
+    11: ("angstroms", 1e-10),
+    12: ("nanometres", 1e-9),
+    13: ("microns", 1e-6),
+    14: ("decimetres", 0.1),
+    15: ("decametres", 10.0),
+    16: ("hectometres", 100.0),
+    17: ("gigametres", 1e9),
+    18: ("astronomical units", 149597870700.0),
+    19: ("light years", 9.4607304725808e15),
+    20: ("parsecs", 3.085677581491367e16),
+}
 
-    def __init__(self, path: Path, dx: float = 0.0, dy: float = 0.0, dz: float = 0.0):
-        super().__init__()
-        self.path = path
-        self.dx = dx
-        self.dy = dy
-        self.dz = dz
-        self.signals = IFCLoadSignals()
 
-    @Slot()
-    def run(self):
+def dxf_units_to_metres(doc, auto_units: bool = True, manual_scale: float = 1.0) -> Tuple[int, str, float, float]:
+    """Return DXF unit metadata and the final coordinate scale to metres.
+
+    IFC geometry in this simulator is kept in metres. DXF files are often
+    exported in millimetres. When auto_units is enabled, $INSUNITS is used as
+    the base conversion and manual_scale remains available as an extra override.
+    """
+    try:
+        code = int(doc.header.get("$INSUNITS", 0) or 0)
+    except Exception:
+        code = 0
+    name, metres = DXF_INSUNITS_TO_METRES.get(code, (f"INSUNITS {code}", 1.0))
+    if not auto_units:
+        metres = 1.0
+        name = "manual/unitless"
+    manual = float(manual_scale or 1.0)
+    return code, name, metres, metres * manual
+
+
+@dataclass
+class AlignmentTransform:
+    """2D transform used to align IFC/model coordinates to the DXF reference.
+
+    Order: scale about origin -> rotate about origin -> translate.
+    """
+    dx: float = 0.0
+    dy: float = 0.0
+    rotation_deg: float = 0.0
+    scale: float = 1.0
+
+    def matrix(self) -> Tuple[float, float, float, float, float, float]:
+        angle = math.radians(float(self.rotation_deg))
+        scale = float(self.scale)
+        cos_a = math.cos(angle)
+        sin_a = math.sin(angle)
+        return (
+            scale * cos_a,
+            -scale * sin_a,
+            scale * sin_a,
+            scale * cos_a,
+            float(self.dx),
+            float(self.dy),
+        )
+
+    def map_xy(self, x: float, y: float) -> Tuple[float, float]:
+        a, b, d, e, xoff, yoff = self.matrix()
+        return a * x + b * y + xoff, d * x + e * y + yoff
+
+    @staticmethod
+    def _invert_matrix(m: Tuple[float, float, float, float, float, float]) -> Tuple[float, float, float, float, float, float]:
+        a, b, d, e, xoff, yoff = m
+        det = a * e - b * d
+        if abs(det) < 1e-12:
+            raise ValueError("Alignment scale/rotation produces a non-invertible transform.")
+        ia = e / det
+        ib = -b / det
+        id_ = -d / det
+        ie = a / det
+        ix = -(ia * xoff + ib * yoff)
+        iy = -(id_ * xoff + ie * yoff)
+        return ia, ib, id_, ie, ix, iy
+
+    @staticmethod
+    def _compose(m2: Tuple[float, float, float, float, float, float],
+                 m1: Tuple[float, float, float, float, float, float]) -> Tuple[float, float, float, float, float, float]:
+        """Return matrix that applies m1 then m2."""
+        a1, b1, d1, e1, x1, y1 = m1
+        a2, b2, d2, e2, x2, y2 = m2
+        return (
+            a2 * a1 + b2 * d1,
+            a2 * b1 + b2 * e1,
+            d2 * a1 + e2 * d1,
+            d2 * b1 + e2 * e1,
+            a2 * x1 + b2 * y1 + x2,
+            d2 * x1 + e2 * y1 + y2,
+        )
+
+    @classmethod
+    def delta_matrix(cls, old: "AlignmentTransform", new: "AlignmentTransform") -> Tuple[float, float, float, float, float, float]:
+        return cls._compose(new.matrix(), cls._invert_matrix(old.matrix()))
+
+    @classmethod
+    def from_matrix(cls, m: Tuple[float, float, float, float, float, float]) -> "AlignmentTransform":
+        a, b, d, e, xoff, yoff = m
+        scale_x = math.hypot(a, d)
+        scale_y = math.hypot(b, e)
+        scale = (scale_x + scale_y) / 2.0 if scale_x > 0 or scale_y > 0 else 1.0
+        rotation = math.degrees(math.atan2(d, a)) if scale > 1e-12 else 0.0
+        return cls(dx=float(xoff), dy=float(yoff), rotation_deg=float(rotation), scale=float(scale))
+
+    @staticmethod
+    def two_point_matrix(ifc_a: Tuple[float, float], ifc_b: Tuple[float, float],
+                         dxf_a: Tuple[float, float], dxf_b: Tuple[float, float]) -> Tuple[float, float, float, float, float, float]:
+        ix1, iy1 = ifc_a; ix2, iy2 = ifc_b
+        dx1, dy1 = dxf_a; dx2, dy2 = dxf_b
+        ivx, ivy = ix2 - ix1, iy2 - iy1
+        dvx, dvy = dx2 - dx1, dy2 - dy1
+        ilen = math.hypot(ivx, ivy)
+        dlen = math.hypot(dvx, dvy)
+        if ilen <= 1e-9 or dlen <= 1e-9:
+            raise ValueError("Two-point alignment needs two distinct IFC points and two distinct DXF points.")
+        scale = dlen / ilen
+        angle = math.atan2(dvy, dvx) - math.atan2(ivy, ivx)
+        cos_a = math.cos(angle); sin_a = math.sin(angle)
+        a = scale * cos_a
+        b = -scale * sin_a
+        d = scale * sin_a
+        e = scale * cos_a
+        xoff = dx1 - (a * ix1 + b * iy1)
+        yoff = dy1 - (d * ix1 + e * iy1)
+        return a, b, d, e, xoff, yoff
+
+
+def load_dxf_overlay(path: Path, unit_scale: float = 1.0, auto_units: bool = True) -> DxfOverlay:
+    """Load basic 2D DXF entities as a reference overlay.
+
+    Supported: LINE, LWPOLYLINE, POLYLINE, CIRCLE and ARC. Coordinates are
+    converted to metres using the DXF $INSUNITS header when available, with
+    ``unit_scale`` applied as an additional manual multiplier.
+    """
+    if ezdxf is None:
+        raise RuntimeError("ezdxf is required. Install with: pip install ezdxf")
+    doc = ezdxf.readfile(str(path))
+    unit_code, unit_name, metres_per_unit, effective_scale = dxf_units_to_metres(
+        doc, auto_units=auto_units, manual_scale=unit_scale
+    )
+    msp = doc.modelspace()
+    prims: List[DxfPrimitive] = []
+
+    def sc(pt) -> Tuple[float, float]:
+        return float(pt[0]) * effective_scale, float(pt[1]) * effective_scale
+
+    def iter_entities(layout):
+        for e in layout:
+            if e.dxftype() == "INSERT":
+                try:
+                    yield from e.virtual_entities()
+                except Exception:
+                    continue
+            else:
+                yield e
+
+    for e in iter_entities(msp):
+        et = e.dxftype()
+        layer = str(getattr(e.dxf, "layer", "0") or "0")
         try:
-            floors = IFCModelLoader(self.path, self.dx, self.dy, self.dz).load()
-            self.signals.finished.emit(self.path, floors, self.path.name)
-        except Exception as exc:
-            self.signals.error.emit(self.path, str(exc))
+            if et == "LINE":
+                prims.append(DxfPrimitive("polyline", layer, [sc(e.dxf.start), sc(e.dxf.end)]))
+            elif et == "LWPOLYLINE":
+                pts = [(float(x) * effective_scale, float(y) * effective_scale) for x, y, *_ in e.get_points()]
+                if len(pts) >= 2:
+                    if e.closed:
+                        pts.append(pts[0])
+                    prims.append(DxfPrimitive("polyline", layer, pts))
+            elif et == "POLYLINE":
+                pts = [sc(v.dxf.location) for v in e.vertices]
+                if len(pts) >= 2:
+                    if e.is_closed:
+                        pts.append(pts[0])
+                    prims.append(DxfPrimitive("polyline", layer, pts))
+            elif et == "CIRCLE":
+                cx, cy = sc(e.dxf.center)
+                r = float(e.dxf.radius) * effective_scale
+                pts = [(cx + math.cos(a) * r, cy + math.sin(a) * r) for a in [2 * math.pi * i / 96 for i in range(97)]]
+                prims.append(DxfPrimitive("polyline", layer, pts))
+            elif et == "ARC":
+                cx, cy = sc(e.dxf.center)
+                r = float(e.dxf.radius) * effective_scale
+                start = math.radians(float(e.dxf.start_angle))
+                end = math.radians(float(e.dxf.end_angle))
+                if end < start:
+                    end += 2 * math.pi
+                steps = max(8, int(abs(end - start) / (2 * math.pi) * 96))
+                pts = [(cx + math.cos(start + (end - start) * i / steps) * r,
+                        cy + math.sin(start + (end - start) * i / steps) * r) for i in range(steps + 1)]
+                prims.append(DxfPrimitive("polyline", layer, pts))
+            elif et in ("SPLINE", "ELLIPSE"):
+                pts = [sc(p) for p in e.flattening(0.05)]
+                if len(pts) >= 2:
+                    prims.append(DxfPrimitive("polyline", layer, pts))
+        except Exception:
+            continue
+    return DxfOverlay(
+        path=str(path),
+        primitives=prims,
+        source_units_code=unit_code,
+        source_units_name=unit_name,
+        metres_per_dxf_unit=metres_per_unit,
+        manual_scale=float(unit_scale or 1.0),
+        effective_scale_to_metres=effective_scale,
+    )
+
+
+def load_dxf_overlay_with_similarity_transform(path: Path, transform: SimilarityTransform2D) -> DxfOverlay:
+    """Load a DXF using raw DXF coordinates, then map it into IFC coordinates.
+
+    The DxfPreAlignDialog calculates a transform from raw DXF coordinates to
+    IFC/model metres. That transform already includes the DXF $INSUNITS unit
+    conversion, so this function deliberately reads the DXF with auto unit
+    conversion disabled and then applies the two-point transform to every point.
+    """
+    overlay = load_dxf_overlay(path, unit_scale=1.0, auto_units=False)
+    transformed: List[DxfPrimitive] = []
+    affine = getattr(transform, "affine_matrix", None)
+    for prim in overlay.primitives:
+        if affine:
+            a, b, d, e, tx, ty = affine
+            pts = [(a * float(x) + b * float(y) + tx, d * float(x) + e * float(y) + ty) for x, y in prim.points]
+        else:
+            pts = [transform.map_point(float(x), float(y)) for x, y in prim.points]
+        transformed.append(DxfPrimitive(prim.kind, prim.layer, pts))
+    overlay.primitives = transformed
+    overlay.source_units_name = "pre-aligned DXF"
+    overlay.effective_scale_to_metres = float(transform.scale)
+    return overlay
+
+
+class DxfAlignmentDialog(QDialog):
+    def __init__(self, parent=None, transform: Optional[AlignmentTransform] = None, apply_callback=None):
+        super().__init__(parent)
+        self.setWindowTitle("Align IFC to DXF")
+        self.transform = transform or AlignmentTransform()
+        self.apply_callback = apply_callback
+        layout = QVBoxLayout(self)
+        info = QLabel("Adjust the IFC model against the DXF overlay. Values are model metres/degrees. Click Apply to update geometry used by RF simulation.")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+        form = QFormLayout()
+        self.dx = QDoubleSpinBox(); self.dx.setRange(-1_000_000, 1_000_000); self.dx.setDecimals(4); self.dx.setSingleStep(0.1); self.dx.setValue(self.transform.dx)
+        self.dy = QDoubleSpinBox(); self.dy.setRange(-1_000_000, 1_000_000); self.dy.setDecimals(4); self.dy.setSingleStep(0.1); self.dy.setValue(self.transform.dy)
+        self.rot = QDoubleSpinBox(); self.rot.setRange(-360, 360); self.rot.setDecimals(4); self.rot.setSingleStep(0.25); self.rot.setValue(self.transform.rotation_deg); self.rot.setSuffix("°")
+        self.scale_spin = QDoubleSpinBox(); self.scale_spin.setRange(0.000001, 1000000); self.scale_spin.setDecimals(6); self.scale_spin.setSingleStep(0.01); self.scale_spin.setValue(self.transform.scale)
+        form.addRow("IFC offset X", self.dx)
+        form.addRow("IFC offset Y", self.dy)
+        form.addRow("IFC rotation", self.rot)
+        form.addRow("IFC scale", self.scale_spin)
+        layout.addLayout(form)
+        btn_row = QHBoxLayout()
+        apply_btn = QPushButton("Apply")
+        reset_btn = QPushButton("Reset")
+        apply_btn.clicked.connect(self.apply)
+        reset_btn.clicked.connect(self.reset)
+        btn_row.addWidget(apply_btn)
+        btn_row.addWidget(reset_btn)
+        layout.addLayout(btn_row)
+        close = QDialogButtonBox(QDialogButtonBox.Close)
+        close.rejected.connect(self.reject)
+        layout.addWidget(close)
+
+    def current_transform(self) -> AlignmentTransform:
+        return AlignmentTransform(
+            dx=float(self.dx.value()),
+            dy=float(self.dy.value()),
+            rotation_deg=float(self.rot.value()),
+            scale=float(self.scale_spin.value()),
+        )
+
+    def apply(self):
+        self.transform = self.current_transform()
+        if self.apply_callback:
+            self.apply_callback(self.transform)
+
+    def reset(self):
+        self.dx.setValue(0.0)
+        self.dy.setValue(0.0)
+        self.rot.setValue(0.0)
+        self.scale_spin.setValue(1.0)
+        self.apply()
+
+
+# ----------------------------- Multiprocessing helpers -----------------------------
+
+def _logical_process_count(requested_count: int = 0) -> int:
+    """Resolve a safe process count for CPU-bound IFC/RF work."""
+    cpu_count = max(1, os.cpu_count() or 1)
+    if requested_count and int(requested_count) > 0:
+        return max(1, min(int(requested_count), cpu_count))
+    return cpu_count
+
+
+def _load_ifc_file_in_process(args):
+    """Top-level IFC worker so it is pickleable on Windows spawn."""
+    path_str, dx, dy, dz, project_external_walls, external_keywords = args
+    path = Path(path_str)
+    floors = IFCModelLoader(
+        path,
+        float(dx),
+        float(dy),
+        float(dz),
+        project_external_walls_across_floors=bool(project_external_walls),
+        external_wall_keywords=list(external_keywords or []),
+    ).load()
+    return path_str, floors, path.name
+
+
+def _index_ifc_file_for_chunking(args):
+    """Lightweight IFC index pass for large-file chunked geometry extraction."""
+    path_str = args[0]
+    if ifcopenshell is None:
+        raise RuntimeError("ifcopenshell is not installed. Run: pip install ifcopenshell")
+    path = Path(path_str)
+    model = ifcopenshell.open(str(path))
+    storeys: Dict[str, float] = {}
+    for st in model.by_type("IfcBuildingStorey"):
+        name = getattr(st, "Name", None) or getattr(st, "GlobalId", None) or "Storey"
+        storeys[str(name)] = float(getattr(st, "Elevation", 0.0) or 0.0)
+    seen = set()
+    wall_guids: List[str] = []
+    for wall in list(model.by_type("IfcWall")) + list(model.by_type("IfcWallStandardCase")):
+        guid = getattr(wall, "GlobalId", "") or ""
+        if guid and guid not in seen:
+            seen.add(guid)
+            wall_guids.append(guid)
+    space_guids = [getattr(sp, "GlobalId", "") or "" for sp in model.by_type("IfcSpace")]
+    space_guids = [g for g in space_guids if g]
+    return path_str, storeys, wall_guids, space_guids, path.name
+
+
+def _load_ifc_geometry_chunk_in_process(args):
+    """Extract geometry for one GlobalId chunk from a large IFC file."""
+    (
+        path_str, dx, dy, dz, project_external_walls, external_keywords,
+        storeys, wall_guids, space_guids, chunk_index, chunk_count,
+    ) = args
+    path = Path(path_str)
+    floors = IFCModelLoader(
+        path,
+        float(dx),
+        float(dy),
+        float(dz),
+        project_external_walls_across_floors=bool(project_external_walls),
+        external_wall_keywords=list(external_keywords or []),
+    ).load_filtered(
+        wall_guids=list(wall_guids or []),
+        space_guids=list(space_guids or []),
+        storeys_override={str(k): float(v) for k, v in dict(storeys or {}).items()},
+    )
+    return path_str, floors, path.name, int(chunk_index), int(chunk_count)
+
+
+def _rf_grid_tile_worker(args):
+    """Calculate one horizontal strip of the RF grid in a separate process."""
+    (
+        floor,
+        floors,
+        aps,
+        patterns,
+        include_inter_floor,
+        heatmap_settings,
+        xs,
+        ys_slice,
+        start_index,
+        disconnected,
+    ) = args
+    xs = np.asarray(xs, dtype=float)
+    ys_slice = np.asarray(ys_slice, dtype=float)
+    tile = np.full((len(ys_slice), len(xs)), float(disconnected), dtype=float)
+    candidate_aps = [a for a in aps if include_inter_floor or a.floor == floor.name]
+    for iy, yy in enumerate(ys_slice):
+        for ix, xx in enumerate(xs):
+            values = []
+            for ap in candidate_aps:
+                for radio in ap.active_radios():
+                    if RFEngine.point_is_inside_radio_cutoff(float(xx), float(yy), floor, ap, floors, radio, heatmap_settings):
+                        values.append(RFEngine.rssi_at(float(xx), float(yy), floor, ap, floors, patterns, radio, include_inter_floor, heatmap_settings))
+            tile[iy, ix] = max(values) if values else float(disconnected)
+    return int(start_index), tile
+
+# ----------------------------- Process-based IFC loading -----------------------------
+# IFC loading intentionally uses multiprocessing only. A QTimer polls the futures
+# from the GUI thread so no Qt worker thread is required. This keeps all GUI
+# updates on the main thread while IFC parsing happens in child processes.
 
 # ----------------------------- Drawing layers -----------------------------
 # Higher z-values are drawn above lower z-values. Keep heatmap colour below IFC
@@ -822,11 +1640,52 @@ Z_HEATMAP_FILL = -30
 Z_IFC_SPACE_FILL = -20
 Z_IFC_SPACE_OUTLINE = -10
 Z_IFC_WALL = 0
+Z_DXF_OVERLAY = 10
 Z_CONTOUR_LINE = 20
 Z_SAMPLE_MARK = 30
 Z_TEXT = 40
 Z_AP = 50
 Z_AP_LABEL = 55
+
+# ----------------------------- ACCESS POINT GRAPHIC ITEM -----------------------------
+
+class AccessPointGraphicsItem(QGraphicsEllipseItem):
+    def __init__(self, main, ap: AccessPoint, radius: float, colour: QColor):
+        super().__init__(ap.x - radius, ap.y - radius, radius * 2.0, radius * 2.0)
+        self.main = main
+        self.ap = ap
+        self.radius = radius
+
+        self.setBrush(QBrush(colour))
+        self.setPen(QPen(main._theme_colours()["ap_outline"], 0.2))
+        self.setZValue(Z_AP)
+        self.setFlags(
+            QGraphicsItem.ItemIsMovable |
+            QGraphicsItem.ItemIsSelectable |
+            QGraphicsItem.ItemSendsGeometryChanges
+        )
+        self.setCursor(Qt.OpenHandCursor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.setCursor(Qt.ClosedHandCursor)
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self.setCursor(Qt.OpenHandCursor)
+        scene_pos = self.sceneBoundingRect().center()
+        self.ap.x = float(scene_pos.x())
+        self.ap.y = float(scene_pos.y())
+        self.main.last_result = None
+        self.main.populate_ap_table()
+        super().mouseReleaseEvent(event)
+
+    def contextMenuEvent(self, event):
+        self.main.aps = [a for a in self.main.aps if a is not self.ap]
+        self.main.last_result = None
+        self.main.draw_floor()
+        self.main.populate_ap_table()
+        event.accept()
 
 # ----------------------------- GUI -----------------------------
 
@@ -841,13 +1700,61 @@ class PlanView(QGraphicsView):
         self.setOptimizationFlag(QGraphicsView.DontAdjustForAntialiasing, False)
         self.setMouseTracking(True)
         self.scale(1, -1)  # IFC Y-up style plan view
+        self._middle_panning = False
+        self._last_pan_pos = None
 
     def wheelEvent(self, event):
         factor = 1.2 if event.angleDelta().y() > 0 else 1 / 1.2
         self.scale(factor, factor)
 
+    def mouseMoveEvent(self, event):
+        if self._middle_panning and self._last_pan_pos is not None:
+            delta = event.position().toPoint() - self._last_pan_pos
+            self._last_pan_pos = event.position().toPoint()
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+            event.accept()
+            return
+
+        if getattr(self.main, "alignment_pick_mode", None) in {"ifc_1", "ifc_2"}:
+            pos = self.mapToScene(event.position().toPoint())
+            snap = self.main.nearest_ifc_snap_point(pos)
+            self.main.show_ifc_snap_marker(snap)
+
+        super().mouseMoveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MiddleButton:
+            self._middle_panning = True
+            self._last_pan_pos = event.position().toPoint()
+            self.setCursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
+
+        if getattr(self.main, "alignment_pick_mode", None) in {"ifc_1", "ifc_2"}:
+            if event.button() == Qt.LeftButton:
+                pos = self.mapToScene(event.position().toPoint())
+                snap = self.main.nearest_ifc_snap_point(pos)
+                self.main.capture_alignment_point(snap.x(), snap.y())
+                event.accept()
+                return
+
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MiddleButton:
+            self._middle_panning = False
+            self._last_pan_pos = None
+            self.setCursor(Qt.ArrowCursor)
+            event.accept()
+            return
+
+        super().mouseReleaseEvent(event)
+
     def mouseDoubleClickEvent(self, event):
         if self.main.floor is None:
+            return
+        if getattr(self.main, "alignment_pick_mode", None):
             return
         pos = self.mapToScene(event.position().toPoint())
         self.main.add_ap(pos.x(), pos.y())
@@ -856,6 +1763,17 @@ class PlanView(QGraphicsView):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+
+        # IFC multiprocessing/chunk-loader state
+        # Initialised defensively so process loading cannot fall back because
+        # chunk tracking attributes do not exist.
+        self._ifc_chunk_remaining = {}
+        self._ifc_chunk_total = {}
+        self._ifc_chunk_results = []
+        self._ifc_chunk_errors = []
+        self._ifc_chunk_futures = []
+        self._ifc_active_batch_id = 0
+        self._ifc_process_executor = None
         self.setWindowTitle("RF Attenuation Simulator")
         self.resize(1400, 900)
         self.floors: Dict[str, FloorModel] = {}
@@ -864,15 +1782,35 @@ class MainWindow(QMainWindow):
         self.aps: List[AccessPoint] = []
         self.antenna_patterns: Dict[str, AntennaPattern] = built_in_antenna_patterns()
         self.last_result: Optional[SimulationResult] = None
-        self.thread_pool = QThreadPool.globalInstance()
-        self.thread_pool.setMaxThreadCount(max(1, min(4, (os.cpu_count() or 2))))
+        self._ifc_process_executor: Optional[concurrent.futures.ProcessPoolExecutor] = None
+        self._ifc_process_futures: Dict[concurrent.futures.Future, Path] = {}
+        self._ifc_process_poll_timer = QTimer(self)
+        self._ifc_process_poll_timer.setInterval(100)
+        self._ifc_process_poll_timer.timeout.connect(self._poll_ifc_process_futures)
         self._load_pending = 0
         self._load_errors: List[str] = []
+        self._load_total = 0
+        self._load_completed = 0
+        self._load_progress_dialog: Optional[QProgressDialog] = None
+        self._load_started_keys = set()
+        self._load_finished_keys = set()
+        self._load_batch_id = 0
         self._loading_replace = False
         self._loading_active = False
         self.heatmap_settings = HeatmapSettings.default()
         self.heatmap_settings_path: Optional[Path] = None
+        self.dxf_overlay: Optional[DxfOverlay] = None
+        self.ifc_alignment = AlignmentTransform()
+        self.alignment_pick_mode: Optional[str] = None
+        self.alignment_pick_points: Dict[str, Tuple[float, float]] = {}
+        self._alignment_pick_sequence: List[str] = []
+        self._pending_dxf_alignment_path: Optional[Path] = None
+        self._ifc_snap_marker_items: List[QGraphicsItem] = []
+        self._ifc_pick_marker_items: List[QGraphicsItem] = []
         self.dark_theme = self._detect_dark_theme()
+
+        self._view_has_been_fitted = False
+        self._preserve_view_on_redraw = False
 
         self.view = PlanView(self)
         self.rssi_legend = QLabel()
@@ -881,37 +1819,36 @@ class MainWindow(QMainWindow):
         self.rssi_legend.setTextFormat(Qt.RichText)
         self._apply_theme_styles()
         self.floor_combo = QComboBox()
-        self.wall_table = QTableWidget(0, 7)
-        self.wall_table.setHorizontalHeaderLabels([
-            "Wall/material/type",
-            "2.4 GHz dB",
-            "5 GHz dB",
-            "6 GHz dB",
-            "Name",
-            "Source IFC",
-            "GUID",
-        ])
+        self.wall_table = QTableWidget(0, 0)
+        self._configure_wall_table_headers()
         self.wall_table.itemChanged.connect(self._wall_table_changed)
 
-        self.ap_table = QTableWidget(0, 9)
+        self.ap_table = QTableWidget(0, 11)
         self.ap_table.setHorizontalHeaderLabels([
-            "AP", "Floor", "X", "Y", "Pattern", "Azimuth", "Downtilt", "TX dBm", "Freq MHz"
+            "AP", "Radio", "Enabled", "Floor", "X", "Y", "Pattern", "Azimuth", "Downtilt", "TX dBm", "Freq MHz"
         ])
         self.ap_table.itemChanged.connect(self._ap_table_changed)
 
         self.resolution = QDoubleSpinBox()
-        self.resolution.setRange(0.3, 10.0)
-        self.resolution.setValue(0.3)
+        self.resolution.setRange(0.5, 10.0)
+        self.resolution.setValue(2.0)
         self.resolution.setSuffix(" m")
         self.tx_power = QDoubleSpinBox()
         self.tx_power.setRange(-10.0, 40.0)
-        self.tx_power.setValue(17.0)
+        self.tx_power.setValue(20.0)
         self.tx_power.setSuffix(" dBm")
         self.freq = QDoubleSpinBox()
-        self.freq.setRange(433.0, 7125.0)
+        self.freq.setRange(1.0, 100000.0)
         self.freq.setValue(2400.0)
         self.freq.setSingleStep(100.0)
         self.freq.setSuffix(" MHz")
+
+        self.rssi_view_frequency = QComboBox()
+        self.rssi_view_frequency.currentTextChanged.connect(self._rssi_view_frequency_changed)
+        self._refresh_rssi_frequency_dropdown()
+
+        self.rssi_results_by_frequency: Dict[float, SimulationResult] = {}
+
         self.pattern_combo = QComboBox()
         self.pattern_combo.addItems(list(self.antenna_patterns.keys()))
         self.azimuth = QDoubleSpinBox()
@@ -956,6 +1893,7 @@ class MainWindow(QMainWindow):
         controls = QWidget()
         form = QFormLayout(controls)
         form.addRow("Floor", self.floor_combo)
+        form.addRow("RSSI view frequency", self.rssi_view_frequency)
         form.addRow("Grid resolution", self.resolution)
         form.addRow("AP TX power", self.tx_power)
         form.addRow("Frequency / Wi-Fi band", self.freq)
@@ -1000,6 +1938,14 @@ class MainWindow(QMainWindow):
         self.open_action.triggered.connect(self.open_ifc)
         self.add_action = QAction("Add IFC(s)", self)
         self.add_action.triggered.connect(self.add_ifc)
+        self.open_dxf_action = QAction("Open DXF overlay", self)
+        self.open_dxf_action.triggered.connect(self.open_dxf_overlay)
+        self.align_ifc_action = QAction("Align IFC to DXF", self)
+        self.align_ifc_action.triggered.connect(self.show_dxf_alignment_dialog)
+        self.two_point_align_action = QAction("2-point align IFC/DXF", self)
+        self.two_point_align_action.triggered.connect(self.start_two_point_alignment)
+        self.clear_dxf_action = QAction("Clear DXF", self)
+        self.clear_dxf_action.triggered.connect(self.clear_dxf_overlay)
         self.sim_action = QAction("Simulate RSSI", self)
         self.sim_action.triggered.connect(self.simulate)
         self.export_action = QAction("Export CSV", self)
@@ -1010,9 +1956,48 @@ class MainWindow(QMainWindow):
         self.load_pattern_action.triggered.connect(self.load_pattern_csv)
         self.load_heatmap_settings_action = QAction("Load heatmap settings", self)
         self.load_heatmap_settings_action.triggered.connect(self.load_heatmap_settings)
-        tb.addActions([self.open_action, self.add_action, self.sim_action, self.export_action, self.clear_ap_action, self.load_pattern_action, self.load_heatmap_settings_action])
+        tb.addActions([self.open_action, self.add_action, self.open_dxf_action, self.align_ifc_action, self.two_point_align_action, self.clear_dxf_action, self.sim_action, self.export_action, self.clear_ap_action, self.load_pattern_action, self.load_heatmap_settings_action])
         self.floor_combo.currentTextChanged.connect(self.select_floor)
         self.include_inter_floor.stateChanged.connect(lambda *_: self.draw_floor())
+
+    def _refresh_rssi_frequency_dropdown(self):
+        if not hasattr(self, "rssi_view_frequency"):
+            return
+
+        current = self.rssi_view_frequency.currentText()
+        self.rssi_view_frequency.blockSignals(True)
+        self.rssi_view_frequency.clear()
+
+        for band in self._frequency_bands():
+            if band >= 1000:
+                label = f"{band / 1000:g} GHz"
+            else:
+                label = f"{band:g} MHz"
+            self.rssi_view_frequency.addItem(label, float(band))
+
+        if current:
+            idx = self.rssi_view_frequency.findText(current)
+            if idx >= 0:
+                self.rssi_view_frequency.setCurrentIndex(idx)
+
+        self.rssi_view_frequency.blockSignals(False)
+
+    def _selected_rssi_view_frequency(self) -> Optional[float]:
+        if not hasattr(self, "rssi_view_frequency"):
+            return None
+        data = self.rssi_view_frequency.currentData()
+        try:
+            return float(data)
+        except Exception:
+            return None
+
+    def _rssi_view_frequency_changed(self, *_):
+        freq = self._selected_rssi_view_frequency()
+        if freq is not None and freq in getattr(self, "rssi_results_by_frequency", {}):
+            self.last_result = self.rssi_results_by_frequency[freq]
+        else:
+            self.last_result = None
+        self.draw_floor()
 
     def _detect_dark_theme(self) -> bool:
         """Return True when the active Qt/OS palette appears to be dark."""
@@ -1043,6 +2028,7 @@ class MainWindow(QMainWindow):
             "ap_same_floor": hs.display_qcolour("ap_same_floor", dark, "#4D8DFF" if dark else "#0050FF"),
             "ap_other_floor": hs.display_qcolour("ap_other_floor", dark, "#C77DFF" if dark else "#7800B4"),
             "ap_outline": hs.display_qcolour("ap_outline", dark, "#D8E4FF" if dark else "#000050"),
+            "dxf_overlay": hs.display_qcolour("dxf_overlay", dark, "#62B7FF" if dark else "#0096FF"),
         }
 
     def _apply_theme_styles(self):
@@ -1058,6 +2044,21 @@ class MainWindow(QMainWindow):
                     border=colours["legend_border"].name(),
                 )
             )
+
+    @staticmethod
+    def _point_xy(point) -> Tuple[float, float]:
+        """Return x/y from either Qt-style points or geometry objects.
+
+        Qt types such as ``QPointF`` expose ``x()`` and ``y()`` methods, while
+        Shapely points expose ``x`` and ``y`` as float properties.  The simulator
+        uses both, so this helper prevents ``TypeError: 'float' object is not
+        callable`` when drawing labels from IFC-derived geometry.
+        """
+        x_attr = getattr(point, "x", 0.0)
+        y_attr = getattr(point, "y", 0.0)
+        x_val = x_attr() if callable(x_attr) else x_attr
+        y_val = y_attr() if callable(y_attr) else y_attr
+        return float(x_val), float(y_val)
 
     def _normalise_text_angle(self, angle_deg: float) -> float:
         """Keep text rotation readable on screen.
@@ -1127,6 +2128,474 @@ class MainWindow(QMainWindow):
         item.setTransform(t)
         return item
 
+    def _resolve_ifc_loader_process_count(self, requested_count: int = 0) -> int:
+        return _logical_process_count(requested_count)
+
+    def _ifc_loading_uses_multiprocessing(self) -> bool:
+        # Multiprocessing is the only asynchronous IFC loading path now. If this
+        # setting is false, loading falls back to a blocking single-process parse.
+        return bool(getattr(self.heatmap_settings, "enable_ifc_multiprocessing", True))
+
+    def _show_ifc_load_progress(self, total_files: int):
+        """Show a visible progress bar while IFC loading is active."""
+        if self._load_progress_dialog is not None:
+            self._load_progress_dialog.close()
+        self._load_progress_dialog = QProgressDialog(
+            "Preparing IFC loading...",
+            "",
+            0,
+            max(1, int(total_files)),
+            self,
+        )
+        self._load_progress_dialog.setWindowTitle("Loading IFC model")
+        self._load_progress_dialog.setCancelButton(None)  # IFC parsing workers cannot be safely cancelled mid-read.
+        self._load_progress_dialog.setWindowModality(Qt.WindowModal)
+        self._load_progress_dialog.setMinimumDuration(0)
+        self._load_progress_dialog.setAutoClose(False)
+        self._load_progress_dialog.setAutoReset(False)
+        self._load_progress_dialog.setValue(0)
+        self._load_progress_dialog.show()
+        QApplication.processEvents()
+
+    def _update_ifc_load_progress(self, current_file: str = ""):
+        if self._load_progress_dialog is None:
+            return
+        completed = max(0, int(self._load_completed))
+        total = max(1, int(self._load_total))
+        remaining = max(0, total - completed)
+        suffix = f"\nCurrent file: {current_file}" if current_file else ""
+        self._load_progress_dialog.setLabelText(
+            f"Loading IFC files: {completed} of {total} complete\n"
+            f"Remaining: {remaining}\n"
+            f"Workers: {getattr(self, '_load_worker_label', 'process loader')}{suffix}"
+        )
+        self._load_progress_dialog.setMaximum(total)
+        self._load_progress_dialog.setValue(min(completed, total))
+        QApplication.processEvents()
+
+    def _close_ifc_load_progress(self):
+        if self._load_progress_dialog is not None:
+            self._load_progress_dialog.setValue(max(1, self._load_total))
+            self._load_progress_dialog.close()
+            self._load_progress_dialog = None
+
+    def open_dxf_overlay(self):
+        """Open a DXF reference drawing directly without alignment.
+
+        For project alignment use the toolbar action "2-point align IFC/DXF".
+        That workflow asks for two snapped IFC points first, then opens the DXF
+        in a separate alignment window before inserting the corrected overlay.
+        """
+        path, _ = QFileDialog.getOpenFileName(self, "Open DXF overlay without alignment", "", "DXF files (*.dxf);;All files (*.*)")
+        if not path:
+            return
+        if ezdxf is None:
+            QMessageBox.critical(self, "Missing dependency", "ezdxf is required. Install with: pip install ezdxf")
+            return
+        try:
+            unit_scale = float(getattr(self.heatmap_settings, "dxf_unit_scale", 1.0))
+            auto_units = bool(getattr(self.heatmap_settings, "dxf_auto_unit_scale", True))
+            self.dxf_overlay = load_dxf_overlay(Path(path), unit_scale=unit_scale, auto_units=auto_units)
+        except Exception as exc:
+            QMessageBox.critical(self, "DXF load failed", str(exc))
+            return
+        self.statusBar().showMessage(
+            f"Loaded unaligned DXF overlay: {Path(path).name} ({len(self.dxf_overlay.primitives)} primitives), "
+            f"units={self.dxf_overlay.source_units_name}, scale={self.dxf_overlay.effective_scale_to_metres:g} m/unit"
+        )
+        self.draw_floor()
+
+    def clear_dxf_overlay(self):
+        self.dxf_overlay = None
+        self.statusBar().showMessage("Cleared DXF overlay")
+        self.draw_floor()
+
+    def show_dxf_alignment_dialog(self):
+        if not self.floors:
+            QMessageBox.information(self, "No IFC loaded", "Load an IFC model before aligning to a DXF.")
+            return
+        if self.dxf_overlay is None:
+            QMessageBox.information(self, "No DXF overlay", "Open a DXF overlay first, then align the IFC to it.")
+            return
+        dlg = DxfAlignmentDialog(self, transform=self.ifc_alignment, apply_callback=self.apply_ifc_alignment)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def start_two_point_alignment(self):
+        """Start the corrected two-stage DXF alignment workflow.
+
+        Stage 1 happens in the IFC scene: select two IFC reference points with
+        snapping to wall/space corners. Stage 2 opens the DXF in a separate
+        pre-alignment dialog where the user selects two matching DXF points with
+        DXF endpoint/corner snapping. Only the corrected DXF is then inserted.
+        """
+        if not self.floors or self.floor is None:
+            QMessageBox.information(self, "No IFC loaded", "Load an IFC model and select a floor before aligning a DXF.")
+            return
+        if ezdxf is None:
+            QMessageBox.critical(self, "Missing dependency", "ezdxf is required. Install with: pip install ezdxf")
+            return
+        self.alignment_pick_points = {}
+        self._alignment_pick_sequence = ["ifc_1", "ifc_2"]
+        self.alignment_pick_mode = "ifc_1"
+        self._pending_dxf_alignment_path = None
+        self.statusBar().showMessage("DXF alignment: click IFC reference point 1. Snapping is active on IFC corners/endpoints.")
+        QMessageBox.information(
+            self,
+            "DXF pre-alignment",
+            "Step 1: Select two reference points on the IFC first.\n\n"
+            "Snapping is available to IFC wall and space corners.\n\n"
+            "After the second IFC point is selected, choose the DXF file. The DXF "
+            "will open in a separate alignment window where you select the two "
+            "matching DXF points before the corrected DXF is inserted."
+        )
+        self.draw_floor()
+
+    def _ifc_snap_points(self) -> List[QPointF]:
+        """Return snap candidates for the current IFC floor."""
+        pts: List[QPointF] = []
+        if not self.floor:
+            return pts
+        for obj in list(self.floor.walls) + list(self.floor.spaces):
+            try:
+                coords = list(obj.polygon.exterior.coords)
+            except Exception:
+                continue
+            for x, y in coords:
+                pts.append(QPointF(float(x), float(y)))
+        for ap in self.aps:
+            if ap.floor == self.floor.name:
+                pts.append(QPointF(float(ap.x), float(ap.y)))
+        return pts
+
+    def nearest_ifc_snap_point(self, scene_pos: QPointF) -> QPointF:
+        """Return nearest IFC snap point within a screen-pixel snap radius."""
+        points = self._ifc_snap_points()
+        if not points:
+            return scene_pos
+        try:
+            p0 = self.view.mapToScene(0, 0)
+            p1 = self.view.mapToScene(18, 0)
+            snap_radius = max(0.01, abs(p1.x() - p0.x()))
+        except Exception:
+            snap_radius = 0.5
+        best = scene_pos
+        best_d = snap_radius
+        for p in points:
+            d = math.hypot(p.x() - scene_pos.x(), p.y() - scene_pos.y())
+            if d <= best_d:
+                best = p
+                best_d = d
+        return best
+
+    def show_ifc_snap_marker(self, point: QPointF):
+        """Show a temporary snap marker in the IFC view."""
+        scene = self.view.scene()
+        if scene is None:
+            return
+
+        for item in list(getattr(self, "_ifc_snap_marker_items", [])):
+            try:
+                if item.scene() is scene:
+                    scene.removeItem(item)
+            except RuntimeError:
+                pass
+
+        self._ifc_snap_marker_items = []
+
+        size = 0.25
+        pen = QPen(QColor("#00AEEF"), 0)
+        pen.setCosmetic(True)
+
+        h = scene.addLine(point.x() - size, point.y(), point.x() + size, point.y(), pen)
+        v = scene.addLine(point.x(), point.y() - size, point.x(), point.y() + size, pen)
+
+        h.setZValue(Z_AP_LABEL + 100)
+        v.setZValue(Z_AP_LABEL + 100)
+
+        self._ifc_snap_marker_items = [h, v]
+
+    def capture_alignment_point(self, x: float, y: float):
+        key = getattr(self, "alignment_pick_mode", None)
+        if key not in {"ifc_1", "ifc_2"}:
+            return
+        self.alignment_pick_points[key] = (float(x), float(y))
+        if key == "ifc_1":
+            self.alignment_pick_mode = "ifc_2"
+            self.statusBar().showMessage("Captured IFC point 1. Click IFC reference point 2.")
+            self._draw_alignment_pick_marks()
+            return
+
+        self.alignment_pick_mode = None
+        self.statusBar().showMessage("Captured IFC point 2. Choose DXF file for separate pre-alignment window.")
+        self._draw_alignment_pick_marks()
+        self._open_dxf_prealign_dialog()
+
+    def _open_dxf_prealign_dialog(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Open DXF for pre-alignment", "", "DXF files (*.dxf);;All files (*.*)")
+        if not path:
+            self.statusBar().showMessage("DXF alignment cancelled before DXF selection.")
+            return
+        pts = self.alignment_pick_points
+        try:
+            ifc_a = QPointF(float(pts["ifc_1"][0]), float(pts["ifc_1"][1]))
+            ifc_b = QPointF(float(pts["ifc_2"][0]), float(pts["ifc_2"][1]))
+        except Exception:
+            QMessageBox.warning(self, "IFC points missing", "Two IFC reference points are required before opening the DXF.")
+            return
+
+        self._pending_dxf_alignment_path = Path(path)
+        dlg = DxfPreAlignDialog(str(path), ifc_a, ifc_b, self)
+        dlg.alignmentReady.connect(self._apply_dxf_prealignment_result)
+        dlg.exec()
+
+    def _apply_dxf_prealignment_result(self, transform: SimilarityTransform2D):
+        """Insert the corrected DXF overlay after the separate dialog alignment."""
+        path = getattr(self, "_pending_dxf_alignment_path", None)
+        if path is None:
+            QMessageBox.warning(self, "DXF path missing", "No pending DXF path is available for alignment.")
+            return
+        try:
+            self.dxf_overlay = load_dxf_overlay_with_similarity_transform(Path(path), transform)
+        except Exception as exc:
+            QMessageBox.critical(self, "Corrected DXF insertion failed", str(exc))
+            return
+        self._pending_dxf_alignment_path = None
+        self.alignment_pick_points = {}
+        self._alignment_pick_sequence = []
+        self.draw_floor()
+        self.statusBar().showMessage(
+            f"Inserted pre-aligned DXF: {Path(path).name}. "
+            f"Scale={transform.scale:g}, rotation={math.degrees(transform.rotation_rad):.4f}°, "
+            f"offset=({transform.tx:.3f}, {transform.ty:.3f})"
+        )
+
+    def _draw_alignment_pick_marks(self):
+        # Redraw the floor, then add temporary IFC pick crosses on top.
+        self._preserve_view_on_redraw = True
+        try:
+            self.draw_floor()
+        finally:
+            self._preserve_view_on_redraw = False
+
+        scene = self.view.scene()
+        if scene is None:
+            return
+
+        pen = QPen(QColor("#FF00FF"), 0)
+        pen.setCosmetic(True)
+        size = 0.45
+        for label, (x, y) in getattr(self, "alignment_pick_points", {}).items():
+            l1 = scene.addLine(x - size, y, x + size, y, pen)
+            l2 = scene.addLine(x, y - size, x, y + size, pen)
+            l1.setZValue(Z_AP_LABEL + 90)
+            l2.setZValue(Z_AP_LABEL + 90)
+            self._add_upright_text(
+                scene,
+                label.replace("_", " ").upper(),
+                x + size,
+                y + size,
+                QColor("#FF00FF"),
+                4,
+                Z_AP_LABEL + 95,
+                bold=True,
+            )
+
+    def apply_two_point_alignment(self):
+        """Deprecated old four-click IFC/DXF scene alignment.
+
+        The active workflow is now:
+            select IFC point 1 -> select IFC point 2 -> open DXF dialog ->
+            select DXF point 1 -> select DXF point 2 -> insert corrected DXF.
+        """
+        QMessageBox.information(
+            self,
+            "Use DXF pre-alignment dialog",
+            "Use the toolbar action '2-point align IFC/DXF'. The new workflow "
+            "selects two IFC points first and then opens the DXF in a separate "
+            "snapping alignment window."
+        )
+
+    def apply_ifc_delta_alignment(self, delta: Tuple[float, float, float, float, float, float], status_prefix: str = "Applied IFC alignment"):
+        for floor in self.floors.values():
+            for wall in floor.walls:
+                wall.polygon = affine_transform(wall.polygon, delta)
+            for space in floor.spaces:
+                space.polygon = affine_transform(space.polygon, delta)
+        for ap in self.aps:
+            a, b, d, e, xoff, yoff = delta
+            old_x, old_y = float(ap.x), float(ap.y)
+            ap.x = a * old_x + b * old_y + xoff
+            ap.y = d * old_x + e * old_y + yoff
+        composed = AlignmentTransform._compose(delta, self.ifc_alignment.matrix())
+        self.ifc_alignment = AlignmentTransform.from_matrix(composed)
+        self.last_result = None
+        self.draw_floor()
+        self.populate_ap_table()
+        self.populate_wall_table()
+        self.statusBar().showMessage(
+            f"{status_prefix}: X {self.ifc_alignment.dx:.3f}, Y {self.ifc_alignment.dy:.3f}, "
+            f"rot {self.ifc_alignment.rotation_deg:.3f}°, scale {self.ifc_alignment.scale:.6f}"
+        )
+
+    def apply_ifc_alignment(self, new_transform: AlignmentTransform):
+        """Apply an absolute IFC alignment by transforming current model geometry by the required delta."""
+        try:
+            delta = AlignmentTransform.delta_matrix(self.ifc_alignment, new_transform)
+        except Exception as exc:
+            QMessageBox.critical(self, "Invalid alignment", str(exc))
+            return
+
+        self.apply_ifc_delta_alignment(delta, status_prefix="Applied IFC alignment")
+        self.ifc_alignment = new_transform
+        self.statusBar().showMessage(
+            f"Applied IFC alignment: X {new_transform.dx:.3f}, Y {new_transform.dy:.3f}, "
+            f"rot {new_transform.rotation_deg:.3f}°, scale {new_transform.scale:.6f}"
+        )
+
+    def _draw_dxf_overlay(self, scene: QGraphicsScene, colours: Dict[str, QColor]):
+        overlay = getattr(self, "dxf_overlay", None)
+        if overlay is None or not overlay.visible:
+            return
+        colour = QColor(colours.get("dxf_overlay", QColor("#0096FF")))
+        colour.setAlpha(max(0, min(255, int(getattr(self.heatmap_settings, "dxf_overlay_alpha", 190)))))
+        pen = QPen(colour, float(getattr(self.heatmap_settings, "dxf_overlay_line_width", 0.08)))
+        pen.setCosmetic(True)
+        for prim in overlay.primitives:
+            if len(prim.points) < 2:
+                continue
+            path = QPainterPath(QPointF(prim.points[0][0], prim.points[0][1]))
+            for x, y in prim.points[1:]:
+                path.lineTo(QPointF(x, y))
+            item = scene.addPath(path, pen)
+            item.setZValue(Z_DXF_OVERLAY)
+
+    def _ifc_path_key(self, path_obj) -> str:
+        path = Path(path_obj)
+        try:
+            return str(path.resolve()) if path.exists() else str(path)
+        except Exception:
+            return str(path)
+
+    def _mark_ifc_load_done(self, path_obj) -> bool:
+        """Mark one IFC path as finished/failed. Returns False for duplicate signals."""
+        key = self._ifc_path_key(path_obj)
+        if key in self._load_finished_keys:
+            return False
+        self._load_finished_keys.add(key)
+        if self._load_pending > 0:
+            self._load_pending -= 1
+        self._load_completed = min(self._load_total, self._load_completed + 1)
+        return True
+
+    def _schedule_ifc_load_timeout_watchdog(self):
+        timeout_seconds = int(getattr(self.heatmap_settings, "ifc_load_timeout_seconds", 900) or 0)
+        if timeout_seconds <= 0:
+            return
+        batch_id = int(self._load_batch_id)
+        QTimer.singleShot(timeout_seconds * 1000, lambda bid=batch_id: self._ifc_load_timeout_check(bid))
+
+    def _ifc_load_timeout_check(self, batch_id: int):
+        if not self._loading_active or batch_id != self._load_batch_id:
+            return
+        missing = [k for k in self._load_started_keys if k not in self._load_finished_keys]
+        if not missing:
+            self._finish_ifc_batch_if_ready()
+            return
+        for key in missing:
+            self._load_errors.append(f"{Path(key).name}: timed out during IFC loading")
+            self._mark_ifc_load_done(key)
+        self._update_ifc_load_progress("timeout")
+        self._finish_ifc_batch_if_ready()
+
+    def _shutdown_ifc_process_executor(self):
+        if self._ifc_process_poll_timer.isActive():
+            self._ifc_process_poll_timer.stop()
+        executor = self._ifc_process_executor
+        self._ifc_process_executor = None
+        self._ifc_process_futures = {}
+        if not hasattr(self, "_ifc_chunk_remaining") or not isinstance(self._ifc_chunk_remaining, dict):
+            self._ifc_chunk_remaining = {}
+        if executor is not None:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                executor.shutdown(wait=False)
+            except Exception:
+                pass
+
+    def _poll_ifc_process_futures(self):
+        """Poll IFC worker-process futures safely from the GUI thread.
+
+        Handles native crashes/BrokenProcessPool from huge IFC geometry reads
+        without raising KeyError or hanging the progress dialog.
+        """
+        if not self._loading_active:
+            self._shutdown_ifc_process_executor()
+            return
+        if not self._ifc_process_futures:
+            self._finish_ifc_batch_if_ready()
+            return
+
+        completed = [future for future in list(self._ifc_process_futures.keys()) if future.done()]
+        pool_broken = False
+
+        for future in completed:
+            meta = self._ifc_process_futures.pop(future, None)
+            if meta is None:
+                continue
+
+            path = meta[0] if isinstance(meta, tuple) else meta
+            kind = meta[1] if isinstance(meta, tuple) and len(meta) > 1 else "file"
+
+            try:
+                result = future.result()
+                if kind == "chunk":
+                    path_str, incoming, source_name, chunk_index, chunk_count = result
+                    self._ifc_chunk_finished(Path(path_str), incoming, source_name, chunk_index, chunk_count)
+                else:
+                    path_str, incoming, source_name = result
+                    self._ifc_worker_finished(Path(path_str), incoming, source_name)
+
+            except concurrent.futures.process.BrokenProcessPool as exc:
+                pool_broken = True
+                self._load_errors.append(
+                    f"{Path(path).name}: IFC worker process crashed while reading geometry. "
+                    f"For very large IFCs, reduce concurrent IFC workers or increase RAM. {exc}"
+                )
+                if kind == "chunk":
+                    self._ifc_chunk_error(path, "worker process crashed while reading geometry")
+                else:
+                    self._ifc_worker_error(path, "worker process crashed while reading geometry")
+                break
+
+            except Exception as exc:
+                if kind == "chunk":
+                    self._ifc_chunk_error(path, str(exc))
+                else:
+                    self._ifc_worker_error(path, str(exc))
+
+        if pool_broken:
+            remaining_meta = list(self._ifc_process_futures.values())
+            self._ifc_process_futures.clear()
+            seen_paths = set()
+            for meta in remaining_meta:
+                p = meta[0] if isinstance(meta, tuple) else meta
+                key = self._ifc_path_key(p)
+                if key in seen_paths or key in self._load_finished_keys:
+                    continue
+                seen_paths.add(key)
+                self._load_errors.append(f"{Path(p).name}: cancelled because the IFC process pool crashed.")
+                self._mark_ifc_load_done(p)
+            self._shutdown_ifc_process_executor()
+            self._update_ifc_load_progress("process pool crashed")
+            self._finish_ifc_batch_if_ready()
+            return
+
+        if not self._ifc_process_futures:
+            self._finish_ifc_batch_if_ready()
+
     def open_ifc(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "Open IFC file(s)", "", "IFC files (*.ifc);;All files (*.*)")
         if not paths:
@@ -1152,6 +2621,10 @@ class MainWindow(QMainWindow):
             self.loaded_ifc_paths = []
             self.aps.clear()
             self.last_result = None
+            self.ifc_alignment = AlignmentTransform()
+        self.alignment_pick_mode: Optional[str] = None
+        self.alignment_pick_points: Dict[str, Tuple[float, float]] = {}
+        self._alignment_pick_sequence: List[str] = []
 
         unique_paths = []
         seen = {p.resolve() for p in self.loaded_ifc_paths if p.exists()}
@@ -1164,43 +2637,261 @@ class MainWindow(QMainWindow):
             return
 
         self._load_pending = len(unique_paths)
+        self._load_total = len(unique_paths)
+        self._load_completed = 0
         self._load_errors = []
+        self._load_started_keys = {self._ifc_path_key(p) for p in unique_paths}
+        self._load_finished_keys = set()
+        self._load_batch_id += 1
         self._loading_replace = replace
         self._loading_active = True
+        use_processes = self._ifc_loading_uses_multiprocessing()
+        requested_processes = int(getattr(self.heatmap_settings, "max_ifc_loader_processes", 0) or 0)
+        available_process_count = self._resolve_ifc_loader_process_count(requested_processes)
+
+        # Do not cap the process pool by the number of IFC files when at least
+        # one large file will be split into geometry chunks. The earlier version
+        # used ``min(cpu_count, len(unique_paths))`` which meant a single 500 MB
+        # IFC could only ever use one process, even though it was later split
+        # into many chunk jobs.
+        chunk_threshold_mb = float(getattr(self.heatmap_settings, "chunk_ifc_files_over_mb", 100.0) or 0.0)
+        enable_chunking = bool(getattr(self.heatmap_settings, "enable_chunked_ifc_geometry_extraction", True))
+        huge_threshold_mb = float(getattr(self.heatmap_settings, "huge_ifc_single_process_threshold_mb", 512.0) or 0.0)
+        max_parallel_huge = max(1, int(getattr(self.heatmap_settings, "max_parallel_huge_ifc_processes", 1) or 1))
+        has_large_chunked_ifc = False
+        if use_processes and enable_chunking and chunk_threshold_mb > 0.0:
+            for path in unique_paths:
+                try:
+                    if path.exists() and (path.stat().st_size / (1024.0 * 1024.0)) >= chunk_threshold_mb:
+                        has_large_chunked_ifc = True
+                        break
+                except Exception:
+                    pass
+
+        if use_processes:
+            # Always create a pool capable of using all configured/logical cores.
+            # The previous logic capped the pool to the number of IFC files when
+            # a file was not detected as "large" before chunking. That meant
+            # loading one or two large/complex models often showed only one or two
+            # busy cores in Task Manager. The job submission path below decides
+            # how many chunks to submit; the pool should not be artificially capped.
+            process_count = max(1, available_process_count)
+        else:
+            process_count = 1
+
+        if use_processes and huge_threshold_mb > 0.0:
+            huge_flags = []
+            for p in unique_paths:
+                try:
+                    huge_flags.append(p.exists() and (p.stat().st_size / (1024.0 * 1024.0)) >= huge_threshold_mb)
+                except Exception:
+                    huge_flags.append(False)
+            if huge_flags and all(huge_flags):
+                process_count = min(process_count, max_parallel_huge)
+        self._load_worker_label = f"{process_count} process(es)" if use_processes else "single process"
         self._set_loading_ui(True)
+        self._show_ifc_load_progress(self._load_total)
+        self._update_ifc_load_progress()
+        self._schedule_ifc_load_timeout_watchdog()
         self.statusBar().showMessage(
-            f"Loading {self._load_pending} IFC file(s) using {self.thread_pool.maxThreadCount()} worker thread(s)..."
+            f"Loading {self._load_pending} IFC file(s) using {self._load_worker_label} on {os.cpu_count() or 1} logical CPU core(s)..."
         )
 
-        for path in unique_paths:
-            worker = IFCLoadWorker(path)
-            worker.signals.finished.connect(self._ifc_worker_finished)
-            worker.signals.error.connect(self._ifc_worker_error)
-            self.thread_pool.start(worker)
+        base_jobs = [(
+            str(path), 0.0, 0.0, 0.0,
+            self.heatmap_settings.project_external_walls_across_floors,
+            self.heatmap_settings.external_wall_keywords,
+        ) for path in unique_paths]
+
+        if use_processes:
+            try:
+                self._shutdown_ifc_process_executor()
+                self._ifc_chunk_remaining = {}
+                self._ifc_chunk_total = {}
+                self._ifc_chunk_sources = {}
+                self._ifc_chunk_had_error = {}
+                self._ifc_process_executor = concurrent.futures.ProcessPoolExecutor(max_workers=process_count)
+                self._ifc_process_futures = {}
+                chunk_size = max(25, int(getattr(self.heatmap_settings, "ifc_geometry_chunk_size", 250) or 250))
+                for job in base_jobs:
+                    path = Path(job[0])
+                    size_mb = (path.stat().st_size / (1024.0 * 1024.0)) if path.exists() else 0.0
+                    # Chunk geometry whenever enabled and the file meets the configured
+                    # threshold. A threshold of 0 forces chunking for all IFCs.
+                    # This makes a single IFC capable of occupying multiple worker
+                    # processes instead of only one whole-file worker.
+                    is_huge_ifc = bool(huge_threshold_mb > 0.0 and size_mb >= huge_threshold_mb)
+                    should_chunk_this_file = (
+                        enable_chunking
+                        and process_count > 1
+                        and path.exists()
+                        and size_mb >= max(0.0, chunk_threshold_mb)
+                        and not is_huge_ifc
+                    )
+                    if is_huge_ifc:
+                        # Memory-safe huge-model path. Do not split into many
+                        # workers because every chunk worker reopens the full IFC.
+                        self.statusBar().showMessage(
+                            f"{path.name} is {size_mb:.0f} MB; using one isolated IFC process to avoid duplicate model loads..."
+                        )
+                        fut = self._ifc_process_executor.submit(_load_ifc_file_in_process, job)
+                        self._ifc_process_futures[fut] = (path, "file")
+                    elif should_chunk_this_file:
+                        try:
+                            self.statusBar().showMessage(
+                                f"Indexing {path.name} before chunked multiprocessing..."
+                            )
+                            QApplication.processEvents()
+                            path_str, storeys, wall_guids, space_guids, source_name = _index_ifc_file_for_chunking(job)
+                            records = [("wall", g) for g in wall_guids] + [("space", g) for g in space_guids]
+                            if not records:
+                                fut = self._ifc_process_executor.submit(_load_ifc_file_in_process, job)
+                                self._ifc_process_futures[fut] = (path, "file")
+                                continue
+                            chunks = [records[i:i + chunk_size] for i in range(0, len(records), chunk_size)]
+                            key = self._ifc_path_key(path)
+                            self._ifc_chunk_remaining[key] = len(chunks)
+                            self._ifc_chunk_total[key] = len(chunks)
+                            self._ifc_chunk_sources[key] = source_name
+                            self._ifc_chunk_had_error[key] = False
+                            for idx, chunk in enumerate(chunks, start=1):
+                                chunk_wall_guids = [g for kind, g in chunk if kind == "wall"]
+                                chunk_space_guids = [g for kind, g in chunk if kind == "space"]
+                                chunk_job = (
+                                    path_str, job[1], job[2], job[3], job[4], job[5],
+                                    storeys, chunk_wall_guids, chunk_space_guids, idx, len(chunks),
+                                )
+                                fut = self._ifc_process_executor.submit(_load_ifc_geometry_chunk_in_process, chunk_job)
+                                self._ifc_process_futures[fut] = (path, "chunk")
+                            active_jobs = min(process_count, len(chunks))
+                            self.statusBar().showMessage(
+                                f"Chunked {path.name}: {len(records)} elements across {len(chunks)} geometry jobs "
+                                f"using up to {active_jobs}/{process_count} process(es)..."
+                            )
+                        except Exception as exc:
+                            self._load_errors.append(f"{path.name}: chunk index failed ({exc}); falling back to whole-file process loading")
+                            fut = self._ifc_process_executor.submit(_load_ifc_file_in_process, job)
+                            self._ifc_process_futures[fut] = (path, "file")
+                    else:
+                        fut = self._ifc_process_executor.submit(_load_ifc_file_in_process, job)
+                        self._ifc_process_futures[fut] = (path, "file")
+                self._ifc_process_poll_timer.start()
+            except Exception as exc:
+                self._load_errors.append(f"Process loader failed to start: {exc}. No in-GUI-process IFC fallback was used.")
+                for job in base_jobs:
+                    self._ifc_worker_error(Path(job[0]), "process loader failed to start")
+                return
+
+        if not use_processes:
+            # Blocking fallback only when explicitly enabled/required. It is
+            # disabled by default because huge IFC native crashes can terminate
+            # the GUI process if parsed in-process.
+            if not bool(getattr(self.heatmap_settings, "allow_blocking_ifc_fallback", False)):
+                for job in base_jobs:
+                    self._ifc_worker_error(Path(job[0]), "IFC multiprocessing is disabled and blocking fallback is not allowed")
+                return
+            for job in base_jobs:
+                path = Path(job[0])
+                try:
+                    path_str, incoming, source_name = _load_ifc_file_in_process(job)
+                    self._ifc_worker_finished(Path(path_str), incoming, source_name)
+                except Exception as exc:
+                    self._ifc_worker_error(path, str(exc))
+
+    def _ifc_chunk_finished(self, path_obj, incoming, source_name: str, chunk_index: int, chunk_count: int):
+        path = Path(path_obj)
+        key = self._ifc_path_key(path)
+        if key in self._load_finished_keys:
+            return
+        CombinedIFCModel.merge(self.floors, incoming, source_name)
+        remaining = max(0, int(self._ifc_chunk_remaining.get(key, 1)) - 1)
+        self._ifc_chunk_remaining[key] = remaining
+        done = int(self._ifc_chunk_total.get(key, chunk_count)) - remaining
+        self.statusBar().showMessage(
+            f"Loaded geometry chunk {done}/{self._ifc_chunk_total.get(key, chunk_count)} for {path.name}."
+        )
+        if remaining <= 0:
+            if self._mark_ifc_load_done(path):
+                self._apply_frequency_settings_to_model(replace_existing=False)
+                self.loaded_ifc_paths.append(path)
+                self._update_ifc_load_progress(path.name)
+                self.statusBar().showMessage(
+                    f"Loaded {path.name} from {self._ifc_chunk_total.get(key, chunk_count)} geometry chunks. "
+                    f"Waiting for {self._load_pending} IFC file(s)..."
+                )
+            self._finish_ifc_batch_if_ready()
+
+    def _ifc_chunk_error(self, path_obj, message: str):
+        path = Path(path_obj)
+        key = self._ifc_path_key(path)
+        if key in self._load_finished_keys:
+            return
+        self._ifc_chunk_had_error[key] = True
+        self._load_errors.append(f"{path.name}: geometry chunk failed: {message}")
+        remaining = max(0, int(self._ifc_chunk_remaining.get(key, 1)) - 1)
+        self._ifc_chunk_remaining[key] = remaining
+        if remaining <= 0:
+            if self._mark_ifc_load_done(path):
+                # Keep any chunks that did load, but report the file as partial.
+                if any(f.walls or f.spaces for f in self.floors.values()):
+                    self.loaded_ifc_paths.append(path)
+                self._update_ifc_load_progress(path.name)
+            self._finish_ifc_batch_if_ready()
 
     @Slot(object, object, str)
     def _ifc_worker_finished(self, path_obj, incoming, source_name: str):
+
+        # Defensive IFC chunk-state guard
+        if not hasattr(self, "_ifc_chunk_remaining") or not isinstance(self._ifc_chunk_remaining, dict):
+            self._ifc_chunk_remaining = {}
+        if not hasattr(self, "_ifc_chunk_total") or not isinstance(self._ifc_chunk_total, dict):
+            self._ifc_chunk_total = {}
+        if not hasattr(self, "_ifc_chunk_results"):
+            self._ifc_chunk_results = []
+        if not hasattr(self, "_ifc_chunk_errors"):
+            self._ifc_chunk_errors = []
+        if not hasattr(self, "_ifc_chunk_futures"):
+            self._ifc_chunk_futures = []
         path = Path(path_obj)
+        if not self._mark_ifc_load_done(path):
+            return
         CombinedIFCModel.merge(self.floors, incoming, source_name)
+        self._apply_frequency_settings_to_model(replace_existing=False)
         self.loaded_ifc_paths.append(path)
-        self._load_pending -= 1
         total_loaded = len(self.loaded_ifc_paths)
+        self._update_ifc_load_progress(path.name)
         self.statusBar().showMessage(f"Loaded {path.name}. Waiting for {self._load_pending} IFC file(s)... Total loaded: {total_loaded}")
         self._finish_ifc_batch_if_ready()
 
     @Slot(object, str)
     def _ifc_worker_error(self, path_obj, message: str):
         path = Path(path_obj)
+        if not self._mark_ifc_load_done(path):
+            return
         self._load_errors.append(f"{path.name}: {message}")
-        self._load_pending -= 1
+        self._update_ifc_load_progress(path.name)
         self.statusBar().showMessage(f"Failed to load {path.name}. Waiting for {self._load_pending} IFC file(s)...")
         self._finish_ifc_batch_if_ready()
 
     def _finish_ifc_batch_if_ready(self):
+
+        # Defensive IFC chunk-state guard
+        if not hasattr(self, "_ifc_chunk_remaining") or not isinstance(self._ifc_chunk_remaining, dict):
+            self._ifc_chunk_remaining = {}
+        if not hasattr(self, "_ifc_chunk_total") or not isinstance(self._ifc_chunk_total, dict):
+            self._ifc_chunk_total = {}
+        if not hasattr(self, "_ifc_chunk_results"):
+            self._ifc_chunk_results = []
+        if not hasattr(self, "_ifc_chunk_errors"):
+            self._ifc_chunk_errors = []
+        if not hasattr(self, "_ifc_chunk_futures"):
+            self._ifc_chunk_futures = []
         if self._load_pending > 0:
             return
         self._loading_active = False
         self._set_loading_ui(False)
+        self._close_ifc_load_progress()
+        self._shutdown_ifc_process_executor()
         self._refresh_floor_combo()
         total_walls = sum(len(f.walls) for f in self.floors.values())
         total_spaces = sum(len(f.spaces) for f in self.floors.values())
@@ -1209,6 +2900,25 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Some IFC files failed", "\n".join(self._load_errors))
             msg += f". {len(self._load_errors)} file(s) failed."
         self.statusBar().showMessage(msg)
+
+    def _ensure_ifc_loader_state(self):
+        """Ensure multiprocessing IFC state exists before any callback uses it."""
+        if not hasattr(self, '_ifc_chunk_remaining') or not isinstance(self._ifc_chunk_remaining, dict):
+            self._ifc_chunk_remaining = {}
+        if not hasattr(self, '_ifc_chunk_total') or not isinstance(self._ifc_chunk_total, dict):
+            self._ifc_chunk_total = {}
+        if not hasattr(self, '_ifc_chunk_results'):
+            self._ifc_chunk_results = []
+        if not hasattr(self, '_ifc_batch_pending'):
+            self._ifc_batch_pending = set()
+        if not hasattr(self, '_ifc_batch_completed'):
+            self._ifc_batch_completed = set()
+        if not hasattr(self, '_ifc_batch_failed'):
+            self._ifc_batch_failed = []
+        if not hasattr(self, '_ifc_process_futures'):
+            self._ifc_process_futures = []
+        if not hasattr(self, '_ifc_process_executor'):
+            self._ifc_process_executor = None
 
     def _refresh_floor_combo(self):
         self.floor_combo.blockSignals(True)
@@ -1224,6 +2934,9 @@ class MainWindow(QMainWindow):
     def _set_loading_ui(self, loading: bool):
         self.open_action.setEnabled(not loading)
         self.add_action.setEnabled(not loading)
+        self.open_dxf_action.setEnabled(not loading)
+        self.align_ifc_action.setEnabled(not loading)
+        self.clear_dxf_action.setEnabled(not loading)
         self.sim_action.setEnabled(not loading)
         self.export_action.setEnabled(not loading)
         self.clear_ap_action.setEnabled(not loading)
@@ -1231,7 +2944,20 @@ class MainWindow(QMainWindow):
         self.floor_combo.setEnabled(not loading)
 
     def select_floor(self, name: str):
-        self.floor = self.floors.get(name)
+        # Avoid calling ``self.floors.get(...)`` directly. A previous settings/UI
+        # change could accidentally shadow a ``get`` attribute with a numeric
+        # value, which causes: TypeError: 'float' object is not callable.
+        # Treat ``self.floors`` strictly as a mapping and use the dict type
+        # implementation where possible.
+        if not isinstance(self.floors, dict):
+            QMessageBox.critical(
+                self,
+                "Internal model error",
+                f"Expected self.floors to be a dict, got {type(self.floors).__name__}."
+            )
+            self.floor = None
+            return
+        self.floor = dict.get(self.floors, str(name), None)
         self.last_result = None
         self._load_slab_attenuation_to_ui()
         self.draw_floor()
@@ -1241,19 +2967,47 @@ class MainWindow(QMainWindow):
     def add_ap(self, x: float, y: float):
         if not self.floor:
             return
+        default_radios = []
+        for idx, radio_def in enumerate(self.heatmap_settings.default_ap_radios or []):
+            # Settings should provide each radio as a dict. If an older/edited
+            # settings file has a bare number or other value, skip it instead of
+            # trying to call ``radio_def.get(...)`` on a float.
+            if not isinstance(radio_def, dict):
+                continue
+            get_value = dict.get
+            pattern = str(get_value(radio_def, "antenna_pattern", self.pattern_combo.currentText()))
+            if pattern not in self.antenna_patterns:
+                pattern = self.pattern_combo.currentText()
+            default_radios.append(APRadio(
+                name=str(get_value(radio_def, "name", f"Radio-{idx + 1}")),
+                frequency_mhz=float(get_value(radio_def, "frequency_mhz", self.freq.value())),
+                tx_power_dbm=float(get_value(radio_def, "tx_power_dbm", self.tx_power.value())),
+                antenna_pattern=pattern,
+                enabled=bool(get_value(radio_def, "enabled", True)),
+            ))
+        if not default_radios:
+            default_radios = [APRadio(
+                name="Radio-1",
+                frequency_mhz=float(self.freq.value()),
+                tx_power_dbm=float(self.tx_power.value()),
+                antenna_pattern=self.pattern_combo.currentText(),
+                enabled=True,
+            )]
+        first_radio = default_radios[0]
         ap = AccessPoint(
             name=f"AP-{len(self.aps)+1}",
             x=x,
             y=y,
             floor=self.floor.name,
-            tx_power_dbm=float(self.tx_power.value()),
-            frequency_mhz=float(self.freq.value()),
+            tx_power_dbm=float(first_radio.tx_power_dbm),
+            frequency_mhz=float(first_radio.frequency_mhz),
             path_loss_exponent=float(self.ple.value()),
-            antenna_pattern=self.pattern_combo.currentText(),
+            antenna_pattern=first_radio.antenna_pattern,
             azimuth_deg=float(self.azimuth.value()),
             downtilt_deg=float(self.downtilt.value()),
             mount_height_m=float(self.mount_height.value()),
             rx_height_m=float(self.rx_height.value()),
+            radios=default_radios,
         )
         self.aps.append(ap)
         self.draw_floor()
@@ -1267,6 +3021,7 @@ class MainWindow(QMainWindow):
     def draw_floor(self):
         scene = self.view.scene()
         scene.clear()
+        self._ifc_snap_marker_items = []
         if not self.floor:
             return
         # Draw heatmap first so the building geometry remains visible above it.
@@ -1274,6 +3029,7 @@ class MainWindow(QMainWindow):
             self._draw_heatmap(self.last_result)
 
         colours = self._theme_colours()
+        self._draw_dxf_overlay(scene, colours)
         # Draw spaces/floor areas with a stronger outline and subtle fill so the
         # extent of the floor remains readable even before a simulation is run.
         for space in self.floor.spaces:
@@ -1289,8 +3045,9 @@ class MainWindow(QMainWindow):
 
             if space.name:
                 centroid = space.polygon.representative_point()
+                cx, cy = self._point_xy(centroid)
                 self._add_upright_text(
-                    scene, str(space.name), centroid.x(), centroid.y(),
+                    scene, str(space.name), cx, cy,
                     colours["space_text"], self.heatmap_settings.space_label_font_size, Z_TEXT, bold=True
                 )
 
@@ -1301,7 +3058,7 @@ class MainWindow(QMainWindow):
             wall_pen = QPen(colours["wall_pen"], self.heatmap_settings.wall_line_width)
             wall_pen.setCosmetic(True)
             item.setPen(wall_pen)
-            fill_key = "wall_alt_fill" if wall.source_file else "wall_fill"
+            fill_key = "wall_alt_fill" if getattr(wall, "projected_to_floor", False) else "wall_fill"
             item.setBrush(QBrush(colours[fill_key]))
             item.setZValue(Z_IFC_WALL)
             item.setFlag(QGraphicsItem.ItemIsSelectable, True)
@@ -1311,11 +3068,33 @@ class MainWindow(QMainWindow):
             same_floor = ap.floor == self.floor.name
             radius = 0.75 if same_floor else 0.45
             colour = colours["ap_same_floor"] if same_floor else colours["ap_other_floor"]
-            dot = QGraphicsEllipseItem(ap.x - radius, ap.y - radius, radius * 2.0, radius * 2.0)
-            dot.setBrush(QBrush(colour))
-            dot.setPen(QPen(colours["ap_outline"], 0.2))
-            dot.setZValue(Z_AP if same_floor else Z_AP - 5)
-            scene.addItem(dot)
+            if self.heatmap_settings.show_ap_cutoff_zones and same_floor:
+                active_radii = []
+                for radio in ap.active_radios():
+                    r = RFEngine.cutoff_radius_m_for_radio(radio, self.heatmap_settings)
+                    if r > 0:
+                        active_radii.append(r)
+                for r in sorted(set(round(v, 3) for v in active_radii)):
+                    cut_colour = QColor(colours.get("ap_cutoff_zone", colour))
+                    cut_colour.setAlpha(self.heatmap_settings.ap_cutoff_zone_alpha)
+                    cut_pen = QPen(cut_colour, self.heatmap_settings.ap_cutoff_zone_line_width)
+                    cut_pen.setCosmetic(True)
+                    cut_item = QGraphicsEllipseItem(ap.x - r, ap.y - r, r * 2.0, r * 2.0)
+                    cut_item.setPen(cut_pen)
+                    cut_item.setBrush(QBrush(Qt.NoBrush))
+                    cut_item.setZValue(Z_CONTOUR_LINE - 2)
+                    scene.addItem(cut_item)
+
+            if same_floor:
+                dot = AccessPointGraphicsItem(self, ap, radius, colour)
+                scene.addItem(dot)
+            else:
+                dot = QGraphicsEllipseItem(ap.x - radius, ap.y - radius, radius * 2.0, radius * 2.0)
+                dot.setBrush(QBrush(colour))
+                dot.setPen(QPen(colours["ap_outline"], 0.2))
+                dot.setZValue(Z_AP - 5)
+                scene.addItem(dot)
+
             # Draw a short boresight arrow so directional antenna orientation can be checked.
             length = 5.0 if same_floor else 3.0
             ang = math.radians(ap.azimuth_deg)
@@ -1325,8 +3104,20 @@ class MainWindow(QMainWindow):
             arrow.setZValue(Z_AP)
             if not same_floor:
                 self._add_upright_text(scene, ap.floor, ap.x + 0.8, ap.y + 0.8, colour, self.heatmap_settings.ap_label_font_size, Z_AP_LABEL)
+
+        old_transform = self.view.transform()
+        old_h = self.view.horizontalScrollBar().value()
+        old_v = self.view.verticalScrollBar().value()
+
         scene.setSceneRect(scene.itemsBoundingRect().adjusted(-10, -10, 10, 10))
-        self.view.fitInView(scene.sceneRect(), Qt.KeepAspectRatio)
+
+        if getattr(self, "_preserve_view_on_redraw", False) or getattr(self, "_view_has_been_fitted", False):
+            self.view.setTransform(old_transform)
+            self.view.horizontalScrollBar().setValue(old_h)
+            self.view.verticalScrollBar().setValue(old_v)
+        else:
+            self.view.fitInView(scene.sceneRect(), Qt.KeepAspectRatio)
+            self._view_has_been_fitted = True
 
     def _draw_heatmap(self, result: SimulationResult):
         """Draw smooth filled RSSI contours, isolines and sampled RSSI points.
@@ -1550,7 +3341,7 @@ class MainWindow(QMainWindow):
         pieces = [
             f"<b>RSSI isolines</b> &nbsp; "
             f"<span style='color:{legend_text};'>Bands: {band_text} dBm. "
-            f"Clients disconnect below {self.heatmap_settings.minimum_client_rssi_dbm:.0f} dBm. <br/>"
+            f"Clients disconnect below {self.heatmap_settings.minimum_client_rssi_dbm:.0f} dBm. <br/> "
             f"Pattern files in settings: {pattern_count}</span>"
         ]
         for zone in self.heatmap_settings.zones:
@@ -1593,6 +3384,10 @@ class MainWindow(QMainWindow):
                 if not pattern_path.is_absolute():
                     pattern_path = base_dir / pattern_path
                 loaded_patterns.append(self.load_pattern_csv_path(pattern_path))
+            self._apply_frequency_settings_to_model(replace_existing=False)
+            self._refresh_rssi_frequency_dropdown()
+            self.populate_ap_table()
+            self.populate_wall_table()
             self._update_rssi_legend()
             self.draw_floor()
             extra = f"\nLoaded RF pattern files: {', '.join(loaded_patterns)}" if loaded_patterns else ""
@@ -1600,23 +3395,81 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "Heatmap settings failed", str(exc))
 
+    def _frequency_bands(self) -> List[float]:
+        return sorted({float(v) for v in self.heatmap_settings.common_frequencies_mhz})
+
+    def _frequency_label(self, mhz: float) -> str:
+        mhz = float(mhz)
+        if mhz >= 1000.0:
+            return f"{mhz / 1000.0:g} GHz dB"
+        return f"{mhz:g} MHz dB"
+
+    def _configure_wall_table_headers(self):
+        bands = self._frequency_bands() if hasattr(self, "heatmap_settings") else [2400.0, 5000.0, 6000.0]
+        headers = ["Wall/material/type"] + [self._frequency_label(b) for b in bands] + ["Name", "Source IFC", "GUID"]
+        self.wall_table.setColumnCount(len(headers))
+        self.wall_table.setHorizontalHeaderLabels(headers)
+
+    def _profile_for_wall_from_settings(self, wall: Wall2D) -> Dict[float, float]:
+        text = f"{wall.material} {wall.type_name} {wall.name}".lower()
+        profiles = self.heatmap_settings.default_wall_attenuation_by_material_db
+        for key, profile in profiles.items():
+            if key != "default" and key.lower() in text:
+                return dict(profile)
+        return dict(profiles.get("default", {}))
+
+    def _apply_frequency_settings_to_model(self, replace_existing: bool = False):
+        """Ensure loaded floors/walls contain attenuation values for all configured frequencies."""
+        bands = self._frequency_bands()
+        floor_profile = self.heatmap_settings.default_floor_attenuation_by_frequency_db
+        for floor in self.floors.values():
+            for band in bands:
+                if replace_existing or band not in floor.slab_attenuation_by_band_db:
+                    floor.slab_attenuation_by_band_db[band] = float(floor_profile.get(band, floor.slab_attenuation_db_for_frequency(band)))
+            for wall in floor.walls:
+                profile = self._profile_for_wall_from_settings(wall)
+                for band in bands:
+                    if replace_existing or band not in wall.attenuation_by_band_db:
+                        wall.attenuation_by_band_db[band] = float(profile.get(band, wall.attenuation_db_for_frequency(band)))
+        self._configure_wall_table_headers()
+
     def populate_ap_table(self):
+        """Show one row per AP radio so a single AP can model multiple bands."""
         self.ap_table.blockSignals(True)
         self.ap_table.setRowCount(0)
         if not self.floor:
             self.ap_table.blockSignals(False)
             return
         for ap in [a for a in self.aps if a.floor == self.floor.name]:
-            row = self.ap_table.rowCount()
-            self.ap_table.insertRow(row)
-            values = [
-                ap.name, ap.floor, f"{ap.x:.2f}", f"{ap.y:.2f}", ap.antenna_pattern,
-                f"{ap.azimuth_deg:.1f}", f"{ap.downtilt_deg:.1f}", f"{ap.tx_power_dbm:.1f}", f"{ap.frequency_mhz:.0f}",
-            ]
-            for col, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                item.setData(Qt.UserRole, ap.name)
-                self.ap_table.setItem(row, col, item)
+            if not ap.radios:
+                ap.radios = [APRadio(
+                    name="Radio-1",
+                    frequency_mhz=float(ap.frequency_mhz),
+                    tx_power_dbm=float(ap.tx_power_dbm),
+                    antenna_pattern=ap.antenna_pattern,
+                    enabled=True,
+                )]
+            for radio_index, radio in enumerate(ap.radios):
+                row = self.ap_table.rowCount()
+                self.ap_table.insertRow(row)
+                values = [
+                    ap.name,
+                    radio.name,
+                    "Yes" if radio.enabled else "No",
+                    ap.floor,
+                    f"{ap.x:.2f}",
+                    f"{ap.y:.2f}",
+                    radio.antenna_pattern,
+                    f"{ap.azimuth_deg:.1f}",
+                    f"{ap.downtilt_deg:.1f}",
+                    f"{radio.tx_power_dbm:.1f}",
+                    f"{radio.frequency_mhz:.0f}",
+                ]
+                for col, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    item.setData(Qt.UserRole, ap.name)
+                    item.setData(Qt.UserRole + 1, radio_index)
+                    self.ap_table.setItem(row, col, item)
         self.ap_table.resizeColumnsToContents()
         self.ap_table.blockSignals(False)
 
@@ -1624,49 +3477,72 @@ class MainWindow(QMainWindow):
         if not self.floor:
             return
         ap_name = item.data(Qt.UserRole)
+        radio_index = item.data(Qt.UserRole + 1)
         ap = next((a for a in self.aps if a.name == ap_name), None)
         if not ap:
             return
+        if not ap.radios:
+            ap.radios = [APRadio(
+                name="Radio-1",
+                frequency_mhz=float(ap.frequency_mhz),
+                tx_power_dbm=float(ap.tx_power_dbm),
+                antenna_pattern=ap.antenna_pattern,
+                enabled=True,
+            )]
         try:
-            if item.column() == 4:
-                if item.text() in self.antenna_patterns:
-                    ap.antenna_pattern = item.text()
-            elif item.column() == 5:
-                ap.azimuth_deg = float(item.text())
+            radio_index = int(radio_index or 0)
+            radio = ap.radios[radio_index]
+            if item.column() == 1:
+                radio.name = item.text().strip() or radio.name
+            elif item.column() == 2:
+                radio.enabled = item.text().strip().lower() in {"yes", "y", "true", "1", "on", "enabled"}
             elif item.column() == 6:
-                ap.downtilt_deg = float(item.text())
+                if item.text() in self.antenna_patterns:
+                    radio.antenna_pattern = item.text()
             elif item.column() == 7:
-                ap.tx_power_dbm = float(item.text())
+                ap.azimuth_deg = float(item.text())
             elif item.column() == 8:
-                ap.frequency_mhz = float(item.text())
-        except ValueError:
+                ap.downtilt_deg = float(item.text())
+            elif item.column() == 9:
+                radio.tx_power_dbm = float(item.text())
+            elif item.column() == 10:
+                radio.frequency_mhz = float(item.text())
+            # Keep legacy AP fields in sync with the first radio for older code/export.
+            if ap.radios:
+                ap.tx_power_dbm = float(ap.radios[0].tx_power_dbm)
+                ap.frequency_mhz = float(ap.radios[0].frequency_mhz)
+                ap.antenna_pattern = ap.radios[0].antenna_pattern
+        except (ValueError, IndexError):
             return
         self.last_result = None
         self.draw_floor()
 
     def populate_wall_table(self):
         self.wall_table.blockSignals(True)
+        self._configure_wall_table_headers()
         self.wall_table.setRowCount(0)
         if not self.floor:
             self.wall_table.blockSignals(False)
             return
+        bands = self._frequency_bands()
+        meta_start = 1 + len(bands)
         for wall in self.floor.walls:
             row = self.wall_table.rowCount()
             self.wall_table.insertRow(row)
             self.wall_table.setItem(row, 0, QTableWidgetItem(wall.label))
-            for col, band in [(1, 2400.0), (2, 5000.0), (3, 6000.0)]:
-                att = QTableWidgetItem(str(wall.attenuation_by_band_db.get(band, 0.0)))
+            for idx, band in enumerate(bands, start=1):
+                att = QTableWidgetItem(str(round(float(wall.attenuation_by_band_db.get(band, wall.attenuation_db_for_frequency(band))), 3)))
                 att.setData(Qt.UserRole, wall.guid)
                 att.setData(Qt.UserRole + 1, band)
-                self.wall_table.setItem(row, col, att)
-            self.wall_table.setItem(row, 4, QTableWidgetItem(wall.name))
-            self.wall_table.setItem(row, 5, QTableWidgetItem(wall.source_file))
-            self.wall_table.setItem(row, 6, QTableWidgetItem(wall.guid))
+                self.wall_table.setItem(row, idx, att)
+            self.wall_table.setItem(row, meta_start, QTableWidgetItem(wall.name))
+            self.wall_table.setItem(row, meta_start + 1, QTableWidgetItem(wall.source_file))
+            self.wall_table.setItem(row, meta_start + 2, QTableWidgetItem(wall.guid))
         self.wall_table.resizeColumnsToContents()
         self.wall_table.blockSignals(False)
 
     def _wall_table_changed(self, item: QTableWidgetItem):
-        if item.column() not in (1, 2, 3) or not self.floor:
+        if not self.floor or item.column() < 1 or item.column() > len(self._frequency_bands()):
             return
         guid = item.data(Qt.UserRole)
         band = item.data(Qt.UserRole + 1)
@@ -1682,11 +3558,14 @@ class MainWindow(QMainWindow):
     def _sync_slab_attenuation_from_ui(self):
         if not self.floor:
             return
-        self.floor.slab_attenuation_by_band_db = {
-            2400.0: float(self.slab_att_24.value()),
-            5000.0: float(self.slab_att_5.value()),
-            6000.0: float(self.slab_att_6.value()),
-        }
+        for band in self._frequency_bands():
+            self.floor.slab_attenuation_by_band_db.setdefault(
+                band,
+                float(self.heatmap_settings.default_floor_attenuation_by_frequency_db.get(band, 0.0)),
+            )
+        self.floor.slab_attenuation_by_band_db[2400.0] = float(self.slab_att_24.value())
+        self.floor.slab_attenuation_by_band_db[5000.0] = float(self.slab_att_5.value())
+        self.floor.slab_attenuation_by_band_db[6000.0] = float(self.slab_att_6.value())
 
     def _load_slab_attenuation_to_ui(self):
         if not self.floor:
@@ -1712,14 +3591,89 @@ class MainWindow(QMainWindow):
             ap.path_loss_exponent = float(self.ple.value())
             # Keep per-AP TX/frequency/pattern edits from the AP table.
             ap.rx_height_m = float(self.rx_height.value())
-        self.last_result = RFEngine.simulate(
-            self.floor,
-            self.floors,
-            self.aps,
-            self.resolution.value(),
-            self.antenna_patterns,
-            include_inter_floor=self.include_inter_floor.isChecked(),
+
+        progress = QProgressDialog("Calculating RSSI heatmap...", "Cancel", 0, 100, self)
+        progress.setWindowTitle("RSSI calculation")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+
+        def update_progress(done, total):
+            if total <= 0:
+                return
+            progress.setValue(int((done / total) * 100))
+            QApplication.processEvents()
+            if progress.wasCanceled():
+                raise RuntimeError("RSSI calculation cancelled")
+
+        self.rssi_results_by_frequency = {}
+
+        active_freqs = sorted(
+            {float(r.frequency_mhz) for ap in self.aps for r in ap.active_radios()}
         )
+
+        if not active_freqs:
+            QMessageBox.information(
+                self,
+                "No active radios",
+                "No enabled AP radios are available for RSSI calculation.",
+            )
+            return
+
+        original_radios = [(ap, list(ap.radios)) for ap in self.aps]
+
+        try:
+            for i, freq in enumerate(active_freqs, start=1):
+                for ap in self.aps:
+                    ap.radios = [
+                        r
+                        for r in original_radios[[a for a, _ in original_radios].index(ap)][1]
+                        if getattr(r, "enabled", True)
+                        and abs(float(r.frequency_mhz) - freq) < 1e-6
+                    ]
+
+                if not any(ap.radios for ap in self.aps):
+                    continue
+
+                self.statusBar().showMessage(
+                    f"Calculating RSSI for {freq:g} MHz ({i}/{len(active_freqs)})..."
+                )
+
+                result = RFEngine.simulate(
+                    self.floor,
+                    self.floors,
+                    self.aps,
+                    self.resolution.value(),
+                    self.antenna_patterns,
+                    include_inter_floor=self.include_inter_floor.isChecked(),
+                    heatmap_settings=self.heatmap_settings,
+                    progress_callback=update_progress,
+                )
+
+                if result is not None:
+                    self.rssi_results_by_frequency[freq] = result
+
+        finally:
+            for ap, radios in original_radios:
+                ap.radios = radios
+
+        selected_freq = self._selected_rssi_view_frequency()
+
+        if selected_freq in self.rssi_results_by_frequency:
+            self.last_result = self.rssi_results_by_frequency[selected_freq]
+        elif self.rssi_results_by_frequency:
+            first_freq = sorted(self.rssi_results_by_frequency.keys())[0]
+            self.last_result = self.rssi_results_by_frequency[first_freq]
+
+            idx = self.rssi_view_frequency.findData(first_freq)
+            if idx >= 0:
+                self.rssi_view_frequency.blockSignals(True)
+                self.rssi_view_frequency.setCurrentIndex(idx)
+                self.rssi_view_frequency.blockSignals(False)
+        else:
+            self.last_result = None
+
         self.draw_floor()
 
     def load_pattern_csv_path(self, path: Path) -> str:
@@ -1779,15 +3733,17 @@ class MainWindow(QMainWindow):
             return
         with open(path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["floor", "x", "y", "frequency_mhz", "rssi_dbm", "rssi_zone", "client_connected", "disconnect_threshold_dbm", "ap_count", "include_inter_floor", "slab_loss_24_db", "slab_loss_5_db", "slab_loss_6_db", "patterns_used"])
+            writer.writerow(["floor", "x", "y", "simulation_mode", "active_radio_frequencies_mhz", "rssi_dbm", "rssi_zone", "client_connected", "disconnect_threshold_dbm", "ap_count", "include_inter_floor", "slab_loss_24_db", "slab_loss_5_db", "slab_loss_6_db", "patterns_used"])
             for iy, y in enumerate(self.last_result.ys):
                 for ix, x in enumerate(self.last_result.xs):
                     rssi = float(self.last_result.rssi[iy, ix])
                     zone = self.heatmap_settings.zone_for_rssi(rssi)
-                    writer.writerow([self.floor.name if self.floor else "", x, y, float(self.freq.value()), rssi, zone.name, rssi >= self.heatmap_settings.minimum_client_rssi_dbm, self.heatmap_settings.minimum_client_rssi_dbm, len(self.aps), self.include_inter_floor.isChecked(), float(self.slab_att_24.value()), float(self.slab_att_5.value()), float(self.slab_att_6.value()), ";".join(sorted({a.antenna_pattern for a in self.aps}))])
+                    active_radios = [r for a in self.aps for r in a.active_radios()]
+                    writer.writerow([self.floor.name if self.floor else "", x, y, "best_active_radio", ";".join(str(int(r.frequency_mhz)) for r in active_radios), rssi, zone.name, rssi >= self.heatmap_settings.minimum_client_rssi_dbm, self.heatmap_settings.minimum_client_rssi_dbm, len(self.aps), self.include_inter_floor.isChecked(), float(self.slab_att_24.value()), float(self.slab_att_5.value()), float(self.slab_att_6.value()), ";".join(sorted({r.antenna_pattern for r in active_radios}))])
 
 
 def main():
+    multiprocessing.freeze_support()
     app = QApplication(sys.argv)
     win = MainWindow()
     win.show()

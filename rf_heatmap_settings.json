@@ -93,7 +93,9 @@
       "sample_text": "#0055FF",
       "ap_same_floor": "#0050FF",
       "ap_other_floor": "#7800B4",
-      "ap_outline": "#000050"
+      "ap_outline": "#000050",
+      "dxf_overlay": "#0096FF",
+      "ap_cutoff_zone": "#0050FF"
     },
     "dark": {
       "background": "#2A2A2A",
@@ -111,7 +113,9 @@
       "sample_text": "#55A0FF",
       "ap_same_floor": "#4D8DFF",
       "ap_other_floor": "#C77DFF",
-      "ap_outline": "#D8E4FF"
+      "ap_outline": "#D8E4FF",
+      "dxf_overlay": "#62B7FF",
+      "ap_cutoff_zone": "#4D8DFF"
     },
     "alpha_light": {
       "space_fill": 45,
@@ -123,5 +127,174 @@
       "ifc_wall_fill": 255,
       "ifc_linked_wall_fill": 255
     }
-  }
+  },
+  "common_frequencies_mhz": [
+    433,
+    868,
+    2400,
+    5000,
+    6000
+  ],
+  "default_floor_attenuation_by_frequency_db": {
+    "433": 8,
+    "868": 10,
+    "2400": 12,
+    "5000": 18,
+    "6000": 22
+  },
+  "default_wall_attenuation_by_material_db": {
+    "default": {
+      "433": 2,
+      "868": 3,
+      "2400": 5,
+      "5000": 7,
+      "6000": 8
+    },
+    "concrete": {
+      "433": 5,
+      "868": 7,
+      "2400": 12,
+      "5000": 16,
+      "6000": 20
+    },
+    "brick": {
+      "433": 4,
+      "868": 5,
+      "2400": 8,
+      "5000": 11,
+      "6000": 14
+    },
+    "masonry": {
+      "433": 4,
+      "868": 5,
+      "2400": 8,
+      "5000": 11,
+      "6000": 14
+    },
+    "glass": {
+      "433": 1,
+      "868": 2,
+      "2400": 3,
+      "5000": 5,
+      "6000": 7
+    },
+    "plasterboard": {
+      "433": 1,
+      "868": 1.5,
+      "2400": 3,
+      "5000": 4,
+      "6000": 5
+    },
+    "partition": {
+      "433": 1,
+      "868": 1.5,
+      "2400": 3,
+      "5000": 4,
+      "6000": 5
+    },
+    "metal": {
+      "433": 12,
+      "868": 16,
+      "2400": 20,
+      "5000": 28,
+      "6000": 35
+    },
+    "steel": {
+      "433": 12,
+      "868": 16,
+      "2400": 20,
+      "5000": 28,
+      "6000": 35
+    }
+  },
+  "default_ap_radios": [
+    {
+      "name": "433 MHz",
+      "frequency_mhz": 433,
+      "tx_power_dbm": 10,
+      "antenna_pattern": "Omni ceiling AP",
+      "enabled": false,
+      "cutoff_radius_m": 120
+    },
+    {
+      "name": "868 MHz",
+      "frequency_mhz": 868,
+      "tx_power_dbm": 14,
+      "antenna_pattern": "Omni ceiling AP",
+      "enabled": false,
+      "cutoff_radius_m": 90
+    },
+    {
+      "name": "2.4 GHz",
+      "frequency_mhz": 2400,
+      "tx_power_dbm": 20,
+      "antenna_pattern": "Omni ceiling AP",
+      "enabled": true,
+      "cutoff_radius_m": 45
+    },
+    {
+      "name": "5 GHz",
+      "frequency_mhz": 5000,
+      "tx_power_dbm": 20,
+      "antenna_pattern": "Omni ceiling AP",
+      "enabled": true,
+      "cutoff_radius_m": 35
+    },
+    {
+      "name": "6 GHz",
+      "frequency_mhz": 6000,
+      "tx_power_dbm": 20,
+      "antenna_pattern": "Omni ceiling AP",
+      "enabled": false,
+      "cutoff_radius_m": 30
+    }
+  ],
+  "max_ifc_loader_threads": 0,
+  "dxf_unit_scale": 1.0,
+  "dxf_overlay_line_width": 0.08,
+  "dxf_overlay_alpha": 190,
+  "project_external_walls_across_floors": true,
+  "external_wall_keywords": [
+    "external",
+    "exterior",
+    "outer",
+    "facade",
+    "fa\u00e7ade",
+    "curtain",
+    "envelope",
+    "perimeter"
+  ],
+  "enable_ap_cutoff_zones": true,
+  "disconnected_rssi_dbm": -120,
+  "default_ap_cutoff_radius_m": 45,
+  "ap_cutoff_radius_by_frequency_m": {
+    "433": 120,
+    "868": 90,
+    "2400": 45,
+    "5000": 35,
+    "6000": 30
+  },
+  "show_ap_cutoff_zones": true,
+  "ap_cutoff_zone_line_width": 0.12,
+  "ap_cutoff_zone_alpha": 120,
+  "enable_ifc_multiprocessing": true,
+  "max_ifc_loader_processes": 0,
+  "enable_rf_multiprocessing": true,
+  "max_rf_worker_processes": 0,
+  "rf_multiprocessing_min_points": 5000,
+  "rf_tile_rows": 16,
+  "ifc_load_timeout_seconds": 900,
+  "ifc_batch_completion_guard": true,
+  "dxf_auto_unit_scale": true,
+  "dxf_unit_name": "auto_from_INSUNITS_to_IFC_metres",
+  "dxf_alignment_mode": "ifc_two_points_then_separate_dxf_dialog",
+  "dxf_alignment_notes": "Select two snapped IFC reference points first. The DXF then opens in a separate pre-alignment dialog. Select two matching snapped DXF endpoints/corners; the corrected DXF is inserted into the IFC scene.",
+  "enable_chunked_ifc_geometry_extraction": true,
+  "chunk_ifc_files_over_mb": 100.0,
+  "ifc_geometry_chunk_size": 250,
+  "ifc_process_pool_strategy": "all_cores_chunked_geometry",
+  "huge_ifc_single_process_threshold_mb": 512.0,
+  "max_parallel_huge_ifc_processes": 1,
+  "allow_blocking_ifc_fallback": false,
+  "large_ifc_notes": "IFCs over huge_ifc_single_process_threshold_mb are parsed in one isolated child process. Do not chunk 800MB IFCs across multiple workers because each worker reopens the full model and can crash ifcopenshell/OCC from memory pressure."
 }

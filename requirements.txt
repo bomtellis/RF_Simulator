@@ -4,3 +4,4 @@ ifcopenshell
 shapely
 contourpy
 scipy
+ezdxf
