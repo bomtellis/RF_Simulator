@@ -13,6 +13,7 @@ import json
 import math
 import multiprocessing
 import os
+import uuid
 from rf_dxf_prealign import DxfPreAlignDialog, SimilarityTransform2D, two_point_transform
 import sys
 from dataclasses import dataclass, field
@@ -51,13 +52,16 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressDialog,
     QPushButton,
+    QSpinBox,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QToolBar,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
     QProgressDialog,
@@ -75,7 +79,7 @@ except Exception:  # pragma: no cover
     ezdxf = None
 
 try:
-    from shapely.geometry import LineString, Polygon, box
+    from shapely.geometry import LineString, Point, Polygon, box
     from shapely.ops import unary_union
     from shapely.affinity import affine_transform
 except Exception as exc:  # pragma: no cover
@@ -107,10 +111,16 @@ class Wall2D:
     projected_to_floor: bool = False
     envelope_wall: bool = False
     attenuation_by_band_db: Dict[float, float] = field(default_factory=lambda: {2400.0: 5.0, 5000.0: 7.0, 6000.0: 8.0})
+    # RF-only metadata. IFC geometry and authoring data remain untouched; these
+    # values are simulator overrides used for attenuation and saved RF plans.
+    rf_type_override: str = ""
+    rf_customised: bool = False
+    is_user_created: bool = False
+    user_wall_thickness_m: float = 0.15
 
     @property
     def label(self) -> str:
-        key = self.material or self.type_name or "Unknown"
+        key = self.rf_type_override or self.material or self.type_name or "Unknown"
         return f"{key} | {self.name or self.guid[:8]}"
 
     def attenuation_db_for_frequency(self, frequency_mhz: float) -> float:
@@ -215,6 +225,10 @@ class APRadio:
     antenna_pattern: str = "Omni ceiling AP"
     enabled: bool = True
     cutoff_radius_m: float = 0.0  # 0 means use settings/default; samples outside this radius are disconnected/skipped
+    antenna_gain_dbi: float = 0.0  # Additional configured gain beyond the selected pattern data.
+    channel: str = ""
+    channel_width_mhz: float = 20.0
+    spectrum_occupancy_percent: float = 0.0
 
 
 @dataclass
@@ -235,6 +249,8 @@ class AccessPoint:
     mount_height_m: float = 2.7
     rx_height_m: float = 1.2
     radios: List[APRadio] = field(default_factory=list)
+    max_clients: int = 50
+    planned: bool = False
 
     def active_radios(self) -> List[APRadio]:
         if not self.radios:
@@ -245,8 +261,129 @@ class AccessPoint:
                 antenna_pattern=self.antenna_pattern,
                 enabled=True,
                 cutoff_radius_m=0.0,
+                antenna_gain_dbi=0.0,
+                channel="",
+                channel_width_mhz=20.0,
+                spectrum_occupancy_percent=0.0,
             )]
         return [r for r in self.radios if getattr(r, "enabled", True)]
+
+
+@dataclass
+class PlannerRadioRequirement:
+    name: str = "5 GHz"
+    enabled: bool = True
+    frequency_mhz: float = 5000.0
+    tx_power_dbm: float = 20.0
+    antenna_pattern: str = "Omni ceiling AP"
+    antenna_gain_dbi: float = 0.0
+    channel_width_mhz: float = 20.0
+    channels: List[str] = field(default_factory=lambda: ["36", "40", "44", "48"])
+    spectrum_occupancy_percent: float = 20.0
+    minimum_rssi_dbm: float = -67.0
+    cutoff_radius_m: float = 0.0
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "name": self.name,
+            "enabled": self.enabled,
+            "frequency_mhz": self.frequency_mhz,
+            "tx_power_dbm": self.tx_power_dbm,
+            "antenna_pattern": self.antenna_pattern,
+            "antenna_gain_dbi": self.antenna_gain_dbi,
+            "channel_width_mhz": self.channel_width_mhz,
+            "channels": list(self.channels),
+            "spectrum_occupancy_percent": self.spectrum_occupancy_percent,
+            "minimum_rssi_dbm": self.minimum_rssi_dbm,
+            "cutoff_radius_m": self.cutoff_radius_m,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "PlannerRadioRequirement":
+        channels = data.get("channels", []) if isinstance(data, dict) else []
+        if isinstance(channels, str):
+            channels = [v.strip() for v in channels.replace(";", ",").split(",") if v.strip()]
+        return cls(
+            name=str(data.get("name", "Radio")),
+            enabled=bool(data.get("enabled", True)),
+            frequency_mhz=float(data.get("frequency_mhz", 5000.0)),
+            tx_power_dbm=float(data.get("tx_power_dbm", 20.0)),
+            antenna_pattern=str(data.get("antenna_pattern", "Omni ceiling AP")),
+            antenna_gain_dbi=float(data.get("antenna_gain_dbi", 0.0)),
+            channel_width_mhz=float(data.get("channel_width_mhz", 20.0)),
+            channels=[str(v) for v in channels] or ["1"],
+            spectrum_occupancy_percent=max(0.0, min(100.0, float(data.get("spectrum_occupancy_percent", 20.0)))),
+            minimum_rssi_dbm=float(data.get("minimum_rssi_dbm", -67.0)),
+            cutoff_radius_m=max(0.0, float(data.get("cutoff_radius_m", 0.0))),
+        )
+
+
+@dataclass
+class AutoPlannerSettings:
+    target_coverage_percent: float = 95.0
+    coverage_mode: str = "all"  # all selected frequencies, or any selected frequency
+    sample_spacing_m: float = 3.0
+    candidate_spacing_m: float = 6.0
+    minimum_ap_spacing_m: float = 8.0
+    maximum_aps: int = 64
+    expected_clients: int = 250
+    clients_per_ap: int = 50
+    keep_existing_aps: bool = True
+    remove_previous_planned_aps: bool = True
+    radio_requirements: List[PlannerRadioRequirement] = field(default_factory=lambda: [
+        PlannerRadioRequirement(
+            name="2.4 GHz", frequency_mhz=2400.0, tx_power_dbm=18.0,
+            channel_width_mhz=20.0, channels=["1", "6", "11"],
+            spectrum_occupancy_percent=35.0, minimum_rssi_dbm=-67.0,
+        ),
+        PlannerRadioRequirement(
+            name="5 GHz", frequency_mhz=5000.0, tx_power_dbm=20.0,
+            channel_width_mhz=40.0, channels=["36", "44", "52", "60", "100", "108", "116", "124"],
+            spectrum_occupancy_percent=20.0, minimum_rssi_dbm=-67.0,
+        ),
+        PlannerRadioRequirement(
+            name="6 GHz", enabled=False, frequency_mhz=6000.0, tx_power_dbm=20.0,
+            channel_width_mhz=80.0, channels=["5", "21", "37", "53", "69", "85"],
+            spectrum_occupancy_percent=10.0, minimum_rssi_dbm=-67.0,
+        ),
+    ])
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "target_coverage_percent": self.target_coverage_percent,
+            "coverage_mode": self.coverage_mode,
+            "sample_spacing_m": self.sample_spacing_m,
+            "candidate_spacing_m": self.candidate_spacing_m,
+            "minimum_ap_spacing_m": self.minimum_ap_spacing_m,
+            "maximum_aps": self.maximum_aps,
+            "expected_clients": self.expected_clients,
+            "clients_per_ap": self.clients_per_ap,
+            "keep_existing_aps": self.keep_existing_aps,
+            "remove_previous_planned_aps": self.remove_previous_planned_aps,
+            "radio_requirements": [r.to_dict() for r in self.radio_requirements],
+        }
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict[str, object]]) -> "AutoPlannerSettings":
+        base = cls()
+        if not isinstance(data, dict):
+            return base
+        radios = data.get("radio_requirements", data.get("radios", []))
+        if isinstance(radios, list) and radios:
+            parsed = [PlannerRadioRequirement.from_dict(r) for r in radios if isinstance(r, dict)]
+            if parsed:
+                base.radio_requirements = parsed
+        base.target_coverage_percent = max(1.0, min(100.0, float(data.get("target_coverage_percent", base.target_coverage_percent))))
+        base.coverage_mode = "any" if str(data.get("coverage_mode", base.coverage_mode)).lower().startswith("any") else "all"
+        base.sample_spacing_m = max(0.5, float(data.get("sample_spacing_m", base.sample_spacing_m)))
+        base.candidate_spacing_m = max(1.0, float(data.get("candidate_spacing_m", base.candidate_spacing_m)))
+        base.minimum_ap_spacing_m = max(0.0, float(data.get("minimum_ap_spacing_m", base.minimum_ap_spacing_m)))
+        base.maximum_aps = max(1, int(data.get("maximum_aps", base.maximum_aps)))
+        base.expected_clients = max(0, int(data.get("expected_clients", base.expected_clients)))
+        base.clients_per_ap = max(1, int(data.get("clients_per_ap", base.clients_per_ap)))
+        base.keep_existing_aps = bool(data.get("keep_existing_aps", base.keep_existing_aps))
+        base.remove_previous_planned_aps = bool(data.get("remove_previous_planned_aps", base.remove_previous_planned_aps))
+        return base
 
 
 @dataclass
@@ -354,10 +491,13 @@ class HeatmapSettings:
         "steel": {433.0: 12.0, 868.0: 16.0, 2400.0: 20.0, 5000.0: 28.0, 6000.0: 35.0}
     })
     default_ap_radios: List[Dict[str, object]] = field(default_factory=lambda: [
-        {"name": "2.4 GHz", "frequency_mhz": 2400.0, "tx_power_dbm": 20.0, "antenna_pattern": "Omni ceiling AP", "enabled": True, "cutoff_radius_m": 45.0},
-        {"name": "5 GHz", "frequency_mhz": 5000.0, "tx_power_dbm": 20.0, "antenna_pattern": "Omni ceiling AP", "enabled": True, "cutoff_radius_m": 35.0},
-        {"name": "6 GHz", "frequency_mhz": 6000.0, "tx_power_dbm": 20.0, "antenna_pattern": "Omni ceiling AP", "enabled": False, "cutoff_radius_m": 30.0}
+        {"name": "2.4 GHz", "frequency_mhz": 2400.0, "tx_power_dbm": 20.0, "antenna_pattern": "Omni ceiling AP", "enabled": True, "cutoff_radius_m": 45.0, "antenna_gain_dbi": 0.0, "channel": "1", "channel_width_mhz": 20.0, "spectrum_occupancy_percent": 35.0},
+        {"name": "5 GHz", "frequency_mhz": 5000.0, "tx_power_dbm": 20.0, "antenna_pattern": "Omni ceiling AP", "enabled": True, "cutoff_radius_m": 35.0, "antenna_gain_dbi": 0.0, "channel": "36", "channel_width_mhz": 40.0, "spectrum_occupancy_percent": 20.0},
+        {"name": "6 GHz", "frequency_mhz": 6000.0, "tx_power_dbm": 20.0, "antenna_pattern": "Omni ceiling AP", "enabled": False, "cutoff_radius_m": 30.0, "antenna_gain_dbi": 0.0, "channel": "5", "channel_width_mhz": 80.0, "spectrum_occupancy_percent": 10.0}
     ])
+    auto_planner_settings: Dict[str, object] = field(default_factory=lambda: AutoPlannerSettings().to_dict())
+    user_wall_default_type: str = "partition"
+    user_wall_default_thickness_m: float = 0.15
     # Text uses model-scaled scene units so it zooms naturally with the IFC view.
     # The numeric font sizes below are small logical sizes which are multiplied
     # by text_model_scale before drawing. Increase text_model_scale if labels
@@ -544,6 +684,11 @@ class HeatmapSettings:
         raw_radios = data.get("default_ap_radios", settings.default_ap_radios)
         if isinstance(raw_radios, list):
             settings.default_ap_radios = [dict(r) for r in raw_radios if isinstance(r, dict)]
+        raw_planner = data.get("auto_planner_settings", data.get("predictive_ap_planner", {}))
+        if isinstance(raw_planner, dict):
+            settings.auto_planner_settings = AutoPlannerSettings.from_dict(raw_planner).to_dict()
+        settings.user_wall_default_type = str(data.get("user_wall_default_type", "partition"))
+        settings.user_wall_default_thickness_m = max(0.02, float(data.get("user_wall_default_thickness_m", 0.15)))
         # Font sizes are logical values converted to model-scaled scene text.
         # Text follows the view transform, so it enlarges when zooming in.
         settings.contour_label_font_size = int(data.get("contour_label_font_size", 6))
@@ -1095,7 +1240,7 @@ class RFEngine:
                     checked_wall_guids.add(wall_key)
 
         floor_loss = RFEngine.floor_penetration_loss_db(receiver_floor, ap_floor, floors, radio.frequency_mhz)
-        return radio.tx_power_dbm + pattern_gain - path_loss - wall_loss - floor_loss
+        return radio.tx_power_dbm + pattern_gain + float(getattr(radio, "antenna_gain_dbi", 0.0) or 0.0) - path_loss - wall_loss - floor_loss
 
     @staticmethod
     def floors_between_inclusive(receiver_floor: FloorModel, ap_floor: FloorModel, floors: Dict[str, FloorModel]) -> List[FloorModel]:
@@ -1530,6 +1675,169 @@ class DxfAlignmentDialog(QDialog):
         self.apply()
 
 
+# ----------------------------- IFC origin/site information -----------------------------
+
+def _ifc_decimal_degrees(value) -> Optional[float]:
+    """Convert IFC compound plane-angle values to decimal degrees."""
+    if value is None:
+        return None
+    try:
+        parts = list(value)
+        if not parts:
+            return None
+        sign = -1.0 if float(parts[0]) < 0 else 1.0
+        deg = abs(float(parts[0]))
+        minute = abs(float(parts[1])) if len(parts) > 1 else 0.0
+        second = abs(float(parts[2])) if len(parts) > 2 else 0.0
+        millionth = abs(float(parts[3])) if len(parts) > 3 else 0.0
+        return sign * (deg + minute / 60.0 + (second + millionth / 1_000_000.0) / 3600.0)
+    except Exception:
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+
+def _ifc_local_placement_summary(product) -> Dict[str, float]:
+    """Return absolute placement origin and plan rotation for an IFC product."""
+    out = {"x": 0.0, "y": 0.0, "z": 0.0, "rotation_from_x_deg": 0.0}
+    placement = getattr(product, "ObjectPlacement", None)
+    if placement is None:
+        return out
+    try:
+        import ifcopenshell.util.placement as placement_util
+        matrix = np.asarray(placement_util.get_local_placement(placement), dtype=float)
+        out["x"] = float(matrix[0, 3])
+        out["y"] = float(matrix[1, 3])
+        out["z"] = float(matrix[2, 3])
+        out["rotation_from_x_deg"] = float(math.degrees(math.atan2(matrix[1, 0], matrix[0, 0])))
+        return out
+    except Exception:
+        pass
+
+    # Conservative fallback for simple IfcLocalPlacement chains.
+    try:
+        x = y = z = angle = 0.0
+        chain = []
+        current = placement
+        while current is not None:
+            chain.append(current)
+            current = getattr(current, "PlacementRelTo", None)
+        for local in reversed(chain):
+            rel = getattr(local, "RelativePlacement", None)
+            loc = getattr(getattr(rel, "Location", None), "Coordinates", None)
+            if loc:
+                lx = float(loc[0]) if len(loc) > 0 else 0.0
+                ly = float(loc[1]) if len(loc) > 1 else 0.0
+                lz = float(loc[2]) if len(loc) > 2 else 0.0
+                ca, sa = math.cos(math.radians(angle)), math.sin(math.radians(angle))
+                x += lx * ca - ly * sa
+                y += lx * sa + ly * ca
+                z += lz
+            direction = getattr(getattr(rel, "RefDirection", None), "DirectionRatios", None)
+            if direction and len(direction) >= 2:
+                angle += math.degrees(math.atan2(float(direction[1]), float(direction[0])))
+        out.update(x=x, y=y, z=z, rotation_from_x_deg=angle)
+    except Exception:
+        pass
+    return out
+
+
+def _extract_ifc_origin_information(model, path: Path) -> Dict[str, object]:
+    """Extract import origin, site orientation, true north and map CRS metadata."""
+    info: Dict[str, object] = {
+        "file": path.name,
+        "path": str(path),
+        "schema": str(getattr(model, "schema", "")),
+        "project": {},
+        "sites": [],
+        "buildings": [],
+        "contexts": [],
+        "map_conversions": [],
+    }
+    try:
+        projects = model.by_type("IfcProject")
+        if projects:
+            project = projects[0]
+            info["project"] = {
+                "name": str(getattr(project, "Name", "") or ""),
+                "global_id": str(getattr(project, "GlobalId", "") or ""),
+                "long_name": str(getattr(project, "LongName", "") or ""),
+            }
+    except Exception:
+        pass
+
+    for type_name, key in (("IfcSite", "sites"), ("IfcBuilding", "buildings")):
+        try:
+            for entity in model.by_type(type_name):
+                row: Dict[str, object] = {
+                    "name": str(getattr(entity, "Name", "") or ""),
+                    "global_id": str(getattr(entity, "GlobalId", "") or ""),
+                    "placement": _ifc_local_placement_summary(entity),
+                }
+                if type_name == "IfcSite":
+                    row["latitude_deg"] = _ifc_decimal_degrees(getattr(entity, "RefLatitude", None))
+                    row["longitude_deg"] = _ifc_decimal_degrees(getattr(entity, "RefLongitude", None))
+                    elevation = getattr(entity, "RefElevation", None)
+                    row["reference_elevation"] = float(elevation) if elevation is not None else None
+                    row["land_title_number"] = str(getattr(entity, "LandTitleNumber", "") or "")
+                info[key].append(row)
+        except Exception:
+            pass
+
+    try:
+        contexts = list(model.by_type("IfcGeometricRepresentationContext"))
+    except Exception:
+        contexts = []
+    for context in contexts:
+        row: Dict[str, object] = {
+            "context_type": str(getattr(context, "ContextType", "") or ""),
+            "coordinate_space_dimension": getattr(context, "CoordinateSpaceDimension", None),
+            "precision": getattr(context, "Precision", None),
+        }
+        world = getattr(context, "WorldCoordinateSystem", None)
+        location = getattr(getattr(world, "Location", None), "Coordinates", None)
+        if location:
+            row["world_origin"] = [float(v) for v in location]
+        ref = getattr(getattr(world, "RefDirection", None), "DirectionRatios", None)
+        if ref and len(ref) >= 2:
+            row["world_axis_rotation_from_x_deg"] = math.degrees(math.atan2(float(ref[1]), float(ref[0])))
+        true_north = getattr(getattr(context, "TrueNorth", None), "DirectionRatios", None)
+        if true_north and len(true_north) >= 2:
+            dx, dy = float(true_north[0]), float(true_north[1])
+            row["true_north_direction"] = [dx, dy]
+            # IFC TrueNorth is expressed relative to the model +Y axis.
+            row["true_north_angle_from_model_y_deg"] = math.degrees(math.atan2(dx, dy))
+        info["contexts"].append(row)
+
+    try:
+        conversions = list(model.by_type("IfcMapConversion"))
+    except Exception:
+        conversions = []
+    for conv in conversions:
+        row: Dict[str, object] = {}
+        for attr in ("Eastings", "Northings", "OrthogonalHeight", "XAxisAbscissa", "XAxisOrdinate", "Scale"):
+            value = getattr(conv, attr, None)
+            row[attr] = float(value) if value is not None else None
+        target = getattr(conv, "TargetCRS", None)
+        if target is not None:
+            row["target_crs"] = {
+                "name": str(getattr(target, "Name", "") or ""),
+                "description": str(getattr(target, "Description", "") or ""),
+                "geodetic_datum": str(getattr(target, "GeodeticDatum", "") or ""),
+                "vertical_datum": str(getattr(target, "VerticalDatum", "") or ""),
+                "map_projection": str(getattr(target, "MapProjection", "") or ""),
+                "map_zone": str(getattr(target, "MapZone", "") or ""),
+                "map_unit": str(getattr(getattr(target, "MapUnit", None), "Name", "") or ""),
+            }
+        if row.get("XAxisAbscissa") is not None and row.get("XAxisOrdinate") is not None:
+            row["map_x_axis_rotation_from_east_deg"] = math.degrees(
+                math.atan2(float(row["XAxisOrdinate"]), float(row["XAxisAbscissa"]))
+            )
+        info["map_conversions"].append(row)
+    return info
+
+
 # ----------------------------- Multiprocessing helpers -----------------------------
 
 def _logical_process_count(requested_count: int = 0) -> int:
@@ -1544,15 +1852,17 @@ def _load_ifc_file_in_process(args):
     """Top-level IFC worker so it is pickleable on Windows spawn."""
     path_str, dx, dy, dz, project_external_walls, external_keywords = args
     path = Path(path_str)
-    floors = IFCModelLoader(
+    loader = IFCModelLoader(
         path,
         float(dx),
         float(dy),
         float(dz),
         project_external_walls_across_floors=bool(project_external_walls),
         external_wall_keywords=list(external_keywords or []),
-    ).load()
-    return path_str, floors, path.name
+    )
+    floors = loader.load()
+    origin_info = _extract_ifc_origin_information(loader.ifc, path)
+    return path_str, floors, path.name, origin_info
 
 
 def _index_ifc_file_for_chunking(args):
@@ -1575,7 +1885,8 @@ def _index_ifc_file_for_chunking(args):
             wall_guids.append(guid)
     space_guids = [getattr(sp, "GlobalId", "") or "" for sp in model.by_type("IfcSpace")]
     space_guids = [g for g in space_guids if g]
-    return path_str, storeys, wall_guids, space_guids, path.name
+    origin_info = _extract_ifc_origin_information(model, path)
+    return path_str, storeys, wall_guids, space_guids, path.name, origin_info
 
 
 def _load_ifc_geometry_chunk_in_process(args):
@@ -1647,7 +1958,288 @@ Z_TEXT = 40
 Z_AP = 50
 Z_AP_LABEL = 55
 
+class WallAttenuationDialog(QDialog):
+    """Edit an IFC or user-created wall's RF type and attenuation profile."""
+
+    def __init__(self, parent, wall: Wall2D, bands: List[float], profiles: Dict[str, Dict[float, float]]):
+        super().__init__(parent)
+        self.wall = wall
+        self.bands = list(bands)
+        self.profiles = profiles
+        self.setWindowTitle("Wall RF type and attenuation")
+        self.resize(620, 420)
+
+        layout = QVBoxLayout(self)
+        details = QLabel(
+            f"<b>{wall.name or 'Wall'}</b><br>Source: {wall.source_file or 'User RF wall'}<br>"
+            f"IFC type: {wall.type_name or '—'} &nbsp;&nbsp; Material: {wall.material or '—'}<br>"
+            f"GUID: {wall.guid}"
+        )
+        details.setWordWrap(True)
+        layout.addWidget(details)
+
+        form = QFormLayout()
+        self.type_combo = QComboBox()
+        self.type_combo.setEditable(True)
+        self.type_combo.addItems(sorted({str(k) for k in profiles.keys()} | {"default", "partition", "glass", "brick", "concrete", "metal"}))
+        self.type_combo.setCurrentText(wall.rf_type_override or wall.material or wall.type_name or "default")
+        form.addRow("RF wall type", self.type_combo)
+        layout.addLayout(form)
+
+        self.table = QTableWidget(len(self.bands), 2)
+        self.table.setHorizontalHeaderLabels(["Frequency", "Attenuation (dB)"])
+        for row, band in enumerate(self.bands):
+            label = f"{band / 1000:g} GHz" if band >= 1000 else f"{band:g} MHz"
+            freq_item = QTableWidgetItem(label)
+            freq_item.setFlags(freq_item.flags() & ~Qt.ItemIsEditable)
+            self.table.setItem(row, 0, freq_item)
+            self.table.setItem(row, 1, QTableWidgetItem(f"{wall.attenuation_db_for_frequency(band):.3f}"))
+        self.table.resizeColumnsToContents()
+        layout.addWidget(self.table)
+
+        preset = QPushButton("Apply attenuation preset for selected wall type")
+        preset.clicked.connect(self._apply_preset)
+        layout.addWidget(preset)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _apply_preset(self):
+        key = self.type_combo.currentText().strip().lower()
+        profile = self.profiles.get(key)
+        if profile is None:
+            profile = next((candidate for name, candidate in self.profiles.items() if name != "default" and name.lower() in key), None)
+        profile = profile or self.profiles.get("default", {})
+        for row, band in enumerate(self.bands):
+            value = profile.get(float(band))
+            if value is None and profile:
+                keys = sorted(float(v) for v in profile)
+                nearest = min(keys, key=lambda v: abs(v - float(band)))
+                value = profile[nearest]
+            if value is not None:
+                self.table.item(row, 1).setText(f"{float(value):.3f}")
+
+    def values(self) -> Tuple[str, Dict[float, float]]:
+        attenuation: Dict[float, float] = {}
+        for row, band in enumerate(self.bands):
+            try:
+                attenuation[float(band)] = float(self.table.item(row, 1).text())
+            except Exception:
+                attenuation[float(band)] = self.wall.attenuation_db_for_frequency(float(band))
+        return self.type_combo.currentText().strip(), attenuation
+
+
+class AutoPlannerSettingsDialog(QDialog):
+    """Configure predictive AP coverage, capacity, channel and radio requirements."""
+
+    HEADERS = ["Enabled", "Name", "Frequency MHz", "Pattern", "TX dBm", "Gain dBi", "Width MHz", "Channels", "Occupancy %", "Min RSSI dBm", "Cut-off m"]
+
+    def __init__(self, parent, settings: AutoPlannerSettings, pattern_names: List[str]):
+        super().__init__(parent)
+        self.pattern_names = list(pattern_names)
+        self.setWindowTitle("Predictive AP planner settings")
+        self.resize(1120, 650)
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self.target = QDoubleSpinBox(); self.target.setRange(1.0, 100.0); self.target.setSuffix(" %"); self.target.setValue(settings.target_coverage_percent)
+        self.coverage_mode = QComboBox(); self.coverage_mode.addItem("Each selected frequency", "all"); self.coverage_mode.addItem("Any selected frequency", "any"); self.coverage_mode.setCurrentIndex(1 if settings.coverage_mode == "any" else 0)
+        self.sample_spacing = QDoubleSpinBox(); self.sample_spacing.setRange(0.5, 25.0); self.sample_spacing.setSuffix(" m"); self.sample_spacing.setValue(settings.sample_spacing_m)
+        self.candidate_spacing = QDoubleSpinBox(); self.candidate_spacing.setRange(1.0, 50.0); self.candidate_spacing.setSuffix(" m"); self.candidate_spacing.setValue(settings.candidate_spacing_m)
+        self.minimum_spacing = QDoubleSpinBox(); self.minimum_spacing.setRange(0.0, 100.0); self.minimum_spacing.setSuffix(" m"); self.minimum_spacing.setValue(settings.minimum_ap_spacing_m)
+        self.maximum_aps = QSpinBox(); self.maximum_aps.setRange(1, 1000); self.maximum_aps.setValue(settings.maximum_aps)
+        self.expected_clients = QSpinBox(); self.expected_clients.setRange(0, 1000000); self.expected_clients.setValue(settings.expected_clients)
+        self.clients_per_ap = QSpinBox(); self.clients_per_ap.setRange(1, 10000); self.clients_per_ap.setValue(settings.clients_per_ap)
+        self.keep_existing = QCheckBox("Count and retain manually placed APs on this floor"); self.keep_existing.setChecked(settings.keep_existing_aps)
+        self.remove_planned = QCheckBox("Replace APs created by the previous planner run"); self.remove_planned.setChecked(settings.remove_previous_planned_aps)
+        form.addRow("Target floor coverage", self.target)
+        form.addRow("Frequency coverage rule", self.coverage_mode)
+        form.addRow("Coverage sample spacing", self.sample_spacing)
+        form.addRow("Candidate AP spacing", self.candidate_spacing)
+        form.addRow("Minimum AP separation", self.minimum_spacing)
+        form.addRow("Maximum planned APs", self.maximum_aps)
+        form.addRow("Expected connected clients", self.expected_clients)
+        form.addRow("Maximum clients per AP", self.clients_per_ap)
+        form.addRow(self.keep_existing)
+        form.addRow(self.remove_planned)
+        layout.addLayout(form)
+
+        note = QLabel("Spectrum occupancy reduces effective client capacity. Channels are allocated to minimise nearby co-channel reuse. Additional antenna gain is added to the selected pattern data.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        self.table = QTableWidget(0, len(self.HEADERS))
+        self.table.setHorizontalHeaderLabels(self.HEADERS)
+        layout.addWidget(self.table, 1)
+        row_buttons = QHBoxLayout()
+        add_btn = QPushButton("Add frequency")
+        remove_btn = QPushButton("Remove selected frequency")
+        add_btn.clicked.connect(lambda: self._add_radio(PlannerRadioRequirement(name="New radio", frequency_mhz=5000.0)))
+        remove_btn.clicked.connect(self._remove_selected)
+        row_buttons.addWidget(add_btn); row_buttons.addWidget(remove_btn); row_buttons.addStretch(1)
+        layout.addLayout(row_buttons)
+
+        for radio in settings.radio_requirements:
+            self._add_radio(radio)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.table.resizeColumnsToContents()
+
+    def _add_radio(self, radio: PlannerRadioRequirement):
+        row = self.table.rowCount(); self.table.insertRow(row)
+        values = [
+            "Yes" if radio.enabled else "No", radio.name, f"{radio.frequency_mhz:g}", radio.antenna_pattern,
+            f"{radio.tx_power_dbm:g}", f"{radio.antenna_gain_dbi:g}", f"{radio.channel_width_mhz:g}",
+            ", ".join(radio.channels), f"{radio.spectrum_occupancy_percent:g}", f"{radio.minimum_rssi_dbm:g}", f"{radio.cutoff_radius_m:g}",
+        ]
+        for col, value in enumerate(values):
+            self.table.setItem(row, col, QTableWidgetItem(str(value)))
+        pattern = QComboBox(); pattern.addItems(self.pattern_names); pattern.setEditable(True); pattern.setCurrentText(radio.antenna_pattern)
+        self.table.setCellWidget(row, 3, pattern)
+
+    def _remove_selected(self):
+        row = self.table.currentRow()
+        if row >= 0:
+            self.table.removeRow(row)
+
+    def settings(self) -> AutoPlannerSettings:
+        radios: List[PlannerRadioRequirement] = []
+        for row in range(self.table.rowCount()):
+            def value(col: int, default: str = "") -> str:
+                item = self.table.item(row, col)
+                return item.text().strip() if item is not None else default
+            pattern_widget = self.table.cellWidget(row, 3)
+            pattern = pattern_widget.currentText().strip() if isinstance(pattern_widget, QComboBox) else value(3, "Omni ceiling AP")
+            channels = [v.strip() for v in value(7, "1").replace(";", ",").split(",") if v.strip()]
+            try:
+                radios.append(PlannerRadioRequirement(
+                    enabled=value(0, "Yes").lower() in {"yes", "y", "true", "1", "on", "enabled"},
+                    name=value(1, f"Radio-{row + 1}"), frequency_mhz=float(value(2, "5000")), antenna_pattern=pattern,
+                    tx_power_dbm=float(value(4, "20")), antenna_gain_dbi=float(value(5, "0")), channel_width_mhz=float(value(6, "20")),
+                    channels=channels or ["1"], spectrum_occupancy_percent=max(0.0, min(100.0, float(value(8, "0")))),
+                    minimum_rssi_dbm=float(value(9, "-67")), cutoff_radius_m=max(0.0, float(value(10, "0"))),
+                ))
+            except ValueError as exc:
+                raise ValueError(f"Invalid numeric value in radio row {row + 1}: {exc}")
+        if not radios:
+            raise ValueError("At least one radio requirement is required.")
+        return AutoPlannerSettings(
+            target_coverage_percent=float(self.target.value()), coverage_mode=str(self.coverage_mode.currentData()),
+            sample_spacing_m=float(self.sample_spacing.value()), candidate_spacing_m=float(self.candidate_spacing.value()),
+            minimum_ap_spacing_m=float(self.minimum_spacing.value()), maximum_aps=int(self.maximum_aps.value()),
+            expected_clients=int(self.expected_clients.value()), clients_per_ap=int(self.clients_per_ap.value()),
+            keep_existing_aps=self.keep_existing.isChecked(), remove_previous_planned_aps=self.remove_planned.isChecked(),
+            radio_requirements=radios,
+        )
+
+    def accept(self):
+        try:
+            self._validated_settings = self.settings()
+        except Exception as exc:
+            QMessageBox.warning(self, "Invalid planner settings", str(exc)); return
+        super().accept()
+
+
+class IFCOriginDialog(QDialog):
+    def __init__(self, parent, origin_info: Dict[str, Dict[str, object]], alignment: AlignmentTransform):
+        super().__init__(parent)
+        self.main = parent
+        self.setWindowTitle("Imported IFC origin and site orientation")
+        self.resize(820, 650)
+        layout = QVBoxLayout(self)
+        explanation = QLabel("Coordinates shown below come from the imported IFC metadata. The simulator view rotation is display-only and does not change IFC coordinates or RF calculations.")
+        explanation.setWordWrap(True); layout.addWidget(explanation)
+        self.text = QTextEdit(); self.text.setReadOnly(True); self.text.setPlainText(self._format_info(origin_info, alignment)); layout.addWidget(self.text, 1)
+        row = QHBoxLayout()
+        rotate = QPushButton("Rotate view to first available True North")
+        rotate.clicked.connect(self._rotate_true_north)
+        reset = QPushButton("Reset view rotation")
+        reset.clicked.connect(parent.reset_view_rotation)
+        close = QPushButton("Close"); close.clicked.connect(self.accept)
+        row.addWidget(rotate); row.addWidget(reset); row.addStretch(1); row.addWidget(close)
+        layout.addLayout(row)
+
+    @staticmethod
+    def _format_info(origin_info: Dict[str, Dict[str, object]], alignment: AlignmentTransform) -> str:
+        lines = [
+            "Current simulator IFC alignment:",
+            f"  Offset X/Y: {alignment.dx:.6f}, {alignment.dy:.6f} m",
+            f"  Rotation: {alignment.rotation_deg:.6f}°",
+            f"  Scale: {alignment.scale:.9g}", "",
+        ]
+        if not origin_info:
+            lines.append("No IFC origin metadata has been captured yet.")
+            return "\n".join(lines)
+        for key, info in origin_info.items():
+            lines.append(f"FILE: {info.get('file', key)}")
+            lines.append(f"  Path: {info.get('path', '')}")
+            lines.append(f"  Schema: {info.get('schema', '')}")
+            project = info.get("project", {}) or {}
+            lines.append(f"  Project: {project.get('name', '')}  [{project.get('global_id', '')}]")
+            for label, collection in (("Site", info.get("sites", [])), ("Building", info.get("buildings", []))):
+                for idx, entity in enumerate(collection or [], start=1):
+                    place = entity.get("placement", {}) or {}
+                    lines.append(f"  {label} {idx}: {entity.get('name', '')}  [{entity.get('global_id', '')}]")
+                    lines.append(f"    Placement origin: X={place.get('x', 0):.6f}, Y={place.get('y', 0):.6f}, Z={place.get('z', 0):.6f} m")
+                    lines.append(f"    Placement rotation from +X: {place.get('rotation_from_x_deg', 0):.6f}°")
+                    if label == "Site":
+                        lines.append(f"    Reference latitude/longitude: {entity.get('latitude_deg', None)}, {entity.get('longitude_deg', None)}")
+                        lines.append(f"    Reference elevation: {entity.get('reference_elevation', None)}")
+            for idx, context in enumerate(info.get("contexts", []) or [], start=1):
+                lines.append(f"  Geometric context {idx}: {context.get('context_type', '')}")
+                if "world_origin" in context: lines.append(f"    World coordinate system origin: {context.get('world_origin')}")
+                if "world_axis_rotation_from_x_deg" in context: lines.append(f"    World axis rotation from +X: {context.get('world_axis_rotation_from_x_deg'):.6f}°")
+                if "true_north_direction" in context:
+                    lines.append(f"    True North direction: {context.get('true_north_direction')}")
+                    lines.append(f"    True North angle from model +Y: {context.get('true_north_angle_from_model_y_deg'):.6f}°")
+            for idx, conv in enumerate(info.get("map_conversions", []) or [], start=1):
+                lines.append(f"  Map conversion {idx}:")
+                lines.append(f"    Eastings/Northings/Height: {conv.get('Eastings')}, {conv.get('Northings')}, {conv.get('OrthogonalHeight')}")
+                lines.append(f"    X axis abscissa/ordinate: {conv.get('XAxisAbscissa')}, {conv.get('XAxisOrdinate')}; scale={conv.get('Scale')}")
+                if "map_x_axis_rotation_from_east_deg" in conv: lines.append(f"    Map X-axis rotation from East: {conv.get('map_x_axis_rotation_from_east_deg'):.6f}°")
+                crs = conv.get("target_crs", {}) or {}
+                if crs: lines.append(f"    Target CRS: {crs.get('name', '')}; projection={crs.get('map_projection', '')}; zone={crs.get('map_zone', '')}; datum={crs.get('geodetic_datum', '')}")
+            lines.append("")
+        return "\n".join(lines)
+
+    def _rotate_true_north(self):
+        if not self.main.rotate_view_to_true_north():
+            QMessageBox.information(self, "True North unavailable", "The imported IFC files do not contain a usable TrueNorth direction.")
+
+
 # ----------------------------- ACCESS POINT GRAPHIC ITEM -----------------------------
+
+class WallGraphicsItem(QGraphicsPolygonItem):
+    def __init__(self, main, wall: Wall2D, polygon: QPolygonF, pen: QPen, brush: QBrush):
+        super().__init__(polygon)
+        self.main = main
+        self.wall = wall
+        self.setPen(pen); self.setBrush(brush); self.setZValue(Z_IFC_WALL)
+        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
+        self.setAcceptedMouseButtons(Qt.LeftButton | Qt.RightButton)
+        self.setToolTip(f"{wall.label}\nRight-click to inspect or edit RF attenuation")
+
+    def contextMenuEvent(self, event):
+        menu = QMenu()
+        edit_action = menu.addAction("Edit wall type and attenuation…")
+        reset_action = menu.addAction("Reset RF attenuation from IFC type/material")
+        delete_action = None
+        if self.wall.is_user_created:
+            menu.addSeparator()
+            delete_action = menu.addAction("Delete user-created RF wall")
+        chosen = menu.exec(event.screenPos())
+        if chosen == edit_action:
+            self.main.edit_wall_rf_properties(self.wall)
+        elif chosen == reset_action:
+            self.main.reset_wall_rf_properties(self.wall)
+        elif delete_action is not None and chosen == delete_action:
+            self.main.delete_user_wall(self.wall)
+        event.accept()
+
 
 class AccessPointGraphicsItem(QGraphicsEllipseItem):
     def __init__(self, main, ap: AccessPoint, radius: float, colour: QColor):
@@ -1665,6 +2257,11 @@ class AccessPointGraphicsItem(QGraphicsEllipseItem):
             QGraphicsItem.ItemSendsGeometryChanges
         )
         self.setCursor(Qt.OpenHandCursor)
+        radio_summary = ", ".join(
+            f"{r.frequency_mhz:g} MHz ch {r.channel or 'auto'} / {r.channel_width_mhz:g} MHz"
+            for r in ap.active_radios()
+        )
+        self.setToolTip(f"{ap.name}{' (predicted)' if ap.planned else ''}\n{radio_summary}\nClients/AP: {ap.max_clients}")
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -1708,6 +2305,11 @@ class PlanView(QGraphicsView):
         self.scale(factor, factor)
 
     def mouseMoveEvent(self, event):
+        if getattr(self.main, "wall_draw_mode", False) and getattr(self.main, "_wall_draw_start", None) is not None:
+            pos = self.mapToScene(event.position().toPoint())
+            snap, _ = self.main.nearest_ifc_connection_point(pos)
+            self.main.show_user_wall_preview(snap)
+
         if self._middle_panning and self._last_pan_pos is not None:
             delta = event.position().toPoint() - self._last_pan_pos
             self._last_pan_pos = event.position().toPoint()
@@ -1724,6 +2326,17 @@ class PlanView(QGraphicsView):
         super().mouseMoveEvent(event)
 
     def mousePressEvent(self, event):
+        if getattr(self.main, "wall_draw_mode", False):
+            if event.button() == Qt.RightButton:
+                self.main.cancel_user_wall_drawing()
+                event.accept()
+                return
+            if event.button() == Qt.LeftButton:
+                pos = self.mapToScene(event.position().toPoint())
+                self.main.capture_user_wall_point(pos)
+                event.accept()
+                return
+
         if event.button() == Qt.MiddleButton:
             self._middle_panning = True
             self._last_pan_pos = event.position().toPoint()
@@ -1754,7 +2367,7 @@ class PlanView(QGraphicsView):
     def mouseDoubleClickEvent(self, event):
         if self.main.floor is None:
             return
-        if getattr(self.main, "alignment_pick_mode", None):
+        if getattr(self.main, "alignment_pick_mode", None) or getattr(self.main, "wall_draw_mode", False):
             return
         pos = self.mapToScene(event.position().toPoint())
         self.main.add_ap(pos.x(), pos.y())
@@ -1798,7 +2411,14 @@ class MainWindow(QMainWindow):
         self._loading_replace = False
         self._loading_active = False
         self.heatmap_settings = HeatmapSettings.default()
+        self.auto_planner_settings = AutoPlannerSettings.from_dict(self.heatmap_settings.auto_planner_settings)
         self.heatmap_settings_path: Optional[Path] = None
+        self.ifc_origin_info: Dict[str, Dict[str, object]] = {}
+        self.view_rotation_deg: float = 0.0
+        self.wall_draw_mode: bool = False
+        self._wall_draw_start: Optional[QPointF] = None
+        self._wall_preview_items: List[QGraphicsItem] = []
+        self._pending_plan_data: Optional[Dict[str, object]] = None
         self.dxf_overlay: Optional[DxfOverlay] = None
         self.ifc_alignment = AlignmentTransform()
         self.alignment_pick_mode: Optional[str] = None
@@ -1823,9 +2443,10 @@ class MainWindow(QMainWindow):
         self._configure_wall_table_headers()
         self.wall_table.itemChanged.connect(self._wall_table_changed)
 
-        self.ap_table = QTableWidget(0, 11)
+        self.ap_table = QTableWidget(0, 16)
         self.ap_table.setHorizontalHeaderLabels([
-            "AP", "Radio", "Enabled", "Floor", "X", "Y", "Pattern", "Azimuth", "Downtilt", "TX dBm", "Freq MHz"
+            "AP", "Radio", "Enabled", "Floor", "X", "Y", "Pattern", "Azimuth", "Downtilt",
+            "TX dBm", "Gain dBi", "Freq MHz", "Channel", "Width MHz", "Occupancy %", "Clients/AP"
         ])
         self.ap_table.itemChanged.connect(self._ap_table_changed)
 
@@ -1956,9 +2577,744 @@ class MainWindow(QMainWindow):
         self.load_pattern_action.triggered.connect(self.load_pattern_csv)
         self.load_heatmap_settings_action = QAction("Load heatmap settings", self)
         self.load_heatmap_settings_action.triggered.connect(self.load_heatmap_settings)
-        tb.addActions([self.open_action, self.add_action, self.open_dxf_action, self.align_ifc_action, self.two_point_align_action, self.clear_dxf_action, self.sim_action, self.export_action, self.clear_ap_action, self.load_pattern_action, self.load_heatmap_settings_action])
+        self.planner_settings_action = QAction("Planner settings", self)
+        self.planner_settings_action.triggered.connect(self.show_auto_planner_settings)
+        self.predict_aps_action = QAction("Predict AP locations", self)
+        self.predict_aps_action.triggered.connect(self.run_auto_planner)
+        self.draw_wall_action = QAction("Draw RF wall", self)
+        self.draw_wall_action.setCheckable(True)
+        self.draw_wall_action.toggled.connect(self.toggle_wall_draw_mode)
+        self.ifc_origin_action = QAction("IFC origin / orientation", self)
+        self.ifc_origin_action.triggered.connect(self.show_ifc_origin_dialog)
+        self.rotate_left_action = QAction("Rotate view left", self)
+        self.rotate_left_action.triggered.connect(lambda: self.rotate_view(-15.0))
+        self.rotate_right_action = QAction("Rotate view right", self)
+        self.rotate_right_action.triggered.connect(lambda: self.rotate_view(15.0))
+        self.reset_rotation_action = QAction("Reset view rotation", self)
+        self.reset_rotation_action.triggered.connect(self.reset_view_rotation)
+        self.save_plan_action = QAction("Save RF plan", self)
+        self.save_plan_action.triggered.connect(self.save_rf_plan)
+        self.load_plan_action = QAction("Load RF plan", self)
+        self.load_plan_action.triggered.connect(self.load_rf_plan)
+        tb.addActions([
+            self.open_action, self.add_action, self.open_dxf_action, self.align_ifc_action, self.two_point_align_action,
+            self.clear_dxf_action, self.ifc_origin_action, self.rotate_left_action, self.rotate_right_action,
+            self.reset_rotation_action, self.draw_wall_action, self.planner_settings_action, self.predict_aps_action,
+            self.sim_action, self.export_action, self.clear_ap_action, self.load_pattern_action,
+            self.load_heatmap_settings_action, self.save_plan_action, self.load_plan_action,
+        ])
         self.floor_combo.currentTextChanged.connect(self.select_floor)
         self.include_inter_floor.stateChanged.connect(lambda *_: self.draw_floor())
+
+    # ----------------------------- View/origin tools -----------------------------
+
+    def rotate_view(self, delta_degrees: float):
+        delta = float(delta_degrees)
+        if abs(delta) < 1e-9:
+            return
+        self.view.rotate(delta)
+        self.view_rotation_deg = ((self.view_rotation_deg + delta + 180.0) % 360.0) - 180.0
+        self._preserve_view_on_redraw = True
+        self.statusBar().showMessage(f"View rotation: {self.view_rotation_deg:.1f}° (display only)")
+
+    def reset_view_rotation(self):
+        if abs(self.view_rotation_deg) > 1e-9:
+            self.view.rotate(-self.view_rotation_deg)
+        self.view_rotation_deg = 0.0
+        self._preserve_view_on_redraw = True
+        self.statusBar().showMessage("View rotation reset to model orientation")
+
+    def rotate_view_to_true_north(self) -> bool:
+        for info in self.ifc_origin_info.values():
+            for context in info.get("contexts", []) or []:
+                angle = context.get("true_north_angle_from_model_y_deg")
+                if angle is None:
+                    continue
+                target = -float(angle)
+                self.rotate_view(target - self.view_rotation_deg)
+                self.statusBar().showMessage(
+                    f"View rotated to IFC True North ({float(angle):.3f}° from model +Y)"
+                )
+                return True
+        return False
+
+    def show_ifc_origin_dialog(self):
+        dlg = IFCOriginDialog(self, self.ifc_origin_info, self.ifc_alignment)
+        dlg.exec()
+
+    # ----------------------------- RF wall creation/editing -----------------------------
+
+    def _clear_wall_preview(self):
+        scene = self.view.scene()
+        for item in list(getattr(self, "_wall_preview_items", [])):
+            try:
+                if scene is not None and item.scene() is scene:
+                    scene.removeItem(item)
+            except RuntimeError:
+                pass
+        self._wall_preview_items = []
+
+    def toggle_wall_draw_mode(self, enabled: bool):
+        self.wall_draw_mode = bool(enabled)
+        self._wall_draw_start = None
+        self._clear_wall_preview()
+        if enabled:
+            if not self.floor:
+                QMessageBox.information(self, "No floor selected", "Load an IFC and select a floor before drawing an RF wall.")
+                self.draw_wall_action.blockSignals(True); self.draw_wall_action.setChecked(False); self.draw_wall_action.blockSignals(False)
+                self.wall_draw_mode = False
+                return
+            self.view.setCursor(Qt.CrossCursor)
+            self.statusBar().showMessage("Draw RF wall: click an existing IFC wall/space edge for the first endpoint. Right-click to cancel.")
+        else:
+            self.view.setCursor(Qt.ArrowCursor)
+            self.statusBar().showMessage("RF wall drawing stopped")
+
+    def cancel_user_wall_drawing(self):
+        self._wall_draw_start = None
+        self._clear_wall_preview()
+        self.wall_draw_mode = False
+        if hasattr(self, "draw_wall_action"):
+            self.draw_wall_action.blockSignals(True); self.draw_wall_action.setChecked(False); self.draw_wall_action.blockSignals(False)
+        self.view.setCursor(Qt.ArrowCursor)
+        self.statusBar().showMessage("RF wall drawing cancelled")
+
+    def nearest_ifc_connection_point(self, scene_pos: QPointF) -> Tuple[QPointF, bool]:
+        """Snap to a vertex or nearest boundary point on existing IFC/user geometry."""
+        if not self.floor:
+            return scene_pos, False
+        try:
+            p0 = self.view.mapToScene(0, 0)
+            p1 = self.view.mapToScene(28, 0)
+            snap_radius = max(0.02, abs(p1.x() - p0.x()))
+        except Exception:
+            snap_radius = 0.75
+        sx, sy = float(scene_pos.x()), float(scene_pos.y())
+        source = Point(sx, sy)
+        best = QPointF(sx, sy)
+        best_distance = snap_radius
+        for obj in list(self.floor.walls) + list(self.floor.spaces):
+            try:
+                boundary = obj.polygon.exterior
+                projected = boundary.interpolate(boundary.project(source))
+                distance = float(projected.distance(source))
+                if distance <= best_distance:
+                    best = QPointF(float(projected.x), float(projected.y)); best_distance = distance
+                for x, y in boundary.coords:
+                    distance = math.hypot(float(x) - sx, float(y) - sy)
+                    if distance <= best_distance:
+                        best = QPointF(float(x), float(y)); best_distance = distance
+            except Exception:
+                continue
+        return best, best_distance <= snap_radius
+
+    def show_user_wall_preview(self, end_point: QPointF):
+        self._clear_wall_preview()
+        if self._wall_draw_start is None or self.view.scene() is None:
+            return
+        pen = QPen(QColor("#FF7800"), 0)
+        pen.setCosmetic(True); pen.setStyle(Qt.DashLine)
+        line = self.view.scene().addLine(
+            self._wall_draw_start.x(), self._wall_draw_start.y(), end_point.x(), end_point.y(), pen
+        )
+        line.setZValue(Z_AP_LABEL + 20)
+        marker = self.view.scene().addEllipse(
+            self._wall_draw_start.x() - 0.15, self._wall_draw_start.y() - 0.15, 0.3, 0.3,
+            QPen(QColor("#FF7800"), 0), QBrush(QColor("#FF7800")),
+        )
+        marker.setZValue(Z_AP_LABEL + 21)
+        self._wall_preview_items = [line, marker]
+
+    def capture_user_wall_point(self, scene_pos: QPointF):
+        if not self.floor:
+            return
+        snap, snapped = self.nearest_ifc_connection_point(scene_pos)
+        if not snapped:
+            self.statusBar().showMessage("RF wall endpoints must connect to an existing IFC wall or space boundary. Click closer to an edge.")
+            return
+        if self._wall_draw_start is None:
+            self._wall_draw_start = snap
+            self.show_user_wall_preview(snap)
+            self.statusBar().showMessage("First wall endpoint captured. Click another existing IFC element/edge for the second endpoint.")
+            return
+        start = self._wall_draw_start
+        if math.hypot(start.x() - snap.x(), start.y() - snap.y()) < 0.05:
+            self.statusBar().showMessage("The second endpoint must be different from the first endpoint.")
+            return
+        thickness = max(0.02, float(self.heatmap_settings.user_wall_default_thickness_m))
+        polygon = LineString([(start.x(), start.y()), (snap.x(), snap.y())]).buffer(
+            thickness / 2.0, cap_style=2, join_style=2
+        )
+        wall_type = self.heatmap_settings.user_wall_default_type or "partition"
+        profile = dict(
+            self.heatmap_settings.default_wall_attenuation_by_material_db.get(
+                wall_type.lower(), self.heatmap_settings.default_wall_attenuation_by_material_db.get("default", {})
+            )
+        )
+        wall = Wall2D(
+            guid=f"user-rf-wall-{uuid.uuid4().hex}", name="User RF blocking wall", floor=self.floor.name,
+            source_file="User RF wall", type_name=wall_type, material=wall_type, polygon=polygon,
+            z_min=float(self.floor.elevation), z_max=float(self.floor.elevation) + 3.0,
+            source_storey=self.floor.name, attenuation_by_band_db=profile,
+            rf_type_override=wall_type, rf_customised=True, is_user_created=True,
+            user_wall_thickness_m=thickness,
+        )
+        self.floor.walls.append(wall)
+        self._wall_draw_start = None
+        self._clear_wall_preview()
+        self.last_result = None
+        self.edit_wall_rf_properties(wall)
+        self.draw_floor(); self.populate_wall_table()
+        self.statusBar().showMessage("Created RF blocking wall. Continue clicking to draw another, or right-click to finish.")
+
+    def _wall_instances(self, wall: Wall2D) -> List[Wall2D]:
+        if wall.is_user_created:
+            return [wall]
+        return [
+            candidate for floor in self.floors.values() for candidate in floor.walls
+            if candidate.guid == wall.guid and candidate.source_file == wall.source_file
+        ] or [wall]
+
+    def edit_wall_rf_properties(self, wall: Wall2D):
+        dlg = WallAttenuationDialog(
+            self, wall, self._frequency_bands(), self.heatmap_settings.default_wall_attenuation_by_material_db
+        )
+        if dlg.exec() != QDialog.Accepted:
+            return
+        wall_type, attenuation = dlg.values()
+        for instance in self._wall_instances(wall):
+            instance.rf_type_override = wall_type
+            instance.attenuation_by_band_db.update({float(k): float(v) for k, v in attenuation.items()})
+            instance.rf_customised = True
+        self.last_result = None
+        self.populate_wall_table(); self.draw_floor()
+        self.statusBar().showMessage(f"Updated RF attenuation for {wall.name or wall.guid}")
+
+    def reset_wall_rf_properties(self, wall: Wall2D):
+        for instance in self._wall_instances(wall):
+            instance.rf_type_override = ""
+            instance.rf_customised = False
+            instance.attenuation_by_band_db = self._profile_for_wall_from_settings(instance)
+        self.last_result = None
+        self.populate_wall_table(); self.draw_floor()
+
+    def delete_user_wall(self, wall: Wall2D):
+        if not wall.is_user_created:
+            return
+        floor = self.floors.get(wall.floor)
+        if floor is not None:
+            floor.walls = [candidate for candidate in floor.walls if candidate is not wall]
+        self.last_result = None
+        self.populate_wall_table(); self.draw_floor()
+
+    # ----------------------------- Predictive AP planning -----------------------------
+
+    def show_auto_planner_settings(self):
+        dlg = AutoPlannerSettingsDialog(self, self.auto_planner_settings, list(self.antenna_patterns.keys()))
+        if dlg.exec() == QDialog.Accepted:
+            self.auto_planner_settings = dlg._validated_settings
+            self.heatmap_settings.auto_planner_settings = self.auto_planner_settings.to_dict()
+            self._apply_frequency_settings_to_model(replace_existing=False)
+            self._refresh_rssi_frequency_dropdown()
+            self.populate_wall_table()
+            self.statusBar().showMessage("Predictive AP planner settings updated")
+
+    def _planner_floor_area(self):
+        if not self.floor:
+            return None
+        polygons = [space.polygon for space in self.floor.spaces if not space.polygon.is_empty]
+        if polygons:
+            try:
+                area = unary_union(polygons)
+                if not area.is_empty:
+                    return area
+            except Exception:
+                pass
+        minx, miny, maxx, maxy = RFEngine._floor_bounds(self.floor, [])
+        return box(minx, miny, maxx, maxy)
+
+    @staticmethod
+    def _planner_tree_hits(tree, walls: List[Wall2D], geometry) -> List[Wall2D]:
+        if tree is None:
+            return walls
+        try:
+            hits = tree.query(geometry)
+        except Exception:
+            return walls
+        result: List[Wall2D] = []
+        for hit in hits:
+            if isinstance(hit, (int, np.integer)):
+                idx = int(hit)
+                if 0 <= idx < len(walls): result.append(walls[idx])
+            else:
+                # Shapely 1.x may return geometry objects.
+                for idx, candidate in enumerate(walls):
+                    if candidate.polygon is hit:
+                        result.append(candidate); break
+        return result
+
+    def _planner_point_is_blocked(self, point: Point, tree, walls: List[Wall2D]) -> bool:
+        for wall in self._planner_tree_hits(tree, walls, point):
+            try:
+                if wall.polygon.covers(point):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _planner_grid_points(self, area, spacing: float, tree, walls: List[Wall2D], limit: int) -> List[Tuple[float, float]]:
+        minx, miny, maxx, maxy = area.bounds
+        spacing = max(0.25, float(spacing))
+        points: List[Tuple[float, float]] = []
+        y = miny + spacing / 2.0
+        while y <= maxy:
+            x = minx + spacing / 2.0
+            while x <= maxx:
+                point = Point(float(x), float(y))
+                try:
+                    inside = area.covers(point)
+                except Exception:
+                    inside = area.contains(point)
+                if inside and not self._planner_point_is_blocked(point, tree, walls):
+                    points.append((float(x), float(y)))
+                x += spacing
+            y += spacing
+        if len(points) > limit:
+            indices = np.linspace(0, len(points) - 1, limit, dtype=int)
+            points = [points[int(i)] for i in indices]
+        return points
+
+    def _planner_rssi(self, x: float, y: float, ap: AccessPoint, radio: APRadio, wall_tree, walls: List[Wall2D]) -> float:
+        if not self.floor:
+            return -200.0
+        dx = float(x) - float(ap.x); dy = float(y) - float(ap.y)
+        dz = float(ap.mount_height_m) - float(ap.rx_height_m)
+        distance = max(1.0, math.sqrt(dx * dx + dy * dy + dz * dz))
+        radius = RFEngine.cutoff_radius_m_for_radio(radio, self.heatmap_settings)
+        if radius > 0.0 and distance > radius:
+            return float(self.heatmap_settings.disconnected_rssi_dbm)
+        path_loss = RFEngine.free_space_loss_db_at_1m(radio.frequency_mhz) + 10.0 * float(ap.path_loss_exponent) * math.log10(distance)
+        bearing = math.degrees(math.atan2(dy, dx))
+        az_rel = bearing - float(ap.azimuth_deg)
+        horizontal_distance = max(1e-9, math.hypot(dx, dy))
+        elevation = math.degrees(math.atan2(float(ap.rx_height_m) - float(ap.mount_height_m), horizontal_distance))
+        el_rel = elevation + float(ap.downtilt_deg)
+        pattern = self.antenna_patterns.get(radio.antenna_pattern)
+        pattern_gain = pattern.gain_dbi(az_rel, el_rel) if pattern else 0.0
+        line = LineString([(float(ap.x), float(ap.y)), (float(x), float(y))])
+        wall_loss = 0.0
+        for wall in self._planner_tree_hits(wall_tree, walls, line):
+            try:
+                if wall.polygon.intersects(line):
+                    wall_loss += wall.attenuation_db_for_frequency(radio.frequency_mhz)
+            except Exception:
+                continue
+        return float(radio.tx_power_dbm) + float(radio.antenna_gain_dbi) + pattern_gain - path_loss - wall_loss
+
+    @staticmethod
+    def _combine_frequency_masks(masks: List[np.ndarray], mode: str, count: int) -> np.ndarray:
+        if not masks:
+            return np.zeros(count, dtype=bool)
+        if mode == "any":
+            return np.logical_or.reduce(masks)
+        return np.logical_and.reduce(masks)
+
+    def _planner_ap_masks(self, ap: AccessPoint, requirements: List[PlannerRadioRequirement], samples: List[Tuple[float, float]], wall_tree, walls: List[Wall2D]) -> List[np.ndarray]:
+        masks: List[np.ndarray] = []
+        for requirement in requirements:
+            matching = [
+                radio for radio in ap.active_radios()
+                if abs(float(radio.frequency_mhz) - float(requirement.frequency_mhz)) < 1.0
+            ]
+            values = np.zeros(len(samples), dtype=bool)
+            for radio in matching:
+                for idx, (x, y) in enumerate(samples):
+                    if values[idx]:
+                        continue
+                    values[idx] = self._planner_rssi(x, y, ap, radio, wall_tree, walls) >= requirement.minimum_rssi_dbm
+            masks.append(values)
+        return masks
+
+    def _next_ap_name(self) -> str:
+        used = {ap.name for ap in self.aps}
+        idx = 1
+        while f"AP-{idx}" in used:
+            idx += 1
+        return f"AP-{idx}"
+
+    @staticmethod
+    def _channel_center_mhz(frequency_mhz: float, channel: str) -> Optional[float]:
+        try:
+            number = float(str(channel).strip())
+        except Exception:
+            return None
+        frequency_mhz = float(frequency_mhz)
+        if 2300.0 <= frequency_mhz < 3000.0:
+            if abs(number - 14.0) < 0.1:
+                return 2484.0
+            return 2407.0 + 5.0 * number
+        if 4900.0 <= frequency_mhz < 5925.0:
+            return 5000.0 + 5.0 * number
+        if 5925.0 <= frequency_mhz < 7125.0:
+            return 5950.0 + 5.0 * number
+        return None
+
+    @classmethod
+    def _channel_overlap_fraction(cls, frequency_mhz: float, channel_a: str, width_a: float, channel_b: str, width_b: float) -> float:
+        center_a = cls._channel_center_mhz(frequency_mhz, channel_a)
+        center_b = cls._channel_center_mhz(frequency_mhz, channel_b)
+        if center_a is None or center_b is None:
+            return 1.0 if str(channel_a) == str(channel_b) and str(channel_a) else 0.0
+        half_total = max(1.0, (float(width_a) + float(width_b)) / 2.0)
+        separation = abs(center_a - center_b)
+        return max(0.0, 1.0 - separation / half_total)
+
+    def _assign_planner_channels(self, new_aps: List[AccessPoint], requirements: List[PlannerRadioRequirement]):
+        new_ids = {id(ap) for ap in new_aps}
+        assigned = [ap for ap in self.aps if id(ap) not in new_ids]
+        for ap in new_aps:
+            for req, radio in zip(requirements, ap.radios):
+                channels = list(req.channels) or [""]
+                best_channel = channels[0]
+                best_cost = float("inf")
+                radius = req.cutoff_radius_m or float(self.heatmap_settings.ap_cutoff_radius_by_frequency_m.get(req.frequency_mhz, 35.0))
+                for channel in channels:
+                    cost = 0.0
+                    for other in assigned:
+                        distance = math.hypot(ap.x - other.x, ap.y - other.y)
+                        if distance > max(radius * 1.5, 10.0):
+                            continue
+                        for other_radio in other.active_radios():
+                            if abs(other_radio.frequency_mhz - req.frequency_mhz) >= 1.0 or not str(other_radio.channel):
+                                continue
+                            overlap = self._channel_overlap_fraction(
+                                req.frequency_mhz, str(channel), req.channel_width_mhz,
+                                str(other_radio.channel), float(other_radio.channel_width_mhz),
+                            )
+                            if overlap > 0.0:
+                                cost += overlap * (1.0 + req.spectrum_occupancy_percent / 100.0) / max(distance, 1.0)
+                    if cost < best_cost:
+                        best_cost = cost; best_channel = channel
+                radio.channel = str(best_channel)
+            assigned.append(ap)
+
+    def run_auto_planner(self):
+        if not self.floor:
+            QMessageBox.information(self, "No floor selected", "Load an IFC and select a floor before predicting AP locations.")
+            return
+        settings = self.auto_planner_settings
+        requirements = [r for r in settings.radio_requirements if r.enabled]
+        if not requirements:
+            QMessageBox.information(self, "No planner radios", "Enable at least one frequency in Planner settings.")
+            return
+
+        if settings.remove_previous_planned_aps:
+            self.aps = [ap for ap in self.aps if not (ap.floor == self.floor.name and ap.planned)]
+        existing = [ap for ap in self.aps if ap.floor == self.floor.name and settings.keep_existing_aps]
+        area = self._planner_floor_area()
+        if area is None or area.is_empty:
+            QMessageBox.warning(self, "No plannable area", "No IFC spaces or usable floor bounds were found.")
+            return
+        walls = list(self.floor.walls)
+        try:
+            from shapely.strtree import STRtree
+            wall_tree = STRtree([wall.polygon for wall in walls]) if walls else None
+        except Exception:
+            wall_tree = None
+
+        samples = self._planner_grid_points(area, settings.sample_spacing_m, wall_tree, walls, 2500)
+        candidates = self._planner_grid_points(area, settings.candidate_spacing_m, wall_tree, walls, 450)
+        # Include room representative points because they often place APs more naturally than a global grid.
+        for space in self.floor.spaces:
+            try:
+                point = space.polygon.representative_point()
+                candidate = (float(point.x), float(point.y))
+                if candidate not in candidates and not self._planner_point_is_blocked(point, wall_tree, walls):
+                    candidates.append(candidate)
+            except Exception:
+                pass
+        if not samples or not candidates:
+            QMessageBox.warning(self, "No planner points", "The selected floor did not produce usable coverage samples and AP candidates.")
+            return
+
+        directional = any(not req.antenna_pattern.lower().startswith("omni") for req in requirements)
+        azimuths = list(range(0, 360, 45)) if directional else [0]
+        candidate_specs = [(x, y, float(az)) for x, y in candidates for az in azimuths]
+        if len(candidate_specs) > 700:
+            indices = np.linspace(0, len(candidate_specs) - 1, 700, dtype=int)
+            candidate_specs = [candidate_specs[int(i)] for i in indices]
+
+        progress = QProgressDialog("Evaluating predictive AP locations…", "Cancel", 0, len(candidate_specs) + settings.maximum_aps, self)
+        progress.setWindowTitle("Predictive AP planner"); progress.setWindowModality(Qt.WindowModal); progress.setMinimumDuration(0); progress.show()
+
+        covered_by_radio = [np.zeros(len(samples), dtype=bool) for _ in requirements]
+        for ap in existing:
+            masks = self._planner_ap_masks(ap, requirements, samples, wall_tree, walls)
+            covered_by_radio = [current | mask for current, mask in zip(covered_by_radio, masks)]
+
+        candidate_records = []
+        try:
+            for idx, (x, y, azimuth) in enumerate(candidate_specs):
+                if progress.wasCanceled():
+                    raise RuntimeError("Predictive AP planning cancelled")
+                radios = [APRadio(
+                    name=req.name, frequency_mhz=req.frequency_mhz, tx_power_dbm=req.tx_power_dbm,
+                    antenna_pattern=req.antenna_pattern, enabled=True, cutoff_radius_m=req.cutoff_radius_m,
+                    antenna_gain_dbi=req.antenna_gain_dbi, channel="", channel_width_mhz=req.channel_width_mhz,
+                    spectrum_occupancy_percent=req.spectrum_occupancy_percent,
+                ) for req in requirements]
+                temp_ap = AccessPoint(
+                    name="candidate", x=x, y=y, floor=self.floor.name, radios=radios,
+                    path_loss_exponent=float(self.ple.value()), azimuth_deg=azimuth,
+                    mount_height_m=float(self.mount_height.value()), rx_height_m=float(self.rx_height.value()),
+                    max_clients=settings.clients_per_ap, planned=True,
+                )
+                radio_masks = self._planner_ap_masks(temp_ap, requirements, samples, wall_tree, walls)
+                candidate_records.append((temp_ap, radio_masks))
+                progress.setValue(idx + 1)
+                if idx % 5 == 0: QApplication.processEvents()
+
+            overall = self._combine_frequency_masks(covered_by_radio, settings.coverage_mode, len(samples))
+            target_fraction = settings.target_coverage_percent / 100.0
+            average_occupancy = sum(req.spectrum_occupancy_percent for req in requirements) / len(requirements)
+            effective_clients = max(1.0, settings.clients_per_ap * max(0.05, 1.0 - average_occupancy / 100.0))
+            capacity_ap_count = int(math.ceil(settings.expected_clients / effective_clients)) if settings.expected_clients > 0 else 0
+            selected: List[Tuple[AccessPoint, List[np.ndarray]]] = []
+            positions = [(ap.x, ap.y) for ap in existing]
+            remaining = list(range(len(candidate_records)))
+
+            while remaining and len(selected) < settings.maximum_aps:
+                coverage_fraction = float(np.count_nonzero(overall)) / max(1, len(overall))
+                total_capacity_aps = len(existing) + len(selected)
+                if coverage_fraction >= target_fraction and total_capacity_aps >= capacity_ap_count:
+                    break
+                best_index = None; best_score = -1.0
+                coverage_needed = coverage_fraction < target_fraction
+                for record_index in remaining:
+                    candidate_ap, radio_masks = candidate_records[record_index]
+                    if positions:
+                        min_distance = min(math.hypot(candidate_ap.x - px, candidate_ap.y - py) for px, py in positions)
+                        if min_distance + 1e-9 < settings.minimum_ap_spacing_m:
+                            continue
+                    else:
+                        min_distance = settings.minimum_ap_spacing_m
+                    proposed_by_radio = [current | mask for current, mask in zip(covered_by_radio, radio_masks)]
+                    proposed_overall = self._combine_frequency_masks(proposed_by_radio, settings.coverage_mode, len(samples))
+                    overall_gain = int(np.count_nonzero(proposed_overall & ~overall))
+                    band_gain = sum(int(np.count_nonzero(mask & ~current)) for mask, current in zip(radio_masks, covered_by_radio))
+                    if coverage_needed:
+                        score = overall_gain * 1000.0 + band_gain * 10.0 + min_distance
+                    else:
+                        # Coverage is met but client capacity requires more APs: spread them across covered demand.
+                        score = min_distance * 10.0 + sum(int(np.count_nonzero(mask)) for mask in radio_masks) / max(1, len(samples))
+                    if score > best_score:
+                        best_score = score; best_index = record_index
+                if best_index is None:
+                    break
+                candidate_ap, radio_masks = candidate_records[best_index]
+                selected.append((candidate_ap, radio_masks)); positions.append((candidate_ap.x, candidate_ap.y))
+                covered_by_radio = [current | mask for current, mask in zip(covered_by_radio, radio_masks)]
+                overall = self._combine_frequency_masks(covered_by_radio, settings.coverage_mode, len(samples))
+                remaining.remove(best_index)
+                progress.setValue(len(candidate_specs) + len(selected)); QApplication.processEvents()
+
+            new_aps: List[AccessPoint] = []
+            for candidate_ap, _ in selected:
+                candidate_ap.name = self._next_ap_name()
+                candidate_ap.tx_power_dbm = candidate_ap.radios[0].tx_power_dbm
+                candidate_ap.frequency_mhz = candidate_ap.radios[0].frequency_mhz
+                candidate_ap.antenna_pattern = candidate_ap.radios[0].antenna_pattern
+                self.aps.append(candidate_ap); new_aps.append(candidate_ap)
+            self._assign_planner_channels(new_aps, requirements)
+
+        except RuntimeError as exc:
+            progress.close()
+            self.statusBar().showMessage(str(exc))
+            return
+        except Exception as exc:
+            progress.close()
+            QMessageBox.warning(self, "Predictive AP planner failed", str(exc))
+            return
+        finally:
+            progress.close()
+
+        self.last_result = None; self.rssi_results_by_frequency = {}
+        self._refresh_rssi_frequency_dropdown()
+        self.populate_ap_table(); self.draw_floor()
+        overall_pct = 100.0 * float(np.count_nonzero(overall)) / max(1, len(overall))
+        band_lines = []
+        for req, mask in zip(requirements, covered_by_radio):
+            pct = 100.0 * float(np.count_nonzero(mask)) / max(1, len(mask))
+            band_lines.append(f"{req.name} ({req.frequency_mhz:g} MHz): {pct:.1f}% at ≥ {req.minimum_rssi_dbm:g} dBm")
+        available_capacity = int((len(existing) + len(new_aps)) * effective_clients)
+        warnings = []
+        if overall_pct + 1e-6 < settings.target_coverage_percent:
+            warnings.append("The coverage target was not fully achievable with the configured AP limit, spacing, radio patterns and wall losses.")
+        if available_capacity < settings.expected_clients:
+            warnings.append(f"The estimated effective capacity ({available_capacity}) is below the expected {settings.expected_clients} clients.")
+        warning = ("\n\n" + "\n".join(warnings)) if warnings else ""
+        QMessageBox.information(
+            self, "Predictive AP plan complete",
+            f"Added {len(new_aps)} predicted AP(s) on {self.floor.name}.\n"
+            f"Overall coverage ({'every band' if settings.coverage_mode == 'all' else 'any band'}): {overall_pct:.1f}%\n"
+            f"Effective client capacity after {average_occupancy:.1f}% average spectrum occupancy: approximately {available_capacity} clients.\n\n"
+            + "\n".join(band_lines) + warning,
+        )
+
+    # ----------------------------- RF plan persistence -----------------------------
+
+    @staticmethod
+    def _radio_to_dict(radio: APRadio) -> Dict[str, object]:
+        return {
+            "name": radio.name, "frequency_mhz": radio.frequency_mhz, "tx_power_dbm": radio.tx_power_dbm,
+            "antenna_pattern": radio.antenna_pattern, "enabled": radio.enabled, "cutoff_radius_m": radio.cutoff_radius_m,
+            "antenna_gain_dbi": radio.antenna_gain_dbi, "channel": radio.channel,
+            "channel_width_mhz": radio.channel_width_mhz, "spectrum_occupancy_percent": radio.spectrum_occupancy_percent,
+        }
+
+    @staticmethod
+    def _radio_from_dict(data: Dict[str, object]) -> APRadio:
+        return APRadio(
+            name=str(data.get("name", "Radio")), frequency_mhz=float(data.get("frequency_mhz", 2400.0)),
+            tx_power_dbm=float(data.get("tx_power_dbm", 20.0)), antenna_pattern=str(data.get("antenna_pattern", "Omni ceiling AP")),
+            enabled=bool(data.get("enabled", True)), cutoff_radius_m=float(data.get("cutoff_radius_m", 0.0)),
+            antenna_gain_dbi=float(data.get("antenna_gain_dbi", 0.0)), channel=str(data.get("channel", "")),
+            channel_width_mhz=float(data.get("channel_width_mhz", 20.0)),
+            spectrum_occupancy_percent=float(data.get("spectrum_occupancy_percent", 0.0)),
+        )
+
+    def _rf_plan_data(self) -> Dict[str, object]:
+        aps = []
+        for ap in self.aps:
+            aps.append({
+                "name": ap.name, "x": ap.x, "y": ap.y, "floor": ap.floor,
+                "tx_power_dbm": ap.tx_power_dbm, "frequency_mhz": ap.frequency_mhz,
+                "reference_loss_db_at_1m": ap.reference_loss_db_at_1m, "path_loss_exponent": ap.path_loss_exponent,
+                "antenna_pattern": ap.antenna_pattern, "azimuth_deg": ap.azimuth_deg, "downtilt_deg": ap.downtilt_deg,
+                "mount_height_m": ap.mount_height_m, "rx_height_m": ap.rx_height_m,
+                "max_clients": ap.max_clients, "planned": ap.planned,
+                "radios": [self._radio_to_dict(radio) for radio in ap.radios],
+            })
+        user_walls = []
+        overrides = []
+        for floor in self.floors.values():
+            for wall in floor.walls:
+                if wall.is_user_created:
+                    user_walls.append({
+                        "guid": wall.guid, "name": wall.name, "floor": wall.floor, "type_name": wall.type_name,
+                        "material": wall.material, "polygon": [[float(x), float(y)] for x, y in wall.polygon.exterior.coords],
+                        "z_min": wall.z_min, "z_max": wall.z_max, "rf_type_override": wall.rf_type_override,
+                        "attenuation_by_band_db": {str(k): float(v) for k, v in wall.attenuation_by_band_db.items()},
+                        "thickness_m": wall.user_wall_thickness_m,
+                    })
+                elif wall.rf_customised:
+                    overrides.append({
+                        "guid": wall.guid, "source_file": wall.source_file, "rf_type_override": wall.rf_type_override,
+                        "attenuation_by_band_db": {str(k): float(v) for k, v in wall.attenuation_by_band_db.items()},
+                    })
+        return {
+            "format": "rf-attenuation-plan", "version": 1,
+            "ifc_paths": [str(path) for path in self.loaded_ifc_paths],
+            "selected_floor": self.floor.name if self.floor else "", "view_rotation_deg": self.view_rotation_deg,
+            "ifc_alignment": {"dx": self.ifc_alignment.dx, "dy": self.ifc_alignment.dy, "rotation_deg": self.ifc_alignment.rotation_deg, "scale": self.ifc_alignment.scale},
+            "auto_planner_settings": self.auto_planner_settings.to_dict(),
+            "access_points": aps, "user_walls": user_walls, "wall_overrides": overrides,
+        }
+
+    def save_rf_plan(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save RF plan", "rf_plan.rfplan.json", "RF plan (*.rfplan.json);;JSON files (*.json)")
+        if not path:
+            return
+        try:
+            Path(path).write_text(json.dumps(self._rf_plan_data(), indent=2), encoding="utf-8")
+            self.statusBar().showMessage(f"Saved RF plan: {Path(path).name}")
+        except Exception as exc:
+            QMessageBox.warning(self, "RF plan save failed", str(exc))
+
+    def load_rf_plan(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Load RF plan", "", "RF plan (*.rfplan.json *.json);;All files (*.*)")
+        if not path:
+            return
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            if data.get("format") != "rf-attenuation-plan":
+                raise ValueError("This is not an RF Attenuation Simulator plan file.")
+        except Exception as exc:
+            QMessageBox.warning(self, "RF plan load failed", str(exc)); return
+        if not self.floors:
+            paths = [Path(v) for v in data.get("ifc_paths", []) if str(v).strip()]
+            existing_paths = [candidate for candidate in paths if candidate.exists()]
+            if existing_paths:
+                self._pending_plan_data = data
+                self._load_ifc_paths(existing_paths, replace=True)
+                return
+        self._apply_rf_plan_data(data)
+
+    def _apply_rf_plan_data(self, data: Dict[str, object]):
+        alignment_data = data.get("ifc_alignment", {}) or {}
+        try:
+            target_alignment = AlignmentTransform(
+                dx=float(alignment_data.get("dx", 0.0)), dy=float(alignment_data.get("dy", 0.0)),
+                rotation_deg=float(alignment_data.get("rotation_deg", 0.0)), scale=float(alignment_data.get("scale", 1.0)),
+            )
+            self.apply_ifc_alignment(target_alignment)
+        except Exception:
+            pass
+        # Remove prior user geometry before restoring the saved plan.
+        for floor in self.floors.values():
+            floor.walls = [wall for wall in floor.walls if not wall.is_user_created]
+            for wall in floor.walls:
+                wall.rf_customised = False; wall.rf_type_override = ""
+                wall.attenuation_by_band_db = self._profile_for_wall_from_settings(wall)
+        override_lookup = {
+            (str(item.get("source_file", "")), str(item.get("guid", ""))): item
+            for item in data.get("wall_overrides", []) if isinstance(item, dict)
+        }
+        for floor in self.floors.values():
+            for wall in floor.walls:
+                item = override_lookup.get((wall.source_file, wall.guid))
+                if item:
+                    wall.rf_type_override = str(item.get("rf_type_override", "")); wall.rf_customised = True
+                    wall.attenuation_by_band_db.update({float(k): float(v) for k, v in dict(item.get("attenuation_by_band_db", {})).items()})
+        for item in data.get("user_walls", []):
+            if not isinstance(item, dict): continue
+            floor = self.floors.get(str(item.get("floor", "")))
+            coords = item.get("polygon", [])
+            if floor is None or not isinstance(coords, list) or len(coords) < 3: continue
+            polygon = Polygon([(float(v[0]), float(v[1])) for v in coords])
+            floor.walls.append(Wall2D(
+                guid=str(item.get("guid", f"user-rf-wall-{uuid.uuid4().hex}")), name=str(item.get("name", "User RF blocking wall")),
+                floor=floor.name, source_file="User RF wall", type_name=str(item.get("type_name", "partition")),
+                material=str(item.get("material", "partition")), polygon=polygon,
+                z_min=float(item.get("z_min", floor.elevation)), z_max=float(item.get("z_max", floor.elevation + 3.0)),
+                source_storey=floor.name, attenuation_by_band_db={float(k): float(v) for k, v in dict(item.get("attenuation_by_band_db", {})).items()},
+                rf_type_override=str(item.get("rf_type_override", item.get("type_name", "partition"))),
+                rf_customised=True, is_user_created=True, user_wall_thickness_m=float(item.get("thickness_m", 0.15)),
+            ))
+        self.aps = []
+        for item in data.get("access_points", []):
+            if not isinstance(item, dict): continue
+            radios = [self._radio_from_dict(v) for v in item.get("radios", []) if isinstance(v, dict)]
+            self.aps.append(AccessPoint(
+                name=str(item.get("name", self._next_ap_name())), x=float(item.get("x", 0.0)), y=float(item.get("y", 0.0)), floor=str(item.get("floor", "")),
+                tx_power_dbm=float(item.get("tx_power_dbm", 20.0)), frequency_mhz=float(item.get("frequency_mhz", 2400.0)),
+                reference_loss_db_at_1m=float(item.get("reference_loss_db_at_1m", 40.0)), path_loss_exponent=float(item.get("path_loss_exponent", 2.2)),
+                antenna_pattern=str(item.get("antenna_pattern", "Omni ceiling AP")), azimuth_deg=float(item.get("azimuth_deg", 0.0)),
+                downtilt_deg=float(item.get("downtilt_deg", 0.0)), mount_height_m=float(item.get("mount_height_m", 2.7)),
+                rx_height_m=float(item.get("rx_height_m", 1.2)), radios=radios,
+                max_clients=int(item.get("max_clients", 50)), planned=bool(item.get("planned", False)),
+            ))
+        self.auto_planner_settings = AutoPlannerSettings.from_dict(data.get("auto_planner_settings", {}))
+        selected_floor = str(data.get("selected_floor", ""))
+        if selected_floor in self.floors:
+            self.floor_combo.setCurrentText(selected_floor)
+        self.reset_view_rotation()
+        saved_rotation = float(data.get("view_rotation_deg", 0.0))
+        if abs(saved_rotation) > 1e-9:
+            self.rotate_view(saved_rotation)
+        self.last_result = None; self.rssi_results_by_frequency = {}
+        self.populate_ap_table(); self.populate_wall_table(); self.draw_floor()
+        self.statusBar().showMessage("Loaded RF plan")
 
     def _refresh_rssi_frequency_dropdown(self):
         if not hasattr(self, "rssi_view_frequency"):
@@ -2555,8 +3911,8 @@ class MainWindow(QMainWindow):
                     path_str, incoming, source_name, chunk_index, chunk_count = result
                     self._ifc_chunk_finished(Path(path_str), incoming, source_name, chunk_index, chunk_count)
                 else:
-                    path_str, incoming, source_name = result
-                    self._ifc_worker_finished(Path(path_str), incoming, source_name)
+                    path_str, incoming, source_name, origin_info = result
+                    self._ifc_worker_finished(Path(path_str), incoming, source_name, origin_info)
 
             except concurrent.futures.process.BrokenProcessPool as exc:
                 pool_broken = True
@@ -2602,6 +3958,7 @@ class MainWindow(QMainWindow):
             return
         self.floors = {}
         self.loaded_ifc_paths = []
+        self.ifc_origin_info = {}
         self.aps.clear()
         self._load_ifc_paths([Path(p) for p in paths], replace=True)
 
@@ -2617,8 +3974,13 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "IFC load in progress", "Wait for the current IFC load to finish before adding more files.")
             return
         if replace:
+            if getattr(self, "wall_draw_mode", False) or getattr(self, "_wall_draw_start", None) is not None:
+                self.cancel_user_wall_drawing()
+            if abs(float(getattr(self, "view_rotation_deg", 0.0))) > 1e-9:
+                self.reset_view_rotation()
             self.floors = {}
             self.loaded_ifc_paths = []
+            self.ifc_origin_info = {}
             self.aps.clear()
             self.last_result = None
             self.ifc_alignment = AlignmentTransform()
@@ -2742,7 +4104,8 @@ class MainWindow(QMainWindow):
                                 f"Indexing {path.name} before chunked multiprocessing..."
                             )
                             QApplication.processEvents()
-                            path_str, storeys, wall_guids, space_guids, source_name = _index_ifc_file_for_chunking(job)
+                            path_str, storeys, wall_guids, space_guids, source_name, origin_info = _index_ifc_file_for_chunking(job)
+                            self.ifc_origin_info[self._ifc_path_key(path)] = origin_info
                             records = [("wall", g) for g in wall_guids] + [("space", g) for g in space_guids]
                             if not records:
                                 fut = self._ifc_process_executor.submit(_load_ifc_file_in_process, job)
@@ -2793,8 +4156,8 @@ class MainWindow(QMainWindow):
             for job in base_jobs:
                 path = Path(job[0])
                 try:
-                    path_str, incoming, source_name = _load_ifc_file_in_process(job)
-                    self._ifc_worker_finished(Path(path_str), incoming, source_name)
+                    path_str, incoming, source_name, origin_info = _load_ifc_file_in_process(job)
+                    self._ifc_worker_finished(Path(path_str), incoming, source_name, origin_info)
                 except Exception as exc:
                     self._ifc_worker_error(path, str(exc))
 
@@ -2838,8 +4201,8 @@ class MainWindow(QMainWindow):
                 self._update_ifc_load_progress(path.name)
             self._finish_ifc_batch_if_ready()
 
-    @Slot(object, object, str)
-    def _ifc_worker_finished(self, path_obj, incoming, source_name: str):
+    @Slot(object, object, str, object)
+    def _ifc_worker_finished(self, path_obj, incoming, source_name: str, origin_info=None):
 
         # Defensive IFC chunk-state guard
         if not hasattr(self, "_ifc_chunk_remaining") or not isinstance(self._ifc_chunk_remaining, dict):
@@ -2856,6 +4219,8 @@ class MainWindow(QMainWindow):
         if not self._mark_ifc_load_done(path):
             return
         CombinedIFCModel.merge(self.floors, incoming, source_name)
+        if isinstance(origin_info, dict):
+            self.ifc_origin_info[self._ifc_path_key(path)] = origin_info
         self._apply_frequency_settings_to_model(replace_existing=False)
         self.loaded_ifc_paths.append(path)
         total_loaded = len(self.loaded_ifc_paths)
@@ -2900,6 +4265,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Some IFC files failed", "\n".join(self._load_errors))
             msg += f". {len(self._load_errors)} file(s) failed."
         self.statusBar().showMessage(msg)
+        if self._pending_plan_data is not None:
+            pending = self._pending_plan_data
+            self._pending_plan_data = None
+            self._apply_rf_plan_data(pending)
 
     def _ensure_ifc_loader_state(self):
         """Ensure multiprocessing IFC state exists before any callback uses it."""
@@ -2941,9 +4310,18 @@ class MainWindow(QMainWindow):
         self.export_action.setEnabled(not loading)
         self.clear_ap_action.setEnabled(not loading)
         self.load_pattern_action.setEnabled(not loading)
+        for action_name in (
+            "planner_settings_action", "predict_aps_action", "draw_wall_action", "ifc_origin_action",
+            "rotate_left_action", "rotate_right_action", "reset_rotation_action", "save_plan_action", "load_plan_action",
+        ):
+            action = getattr(self, action_name, None)
+            if action is not None:
+                action.setEnabled(not loading)
         self.floor_combo.setEnabled(not loading)
 
     def select_floor(self, name: str):
+        if getattr(self, "wall_draw_mode", False) or getattr(self, "_wall_draw_start", None) is not None:
+            self.cancel_user_wall_drawing()
         # Avoid calling ``self.floors.get(...)`` directly. A previous settings/UI
         # change could accidentally shadow a ``get`` attribute with a numeric
         # value, which causes: TypeError: 'float' object is not callable.
@@ -2984,6 +4362,11 @@ class MainWindow(QMainWindow):
                 tx_power_dbm=float(get_value(radio_def, "tx_power_dbm", self.tx_power.value())),
                 antenna_pattern=pattern,
                 enabled=bool(get_value(radio_def, "enabled", True)),
+                cutoff_radius_m=float(get_value(radio_def, "cutoff_radius_m", 0.0)),
+                antenna_gain_dbi=float(get_value(radio_def, "antenna_gain_dbi", 0.0)),
+                channel=str(get_value(radio_def, "channel", "")),
+                channel_width_mhz=float(get_value(radio_def, "channel_width_mhz", 20.0)),
+                spectrum_occupancy_percent=float(get_value(radio_def, "spectrum_occupancy_percent", 0.0)),
             ))
         if not default_radios:
             default_radios = [APRadio(
@@ -2995,7 +4378,7 @@ class MainWindow(QMainWindow):
             )]
         first_radio = default_radios[0]
         ap = AccessPoint(
-            name=f"AP-{len(self.aps)+1}",
+            name=self._next_ap_name(),
             x=x,
             y=y,
             floor=self.floor.name,
@@ -3008,6 +4391,8 @@ class MainWindow(QMainWindow):
             mount_height_m=float(self.mount_height.value()),
             rx_height_m=float(self.rx_height.value()),
             radios=default_radios,
+            max_clients=int(self.auto_planner_settings.clients_per_ap),
+            planned=False,
         )
         self.aps.append(ap)
         self.draw_floor()
@@ -3022,6 +4407,7 @@ class MainWindow(QMainWindow):
         scene = self.view.scene()
         scene.clear()
         self._ifc_snap_marker_items = []
+        self._wall_preview_items = []
         if not self.floor:
             return
         # Draw heatmap first so the building geometry remains visible above it.
@@ -3054,14 +4440,14 @@ class MainWindow(QMainWindow):
         for wall in self.floor.walls:
             coords = list(wall.polygon.exterior.coords)
             poly = QPolygonF([QPointF(x, y) for x, y in coords])
-            item = QGraphicsPolygonItem(poly)
-            wall_pen = QPen(colours["wall_pen"], self.heatmap_settings.wall_line_width)
+            wall_pen_colour = QColor("#FF7800") if wall.is_user_created else colours["wall_pen"]
+            wall_pen = QPen(wall_pen_colour, self.heatmap_settings.wall_line_width)
             wall_pen.setCosmetic(True)
-            item.setPen(wall_pen)
             fill_key = "wall_alt_fill" if getattr(wall, "projected_to_floor", False) else "wall_fill"
-            item.setBrush(QBrush(colours[fill_key]))
-            item.setZValue(Z_IFC_WALL)
-            item.setFlag(QGraphicsItem.ItemIsSelectable, True)
+            fill_colour = QColor("#FFB45A") if wall.is_user_created else QColor(colours[fill_key])
+            if wall.is_user_created:
+                fill_colour.setAlpha(150)
+            item = WallGraphicsItem(self, wall, poly, wall_pen, QBrush(fill_colour))
             scene.addItem(item)
         visible_aps = [a for a in self.aps if a.floor == self.floor.name or self.include_inter_floor.isChecked()]
         for ap in visible_aps:
@@ -3373,6 +4759,7 @@ class MainWindow(QMainWindow):
             return
         try:
             self.heatmap_settings = HeatmapSettings.from_json_file(Path(path))
+            self.auto_planner_settings = AutoPlannerSettings.from_dict(self.heatmap_settings.auto_planner_settings)
             self.heatmap_settings_path = Path(path)
             self.min_client_rssi.blockSignals(True)
             self.min_client_rssi.setValue(self.heatmap_settings.minimum_client_rssi_dbm)
@@ -3396,7 +4783,12 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Heatmap settings failed", str(exc))
 
     def _frequency_bands(self) -> List[float]:
-        return sorted({float(v) for v in self.heatmap_settings.common_frequencies_mhz})
+        values = {float(v) for v in self.heatmap_settings.common_frequencies_mhz}
+        planner = getattr(self, "auto_planner_settings", None)
+        if planner is not None:
+            values.update(float(r.frequency_mhz) for r in planner.radio_requirements)
+        values.update(float(r.frequency_mhz) for ap in getattr(self, "aps", []) for r in ap.active_radios())
+        return sorted(values)
 
     def _frequency_label(self, mhz: float) -> str:
         mhz = float(mhz)
@@ -3411,7 +4803,10 @@ class MainWindow(QMainWindow):
         self.wall_table.setHorizontalHeaderLabels(headers)
 
     def _profile_for_wall_from_settings(self, wall: Wall2D) -> Dict[float, float]:
-        text = f"{wall.material} {wall.type_name} {wall.name}".lower()
+        # Prefer the user-selected RF type when a wall has been overridden so
+        # newly added planning frequencies inherit the intended RF material.
+        override = wall.rf_type_override if wall.rf_customised else ""
+        text = f"{override} {wall.material} {wall.type_name} {wall.name}".lower()
         profiles = self.heatmap_settings.default_wall_attenuation_by_material_db
         for key, profile in profiles.items():
             if key != "default" and key.lower() in text:
@@ -3463,7 +4858,12 @@ class MainWindow(QMainWindow):
                     f"{ap.azimuth_deg:.1f}",
                     f"{ap.downtilt_deg:.1f}",
                     f"{radio.tx_power_dbm:.1f}",
+                    f"{radio.antenna_gain_dbi:.1f}",
                     f"{radio.frequency_mhz:.0f}",
+                    str(radio.channel),
+                    f"{radio.channel_width_mhz:g}",
+                    f"{radio.spectrum_occupancy_percent:g}",
+                    str(ap.max_clients),
                 ]
                 for col, value in enumerate(values):
                     item = QTableWidgetItem(value)
@@ -3506,7 +4906,18 @@ class MainWindow(QMainWindow):
             elif item.column() == 9:
                 radio.tx_power_dbm = float(item.text())
             elif item.column() == 10:
+                radio.antenna_gain_dbi = float(item.text())
+            elif item.column() == 11:
                 radio.frequency_mhz = float(item.text())
+                self._refresh_rssi_frequency_dropdown()
+            elif item.column() == 12:
+                radio.channel = item.text().strip()
+            elif item.column() == 13:
+                radio.channel_width_mhz = max(1.0, float(item.text()))
+            elif item.column() == 14:
+                radio.spectrum_occupancy_percent = max(0.0, min(100.0, float(item.text())))
+            elif item.column() == 15:
+                ap.max_clients = max(1, int(float(item.text())))
             # Keep legacy AP fields in sync with the first radio for older code/export.
             if ap.radios:
                 ap.tx_power_dbm = float(ap.radios[0].tx_power_dbm)
@@ -3529,7 +4940,10 @@ class MainWindow(QMainWindow):
         for wall in self.floor.walls:
             row = self.wall_table.rowCount()
             self.wall_table.insertRow(row)
-            self.wall_table.setItem(row, 0, QTableWidgetItem(wall.label))
+            label_item = QTableWidgetItem(("[User] " if wall.is_user_created else "") + wall.label)
+            label_item.setData(Qt.UserRole, wall.guid)
+            label_item.setData(Qt.UserRole + 2, wall.source_file)
+            self.wall_table.setItem(row, 0, label_item)
             for idx, band in enumerate(bands, start=1):
                 att = QTableWidgetItem(str(round(float(wall.attenuation_by_band_db.get(band, wall.attenuation_db_for_frequency(band))), 3)))
                 att.setData(Qt.UserRole, wall.guid)
@@ -3550,10 +4964,13 @@ class MainWindow(QMainWindow):
             val = float(item.text())
         except ValueError:
             return
-        for wall in self.floor.walls:
-            if wall.guid == guid:
-                wall.attenuation_by_band_db[float(band)] = val
-                break
+        wall = next((candidate for candidate in self.floor.walls if candidate.guid == guid), None)
+        if wall is None:
+            return
+        for instance in self._wall_instances(wall):
+            instance.attenuation_by_band_db[float(band)] = val
+            instance.rf_customised = True
+        self.last_result = None
 
     def _sync_slab_attenuation_from_ui(self):
         if not self.floor:

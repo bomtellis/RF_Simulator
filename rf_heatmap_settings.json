@@ -214,7 +214,11 @@
       "tx_power_dbm": 10,
       "antenna_pattern": "Omni ceiling AP",
       "enabled": false,
-      "cutoff_radius_m": 120
+      "cutoff_radius_m": 120,
+      "antenna_gain_dbi": 0,
+      "channel": "",
+      "channel_width_mhz": 20,
+      "spectrum_occupancy_percent": 10
     },
     {
       "name": "868 MHz",
@@ -222,7 +226,11 @@
       "tx_power_dbm": 14,
       "antenna_pattern": "Omni ceiling AP",
       "enabled": false,
-      "cutoff_radius_m": 90
+      "cutoff_radius_m": 90,
+      "antenna_gain_dbi": 0,
+      "channel": "",
+      "channel_width_mhz": 20,
+      "spectrum_occupancy_percent": 10
     },
     {
       "name": "2.4 GHz",
@@ -230,7 +238,11 @@
       "tx_power_dbm": 20,
       "antenna_pattern": "Omni ceiling AP",
       "enabled": true,
-      "cutoff_radius_m": 45
+      "cutoff_radius_m": 45,
+      "antenna_gain_dbi": 0,
+      "channel": "1",
+      "channel_width_mhz": 20,
+      "spectrum_occupancy_percent": 35
     },
     {
       "name": "5 GHz",
@@ -238,7 +250,11 @@
       "tx_power_dbm": 20,
       "antenna_pattern": "Omni ceiling AP",
       "enabled": true,
-      "cutoff_radius_m": 35
+      "cutoff_radius_m": 35,
+      "antenna_gain_dbi": 0,
+      "channel": "36",
+      "channel_width_mhz": 40,
+      "spectrum_occupancy_percent": 20
     },
     {
       "name": "6 GHz",
@@ -246,7 +262,11 @@
       "tx_power_dbm": 20,
       "antenna_pattern": "Omni ceiling AP",
       "enabled": false,
-      "cutoff_radius_m": 30
+      "cutoff_radius_m": 30,
+      "antenna_gain_dbi": 0,
+      "channel": "5",
+      "channel_width_mhz": 80,
+      "spectrum_occupancy_percent": 10
     }
   ],
   "max_ifc_loader_threads": 0,
@@ -296,5 +316,80 @@
   "huge_ifc_single_process_threshold_mb": 512.0,
   "max_parallel_huge_ifc_processes": 1,
   "allow_blocking_ifc_fallback": false,
-  "large_ifc_notes": "IFCs over huge_ifc_single_process_threshold_mb are parsed in one isolated child process. Do not chunk 800MB IFCs across multiple workers because each worker reopens the full model and can crash ifcopenshell/OCC from memory pressure."
+  "large_ifc_notes": "IFCs over huge_ifc_single_process_threshold_mb are parsed in one isolated child process. Do not chunk 800MB IFCs across multiple workers because each worker reopens the full model and can crash ifcopenshell/OCC from memory pressure.",
+  "auto_planner_settings": {
+    "target_coverage_percent": 95,
+    "coverage_mode": "all",
+    "sample_spacing_m": 3,
+    "candidate_spacing_m": 6,
+    "minimum_ap_spacing_m": 8,
+    "maximum_aps": 64,
+    "expected_clients": 250,
+    "clients_per_ap": 50,
+    "keep_existing_aps": true,
+    "remove_previous_planned_aps": true,
+    "radio_requirements": [
+      {
+        "name": "2.4 GHz",
+        "enabled": true,
+        "frequency_mhz": 2400,
+        "tx_power_dbm": 18,
+        "antenna_pattern": "Omni ceiling AP",
+        "antenna_gain_dbi": 0,
+        "channel_width_mhz": 20,
+        "channels": [
+          "1",
+          "6",
+          "11"
+        ],
+        "spectrum_occupancy_percent": 35,
+        "minimum_rssi_dbm": -67,
+        "cutoff_radius_m": 45
+      },
+      {
+        "name": "5 GHz",
+        "enabled": true,
+        "frequency_mhz": 5000,
+        "tx_power_dbm": 20,
+        "antenna_pattern": "Omni ceiling AP",
+        "antenna_gain_dbi": 0,
+        "channel_width_mhz": 40,
+        "channels": [
+          "36",
+          "44",
+          "52",
+          "60",
+          "100",
+          "108",
+          "116",
+          "124"
+        ],
+        "spectrum_occupancy_percent": 20,
+        "minimum_rssi_dbm": -67,
+        "cutoff_radius_m": 35
+      },
+      {
+        "name": "6 GHz",
+        "enabled": false,
+        "frequency_mhz": 6000,
+        "tx_power_dbm": 20,
+        "antenna_pattern": "Omni ceiling AP",
+        "antenna_gain_dbi": 0,
+        "channel_width_mhz": 80,
+        "channels": [
+          "5",
+          "21",
+          "37",
+          "53",
+          "69",
+          "85"
+        ],
+        "spectrum_occupancy_percent": 10,
+        "minimum_rssi_dbm": -67,
+        "cutoff_radius_m": 30
+      }
+    ]
+  },
+  "user_wall_default_type": "partition",
+  "user_wall_default_thickness_m": 0.15
 }
