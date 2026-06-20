@@ -15,6 +15,7 @@ import multiprocessing
 import os
 import uuid
 from rf_dxf_prealign import DxfPreAlignDialog, SimilarityTransform2D, two_point_transform
+from rf_boundary_tools import estimate_outer_wall_gap_tolerance, suggest_external_boundary_polygons
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -2158,7 +2159,7 @@ class AutoPlannerSettingsDialog(QDialog):
         form.addRow(self.remove_planned)
         layout.addLayout(form)
 
-        note = QLabel("AP positions are selected from simulated RSSI values: the planner prioritises the samples with the largest dB shortfall instead of relying only on geometric spacing. When handover is enabled, a sample contributes to the handover target only when a second distinct AP reaches the configured secondary threshold. The second AP may use a different channel; channel allocation prefers non-overlapping channels in shared coverage areas. Spectrum occupancy reduces effective client capacity. Shared rectangular and polygon planner boundaries apply to every IFC floor and remain a hard placement limit.")
+        note = QLabel("AP positions are selected from simulated RSSI values: the planner prioritises the samples with the largest dB shortfall instead of relying only on geometric spacing. When handover is enabled, a sample contributes to the handover target only when a second distinct AP reaches the configured secondary threshold. The second AP may use a different channel; channel allocation prefers non-overlapping channels in shared coverage areas. Spectrum occupancy reduces effective client capacity. Shared rectangular and polygon planner boundaries apply to every IFC floor and remain a hard placement limit. The outer-boundary suggestion tool can trace and preview the outermost IFC wall chain before it is accepted.")
         note.setWordWrap(True)
         layout.addWidget(note)
 
@@ -2603,6 +2604,7 @@ class MainWindow(QMainWindow):
         self._boundary_draw_start: Optional[QPointF] = None
         self._boundary_polygon_points: List[QPointF] = []
         self._boundary_preview_items: List[QGraphicsItem] = []
+        self._suggested_boundary_preview_items: List[QGraphicsItem] = []
         self._pending_plan_data: Optional[Dict[str, object]] = None
         self.dxf_overlay: Optional[DxfOverlay] = None
         self.ifc_alignment = AlignmentTransform()
@@ -2825,6 +2827,8 @@ class MainWindow(QMainWindow):
         self.draw_polygon_boundary_action.toggled.connect(
             lambda enabled: self.toggle_planner_boundary_draw_mode(enabled, "polygon")
         )
+        self.suggest_external_boundary_action = QAction("Suggest external boundary", self)
+        self.suggest_external_boundary_action.triggered.connect(self.suggest_external_planner_boundary)
         self.clear_boundaries_action = QAction("Clear planner boundaries", self)
         self.clear_boundaries_action.triggered.connect(self.clear_planner_boundaries)
         self.ifc_origin_action = QAction("IFC origin / orientation", self)
@@ -2927,6 +2931,10 @@ class MainWindow(QMainWindow):
             "draw_polygon_boundary_action": (
                 "Polygon boundary", "Draw a polygon hard boundary shared by all IFC floors; right-click to finish.",
                 "SP_DriveNetIcon", ""
+            ),
+            "suggest_external_boundary_action": (
+                "Suggest outer boundary", "Trace the outermost IFC wall chain, preview it on the plan and accept it as a shared planner boundary.",
+                "SP_FileDialogListView", ""
             ),
             "clear_boundaries_action": (
                 "Clear boundaries", "Remove every rectangular and polygon planner boundary.",
@@ -3047,7 +3055,7 @@ class MainWindow(QMainWindow):
         ]), "Model and view")
         ribbon.addTab(self._make_ribbon_page([
             ("RF obstructions", ["draw_wall_action"]),
-            ("Permitted planning area", ["draw_boundary_action", "draw_polygon_boundary_action", "clear_boundaries_action"]),
+            ("Permitted planning area", ["draw_boundary_action", "draw_polygon_boundary_action", "suggest_external_boundary_action", "clear_boundaries_action"]),
         ]), "Walls and boundaries")
         ribbon.addTab(self._make_ribbon_page([
             ("Antenna data", ["load_pattern_action"]),
@@ -3352,6 +3360,268 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Created {boundary.name} with {len(coordinates)} vertices; it constrains AP planning on all IFC floors. "
             "Left-click to start another polygon or toggle the tool off."
+        )
+
+    def _clear_suggested_boundary_preview(self):
+        scene = self.view.scene()
+        for item in list(getattr(self, "_suggested_boundary_preview_items", [])):
+            try:
+                if scene is not None and item.scene() is scene:
+                    scene.removeItem(item)
+            except RuntimeError:
+                pass
+        self._suggested_boundary_preview_items = []
+
+    def _show_suggested_boundary_preview(self, polygons: List[Polygon]):
+        """Overlay the proposed outer-wall chain without committing it."""
+        self._clear_suggested_boundary_preview()
+        scene = self.view.scene()
+        if scene is None:
+            return
+
+        items: List[QGraphicsItem] = []
+        outline_colour = QColor("#D000FF")
+        fill_colour = QColor("#D000FF")
+        fill_colour.setAlpha(35)
+        pen = QPen(outline_colour, 2.2)
+        pen.setCosmetic(True)
+        pen.setStyle(Qt.DashDotLine)
+        marker_pen = QPen(outline_colour, 1.2)
+        marker_pen.setCosmetic(True)
+        marker_brush = QBrush(QColor("#FFFFFF"))
+
+        for index, polygon in enumerate(polygons, start=1):
+            coords = list(polygon.exterior.coords)
+            qpolygon = QPolygonF([QPointF(float(x), float(y)) for x, y in coords])
+            preview = QGraphicsPolygonItem(qpolygon)
+            preview.setPen(pen)
+            preview.setBrush(QBrush(fill_colour))
+            preview.setAcceptedMouseButtons(Qt.NoButton)
+            preview.setZValue(Z_AP_LABEL + 40)
+            scene.addItem(preview)
+            items.append(preview)
+
+            # Show the chained vertices so the user can inspect where wall
+            # segments have been bridged before accepting the suggestion.
+            vertices = coords[:-1]
+            step = max(1, int(math.ceil(len(vertices) / 250.0)))
+            for x, y in vertices[::step]:
+                marker = scene.addEllipse(
+                    float(x) - 0.08,
+                    float(y) - 0.08,
+                    0.16,
+                    0.16,
+                    marker_pen,
+                    marker_brush,
+                )
+                marker.setAcceptedMouseButtons(Qt.NoButton)
+                marker.setZValue(Z_AP_LABEL + 41)
+                items.append(marker)
+
+            representative = polygon.representative_point()
+            label = self._add_upright_text(
+                scene,
+                f"Suggested outer-wall chain {index}",
+                float(representative.x),
+                float(representative.y),
+                outline_colour,
+                max(3, int(self.heatmap_settings.space_label_font_size)),
+                Z_AP_LABEL + 42,
+                bold=True,
+            )
+            items.append(label)
+
+        self._suggested_boundary_preview_items = items
+
+    @staticmethod
+    def _bounds_area(polygons: List[Polygon]) -> float:
+        if not polygons:
+            return 0.0
+        minx = min(float(polygon.bounds[0]) for polygon in polygons)
+        miny = min(float(polygon.bounds[1]) for polygon in polygons)
+        maxx = max(float(polygon.bounds[2]) for polygon in polygons)
+        maxy = max(float(polygon.bounds[3]) for polygon in polygons)
+        return max(0.0, maxx - minx) * max(0.0, maxy - miny)
+
+    def _wall_polygons_for_boundary_suggestion(self) -> Tuple[List[Polygon], str, int]:
+        """Return unique wall polygons for tracing the outermost chain.
+
+        All IFC walls are used rather than trusting an ``IsExternal`` flag,
+        because many authoring exports omit or only partially populate that
+        property. Internal walls remain inside the union and therefore do not
+        alter the extracted outer ring.
+        """
+        if not self.floor:
+            return [], "", 0
+
+        unique = set()
+        ifc_walls: List[Wall2D] = []
+        fallback_walls: List[Wall2D] = []
+        for wall in self.floor.walls:
+            polygon = getattr(wall, "polygon", None)
+            if polygon is None or polygon.is_empty or float(polygon.area) <= 1e-6:
+                continue
+            key = (str(wall.source_file), str(wall.guid), bytes(polygon.wkb))
+            if key in unique:
+                continue
+            unique.add(key)
+            fallback_walls.append(wall)
+            if not wall.is_user_created:
+                ifc_walls.append(wall)
+
+        selected = ifc_walls or fallback_walls
+        selected_label = "IFC walls" if ifc_walls else "available IFC/RF walls"
+        return [wall.polygon for wall in selected], selected_label, len(selected)
+
+    def suggest_external_planner_boundary(self):
+        """Preview and optionally accept an outer-wall-derived shared boundary."""
+        if not self.floor:
+            QMessageBox.information(
+                self,
+                "No floor selected",
+                "Load an IFC model and select a floor before suggesting an external boundary.",
+            )
+            return
+
+        if getattr(self, "wall_draw_mode", False):
+            self.cancel_user_wall_drawing()
+        if getattr(self, "boundary_draw_mode", False):
+            self.cancel_planner_boundary_drawing(show_status=False)
+
+        wall_polygons, source_label, source_count = self._wall_polygons_for_boundary_suggestion()
+        if not wall_polygons:
+            QMessageBox.information(
+                self,
+                "No wall geometry",
+                "The selected floor has no usable IFC wall geometry from which to form an external chain.",
+            )
+            return
+
+        default_gap = estimate_outer_wall_gap_tolerance(wall_polygons)
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Suggested external planner boundary")
+        dialog.setModal(True)
+        dialog.resize(590, 300)
+        layout = QVBoxLayout(dialog)
+
+        explanation = QLabel(
+            f"The magenta chain is derived from {source_count} {source_label} on "
+            f"'{self.floor.name}'. If accepted, the resulting polygon boundary is shared by all IFC floors. "
+            "Increase the bridge distance where doors or missing wall segments leave the chain open."
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+
+        form_widget = QWidget(dialog)
+        form = QFormLayout(form_widget)
+        form.setContentsMargins(0, 4, 0, 4)
+        gap_spin = QDoubleSpinBox(form_widget)
+        gap_spin.setRange(0.05, 10.0)
+        gap_spin.setDecimals(2)
+        gap_spin.setSingleStep(0.10)
+        gap_spin.setValue(float(default_gap))
+        gap_spin.setSuffix(" m")
+        gap_spin.setToolTip(
+            "Maximum opening bridged while joining wall segments. Increase for large doors or incomplete IFC wall chains; "
+            "reduce it to avoid joining detached buildings."
+        )
+        form.addRow("Maximum wall-gap bridge", gap_spin)
+        layout.addWidget(form_widget)
+
+        summary = QLabel()
+        summary.setWordWrap(True)
+        summary.setFrameShape(QFrame.StyledPanel)
+        summary.setMinimumHeight(72)
+        layout.addWidget(summary)
+
+        replace_existing = QCheckBox("Replace existing planner boundaries when accepted")
+        replace_existing.setChecked(False)
+        layout.addWidget(replace_existing)
+
+        controls = QHBoxLayout()
+        update_button = QPushButton("Update preview")
+        update_button.setIcon(self._standard_icon("SP_BrowserReload"))
+        controls.addWidget(update_button)
+        controls.addStretch(1)
+        accept_button = QPushButton("Accept suggestion")
+        accept_button.setIcon(self._standard_icon("SP_DialogApplyButton"))
+        cancel_button = QPushButton("Cancel")
+        cancel_button.setIcon(self._standard_icon("SP_DialogCancelButton"))
+        controls.addWidget(accept_button)
+        controls.addWidget(cancel_button)
+        layout.addLayout(controls)
+
+        current_polygons: List[Polygon] = []
+        current_metadata: Dict[str, object] = {}
+
+        def update_preview():
+            nonlocal current_polygons, current_metadata
+            self.statusBar().showMessage("Tracing the outermost IFC wall chain...")
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                current_polygons, current_metadata = suggest_external_boundary_polygons(
+                    wall_polygons,
+                    gap_tolerance_m=float(gap_spin.value()),
+                )
+            finally:
+                QApplication.restoreOverrideCursor()
+
+            self._show_suggested_boundary_preview(current_polygons)
+            warnings = list(current_metadata.get("warnings", []) or [])
+            if current_polygons:
+                area = float(current_metadata.get("total_area_m2", 0.0) or 0.0)
+                vertices = int(current_metadata.get("vertex_count", 0) or 0)
+                chain_count = len(current_polygons)
+                message = (
+                    f"Preview: {chain_count} outer chain{'s' if chain_count != 1 else ''}, "
+                    f"{vertices} vertices and {area:,.1f} m² total permitted area."
+                )
+                if warnings:
+                    message += "\n\nReview: " + " ".join(str(value) for value in warnings)
+                summary.setText(message)
+                accept_button.setEnabled(True)
+                self.statusBar().showMessage(
+                    "External boundary suggestion previewed in magenta. Accept it or adjust the wall-gap bridge."
+                )
+            else:
+                message = "No closed external chain was formed at this bridge distance."
+                if warnings:
+                    message += "\n\n" + " ".join(str(value) for value in warnings)
+                summary.setText(message)
+                accept_button.setEnabled(False)
+                self.statusBar().showMessage(
+                    "No closed outer-wall chain was found; increase the wall-gap bridge and update the preview."
+                )
+
+        update_button.clicked.connect(update_preview)
+        accept_button.clicked.connect(dialog.accept)
+        cancel_button.clicked.connect(dialog.reject)
+        update_preview()
+        result = dialog.exec()
+        self._clear_suggested_boundary_preview()
+
+        if result != QDialog.Accepted or not current_polygons:
+            self.statusBar().showMessage("External boundary suggestion cancelled")
+            return
+
+        if replace_existing.isChecked():
+            self.planner_boundaries.clear()
+
+        for offset, polygon in enumerate(current_polygons):
+            chain_suffix = f" {offset + 1}" if len(current_polygons) > 1 else ""
+            self.planner_boundaries.append(PlannerBoundary2D(
+                guid=f"planner-boundary-{uuid.uuid4().hex}",
+                name=f"Suggested external boundary{chain_suffix}",
+                polygon=polygon,
+                shape_type="polygon",
+            ))
+
+        self.last_result = None
+        self.draw_floor()
+        created = len(current_polygons)
+        self.statusBar().showMessage(
+            f"Accepted {created} suggested external planner boundar{'y' if created == 1 else 'ies'}; "
+            "the permitted area now applies to all IFC floors."
         )
 
     def delete_planner_boundary(self, boundary: PlannerBoundary2D):
@@ -5743,6 +6013,7 @@ class MainWindow(QMainWindow):
         self._ifc_snap_marker_items = []
         self._wall_preview_items = []
         self._boundary_preview_items = []
+        self._suggested_boundary_preview_items = []
         if not self.floor:
             return
         # Draw heatmap first so the building geometry remains visible above it.
