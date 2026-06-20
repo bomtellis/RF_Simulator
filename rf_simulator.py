@@ -335,9 +335,11 @@ class AutoPlannerSettings:
     candidate_spacing_m: float = 6.0
     minimum_ap_spacing_m: float = 8.0
     maximum_aps: int = 64
-    # ``auto`` uses IfcSpace footprints when present and infers a planning
-    # footprint from walls when spaces have not been modelled. ``spaces``
-    # requires IfcSpace geometry; ``walls`` always uses the inferred footprint.
+    # ``auto`` uses IfcSpace footprints when present, otherwise shared user
+    # boundary boxes, and finally an inferred wall footprint. ``spaces``
+    # requires IfcSpace geometry; ``boundaries`` uses only the shared planner
+    # boxes; ``walls`` always uses the inferred footprint. Boundary boxes are
+    # a hard clipping limit in every mode whenever at least one exists.
     planning_area_mode: str = "auto"
     wall_footprint_margin_m: float = 0.0
     expected_clients: int = 250
@@ -398,6 +400,8 @@ class AutoPlannerSettings:
         raw_area_mode = str(data.get("planning_area_mode", data.get("planner_area_mode", base.planning_area_mode))).strip().lower()
         if raw_area_mode.startswith("space"):
             base.planning_area_mode = "spaces"
+        elif raw_area_mode.startswith("bound") or raw_area_mode.startswith("box"):
+            base.planning_area_mode = "boundaries"
         elif raw_area_mode.startswith("wall") or raw_area_mode.startswith("floor"):
             base.planning_area_mode = "walls"
         else:
@@ -446,6 +450,15 @@ class FloorModel:
                 t = (frequency_mhz - lo) / (hi - lo)
                 return lo_v + (hi_v - lo_v) * t
         return float(self.slab_attenuation_by_band_db[bands[-1]])
+
+
+@dataclass
+class PlannerBoundary2D:
+    """User-defined AP planning extent shared by every imported IFC floor."""
+
+    guid: str
+    name: str
+    polygon: Polygon
 
 
 @dataclass
@@ -2082,8 +2095,9 @@ class AutoPlannerSettingsDialog(QDialog):
         self.minimum_spacing = QDoubleSpinBox(); self.minimum_spacing.setRange(0.0, 100.0); self.minimum_spacing.setSuffix(" m"); self.minimum_spacing.setValue(settings.minimum_ap_spacing_m)
         self.maximum_aps = QSpinBox(); self.maximum_aps.setRange(1, 10_000); self.maximum_aps.setValue(settings.maximum_aps)
         self.area_mode = QComboBox()
-        self.area_mode.addItem("Automatic — use IFC spaces, otherwise infer from walls", "auto")
+        self.area_mode.addItem("Automatic — spaces, then shared boundary boxes, then walls", "auto")
         self.area_mode.addItem("IFC spaces only", "spaces")
+        self.area_mode.addItem("Shared planner boundary boxes only", "boundaries")
         self.area_mode.addItem("Infer floor footprint from IFC walls", "walls")
         area_index = self.area_mode.findData(settings.planning_area_mode)
         self.area_mode.setCurrentIndex(max(0, area_index))
@@ -2106,7 +2120,7 @@ class AutoPlannerSettingsDialog(QDialog):
         form.addRow(self.remove_planned)
         layout.addLayout(form)
 
-        note = QLabel("Spectrum occupancy reduces effective client capacity. Channels are allocated to minimise nearby co-channel reuse. Additional antenna gain is added to the selected pattern data. When an IFC contains no IfcSpace objects, Automatic mode derives a floor footprint from imported wall geometry so APs can still be positioned.")
+        note = QLabel("Spectrum occupancy reduces effective client capacity. Channels are allocated to minimise nearby co-channel reuse. Additional antenna gain is added to the selected pattern data. Shared planner boundary boxes apply to every IFC floor and are always a hard placement limit. When an IFC contains no IfcSpace objects, Automatic mode uses those boxes first and falls back to an inferred wall footprint only when no boxes have been drawn.")
         note.setWordWrap(True)
         layout.addWidget(note)
 
@@ -2302,6 +2316,38 @@ class WallGraphicsItem(QGraphicsPolygonItem):
         event.accept()
 
 
+class PlannerBoundaryGraphicsItem(QGraphicsRectItem):
+    """Selectable outline for a planner boundary shared across all floors."""
+
+    def __init__(self, main, boundary: PlannerBoundary2D):
+        minx, miny, maxx, maxy = boundary.polygon.bounds
+        super().__init__(float(minx), float(miny), float(maxx - minx), float(maxy - miny))
+        self.main = main
+        self.boundary = boundary
+        pen = QPen(QColor("#00A6D6"), 1.5)
+        pen.setCosmetic(True)
+        pen.setStyle(Qt.DashLine)
+        self.setPen(pen)
+        self.setBrush(QBrush(Qt.NoBrush))
+        self.setZValue(Z_TEXT + 2)
+        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
+        self.setAcceptedMouseButtons(Qt.LeftButton | Qt.RightButton)
+        self.setToolTip(
+            f"{boundary.name}\nShared by all IFC floors\n"
+            "Predictive AP candidates cannot be placed outside the combined boundary boxes.\n"
+            "Right-click to delete."
+        )
+
+    def contextMenuEvent(self, event):
+        menu = QMenu()
+        self.setSelected(True)
+        delete_action = menu.addAction("Delete planner boundary")
+        chosen = menu.exec(event.screenPos())
+        if chosen == delete_action:
+            self.main.delete_planner_boundary(self.boundary)
+        event.accept()
+
+
 class AccessPointGraphicsItem(QGraphicsEllipseItem):
     def __init__(self, main, ap: AccessPoint, radius: float, colour: QColor):
         super().__init__(ap.x - radius, ap.y - radius, radius * 2.0, radius * 2.0)
@@ -2366,6 +2412,10 @@ class PlanView(QGraphicsView):
         self.scale(factor, factor)
 
     def mouseMoveEvent(self, event):
+        if getattr(self.main, "boundary_draw_mode", False) and getattr(self.main, "_boundary_draw_start", None) is not None:
+            pos = self.mapToScene(event.position().toPoint())
+            self.main.show_planner_boundary_preview(pos)
+
         if getattr(self.main, "wall_draw_mode", False) and getattr(self.main, "_wall_draw_start", None) is not None:
             pos = self.mapToScene(event.position().toPoint())
             snap, _ = self.main.nearest_ifc_connection_point(pos)
@@ -2387,6 +2437,17 @@ class PlanView(QGraphicsView):
         super().mouseMoveEvent(event)
 
     def mousePressEvent(self, event):
+        if getattr(self.main, "boundary_draw_mode", False):
+            if event.button() == Qt.RightButton:
+                self.main.cancel_planner_boundary_drawing()
+                event.accept()
+                return
+            if event.button() == Qt.LeftButton:
+                pos = self.mapToScene(event.position().toPoint())
+                self.main.capture_planner_boundary_point(pos)
+                event.accept()
+                return
+
         if getattr(self.main, "wall_draw_mode", False):
             if event.button() == Qt.RightButton:
                 self.main.cancel_user_wall_drawing()
@@ -2428,7 +2489,11 @@ class PlanView(QGraphicsView):
     def mouseDoubleClickEvent(self, event):
         if self.main.floor is None:
             return
-        if getattr(self.main, "alignment_pick_mode", None) or getattr(self.main, "wall_draw_mode", False):
+        if (
+            getattr(self.main, "alignment_pick_mode", None)
+            or getattr(self.main, "wall_draw_mode", False)
+            or getattr(self.main, "boundary_draw_mode", False)
+        ):
             return
         pos = self.mapToScene(event.position().toPoint())
         self.main.add_ap(pos.x(), pos.y())
@@ -2479,6 +2544,10 @@ class MainWindow(QMainWindow):
         self.wall_draw_mode: bool = False
         self._wall_draw_start: Optional[QPointF] = None
         self._wall_preview_items: List[QGraphicsItem] = []
+        self.planner_boundaries: List[PlannerBoundary2D] = []
+        self.boundary_draw_mode: bool = False
+        self._boundary_draw_start: Optional[QPointF] = None
+        self._boundary_preview_items: List[QGraphicsItem] = []
         self._pending_plan_data: Optional[Dict[str, object]] = None
         self.dxf_overlay: Optional[DxfOverlay] = None
         self.ifc_alignment = AlignmentTransform()
@@ -2645,6 +2714,11 @@ class MainWindow(QMainWindow):
         self.draw_wall_action = QAction("Draw RF wall", self)
         self.draw_wall_action.setCheckable(True)
         self.draw_wall_action.toggled.connect(self.toggle_wall_draw_mode)
+        self.draw_boundary_action = QAction("Draw planner boundary", self)
+        self.draw_boundary_action.setCheckable(True)
+        self.draw_boundary_action.toggled.connect(self.toggle_planner_boundary_draw_mode)
+        self.clear_boundaries_action = QAction("Clear planner boundaries", self)
+        self.clear_boundaries_action.triggered.connect(self.clear_planner_boundaries)
         self.ifc_origin_action = QAction("IFC origin / orientation", self)
         self.ifc_origin_action.triggered.connect(self.show_ifc_origin_dialog)
         self.rotate_left_action = QAction("Rotate view left", self)
@@ -2660,7 +2734,8 @@ class MainWindow(QMainWindow):
         tb.addActions([
             self.open_action, self.add_action, self.open_dxf_action, self.align_ifc_action, self.two_point_align_action,
             self.clear_dxf_action, self.ifc_origin_action, self.rotate_left_action, self.rotate_right_action,
-            self.reset_rotation_action, self.draw_wall_action, self.planner_settings_action, self.predict_aps_action,
+            self.reset_rotation_action, self.draw_wall_action, self.draw_boundary_action, self.clear_boundaries_action,
+            self.planner_settings_action, self.predict_aps_action,
             self.sim_action, self.export_action, self.clear_ap_action, self.load_pattern_action,
             self.load_heatmap_settings_action, self.save_plan_action, self.load_plan_action,
         ])
@@ -2716,6 +2791,8 @@ class MainWindow(QMainWindow):
         self._wall_preview_items = []
 
     def toggle_wall_draw_mode(self, enabled: bool):
+        if enabled and getattr(self, "boundary_draw_mode", False):
+            self.cancel_planner_boundary_drawing()
         self.wall_draw_mode = bool(enabled)
         self._wall_draw_start = None
         self._clear_wall_preview()
@@ -2739,6 +2816,130 @@ class MainWindow(QMainWindow):
             self.draw_wall_action.blockSignals(True); self.draw_wall_action.setChecked(False); self.draw_wall_action.blockSignals(False)
         self.view.setCursor(Qt.ArrowCursor)
         self.statusBar().showMessage("RF wall drawing cancelled")
+
+    def _clear_boundary_preview(self):
+        scene = self.view.scene()
+        for item in list(getattr(self, "_boundary_preview_items", [])):
+            try:
+                if scene is not None and item.scene() is scene:
+                    scene.removeItem(item)
+            except RuntimeError:
+                pass
+        self._boundary_preview_items = []
+
+    def toggle_planner_boundary_draw_mode(self, enabled: bool):
+        if enabled and getattr(self, "wall_draw_mode", False):
+            self.cancel_user_wall_drawing()
+        self.boundary_draw_mode = bool(enabled)
+        self._boundary_draw_start = None
+        self._clear_boundary_preview()
+        if enabled:
+            if not self.floor:
+                QMessageBox.information(
+                    self,
+                    "No floor selected",
+                    "Load an IFC and select a floor before drawing a shared planner boundary.",
+                )
+                self.draw_boundary_action.blockSignals(True)
+                self.draw_boundary_action.setChecked(False)
+                self.draw_boundary_action.blockSignals(False)
+                self.boundary_draw_mode = False
+                return
+            self.view.setCursor(Qt.CrossCursor)
+            self.statusBar().showMessage(
+                "Draw shared planner boundary: click two opposite corners. "
+                "The box applies to every IFC floor. Right-click to finish."
+            )
+        else:
+            self.view.setCursor(Qt.ArrowCursor)
+            self.statusBar().showMessage("Planner boundary drawing stopped")
+
+    def cancel_planner_boundary_drawing(self):
+        self._boundary_draw_start = None
+        self._clear_boundary_preview()
+        self.boundary_draw_mode = False
+        if hasattr(self, "draw_boundary_action"):
+            self.draw_boundary_action.blockSignals(True)
+            self.draw_boundary_action.setChecked(False)
+            self.draw_boundary_action.blockSignals(False)
+        self.view.setCursor(Qt.ArrowCursor)
+        self.statusBar().showMessage("Planner boundary drawing cancelled")
+
+    def show_planner_boundary_preview(self, end_point: QPointF):
+        self._clear_boundary_preview()
+        if self._boundary_draw_start is None or self.view.scene() is None:
+            return
+        start = self._boundary_draw_start
+        minx, maxx = sorted((float(start.x()), float(end_point.x())))
+        miny, maxy = sorted((float(start.y()), float(end_point.y())))
+        pen = QPen(QColor("#00A6D6"), 1.5)
+        pen.setCosmetic(True)
+        pen.setStyle(Qt.DashLine)
+        item = self.view.scene().addRect(
+            minx, miny, maxx - minx, maxy - miny, pen, QBrush(Qt.NoBrush)
+        )
+        item.setZValue(Z_AP_LABEL + 20)
+        self._boundary_preview_items = [item]
+
+    def capture_planner_boundary_point(self, scene_pos: QPointF):
+        if not self.floor:
+            return
+        point = QPointF(float(scene_pos.x()), float(scene_pos.y()))
+        if self._boundary_draw_start is None:
+            self._boundary_draw_start = point
+            self.show_planner_boundary_preview(point)
+            self.statusBar().showMessage(
+                "First planner-boundary corner captured. Click the opposite corner."
+            )
+            return
+        start = self._boundary_draw_start
+        minx, maxx = sorted((float(start.x()), float(point.x())))
+        miny, maxy = sorted((float(start.y()), float(point.y())))
+        if maxx - minx < 0.10 or maxy - miny < 0.10:
+            self.statusBar().showMessage(
+                "Planner boundary must be at least 0.10 m wide and high."
+            )
+            return
+        boundary = PlannerBoundary2D(
+            guid=f"planner-boundary-{uuid.uuid4().hex}",
+            name=f"Planner boundary {len(self.planner_boundaries) + 1}",
+            polygon=box(minx, miny, maxx, maxy),
+        )
+        self.planner_boundaries.append(boundary)
+        self._boundary_draw_start = None
+        self._clear_boundary_preview()
+        self.last_result = None
+        self.draw_floor()
+        self.statusBar().showMessage(
+            f"Created {boundary.name}; it now constrains AP planning on all IFC floors. "
+            "Click two more corners to add another box, or right-click to finish."
+        )
+
+    def delete_planner_boundary(self, boundary: PlannerBoundary2D):
+        self.planner_boundaries = [
+            candidate for candidate in self.planner_boundaries if candidate is not boundary
+        ]
+        self.last_result = None
+        self.draw_floor()
+        self.statusBar().showMessage("Deleted shared planner boundary")
+
+    def clear_planner_boundaries(self):
+        if not self.planner_boundaries:
+            self.statusBar().showMessage("No shared planner boundaries to clear")
+            return
+        answer = QMessageBox.question(
+            self,
+            "Clear planner boundaries",
+            "Delete all planner boundary boxes shared by every IFC floor?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self.planner_boundaries.clear()
+        self.last_result = None
+        self.draw_floor()
+        self.statusBar().showMessage("Cleared all shared planner boundaries")
 
     def nearest_ifc_connection_point(self, scene_pos: QPointF) -> Tuple[QPointF, bool]:
         """Snap to a vertex or nearest boundary point on existing IFC/user geometry."""
@@ -3020,20 +3221,66 @@ class MainWindow(QMainWindow):
             self.populate_wall_table()
             self.statusBar().showMessage("Predictive AP planner settings updated")
 
+    def _planner_boundary_area(self):
+        polygons = [
+            boundary.polygon for boundary in self.planner_boundaries
+            if boundary.polygon is not None and not boundary.polygon.is_empty
+        ]
+        if not polygons:
+            return None
+        try:
+            area = unary_union(polygons)
+            if not area.is_valid:
+                area = area.buffer(0)
+            return None if area.is_empty else area
+        except Exception:
+            return None
+
     def _planner_floor_area(self):
         """Return the area sampled by the predictive planner.
 
-        IFC files frequently omit IfcSpace objects. In ``auto`` mode the
-        planner therefore uses spaces when available and otherwise derives a
-        practical footprint from the wall geometry. The inferred footprint is
-        only a planning mask: wall polygons still provide the RF attenuation
-        and candidate-point blocking behaviour.
+        Shared user boundary boxes apply to every IFC floor. Whenever at least
+        one exists, their union is a hard clipping mask: no candidate or sample
+        point can be generated outside it. In automatic mode, IFC spaces are
+        preferred; if spaces are absent, the shared boundary boxes become the
+        planning area; wall-derived geometry is used only as the final fallback.
         """
         if not self.floor:
             return None
         settings = self.auto_planner_settings
         mode = str(getattr(settings, "planning_area_mode", "auto") or "auto").lower()
-        spaces = [space.polygon for space in self.floor.spaces if space.polygon is not None and not space.polygon.is_empty]
+        boundary_area = self._planner_boundary_area()
+        boundary_count = len(self.planner_boundaries)
+        spaces = [
+            space.polygon for space in self.floor.spaces
+            if space.polygon is not None and not space.polygon.is_empty
+        ]
+
+        def constrained(area, source_label: str):
+            if area is None or area.is_empty:
+                return None
+            if boundary_area is not None:
+                try:
+                    area = area.intersection(boundary_area)
+                except Exception:
+                    return None
+                if not area.is_valid:
+                    area = area.buffer(0)
+                if area.is_empty:
+                    self._planner_area_source_label = (
+                        f"{source_label}; no overlap with {boundary_count} shared boundary box(es)"
+                    )
+                    return None
+                source_label += f", clipped by {boundary_count} shared boundary box(es)"
+            self._planner_area_source_label = source_label
+            return area
+
+        if mode == "boundaries":
+            if boundary_area is None:
+                self._planner_area_source_label = "shared planner boundary boxes only (none drawn)"
+                return None
+            self._planner_area_source_label = f"{boundary_count} shared planner boundary box(es)"
+            return boundary_area
 
         if mode in {"auto", "spaces"} and spaces:
             try:
@@ -3041,8 +3288,7 @@ class MainWindow(QMainWindow):
                 if not area.is_valid:
                     area = area.buffer(0)
                 if not area.is_empty:
-                    self._planner_area_source_label = f"{len(spaces)} IFC space footprint(s)"
-                    return area
+                    return constrained(area, f"{len(spaces)} IFC space footprint(s)")
             except Exception:
                 if mode == "spaces":
                     return None
@@ -3050,9 +3296,18 @@ class MainWindow(QMainWindow):
             self._planner_area_source_label = "IFC spaces only (none available)"
             return None
 
-        wall_polygons = [wall.polygon for wall in self.floor.walls if wall.polygon is not None and not wall.polygon.is_empty]
+        # When spaces are unavailable, user boxes are an explicit and safer
+        # planning extent than an automatically inferred convex/concave hull.
+        if mode == "auto" and boundary_area is not None:
+            self._planner_area_source_label = f"{boundary_count} shared planner boundary box(es)"
+            return boundary_area
+
+        wall_polygons = [
+            wall.polygon for wall in self.floor.walls
+            if wall.polygon is not None and not wall.polygon.is_empty
+        ]
         if not wall_polygons:
-            self._planner_area_source_label = "no IFC spaces or wall geometry"
+            self._planner_area_source_label = "no IFC spaces, shared boundary boxes, or wall geometry"
             return None
         try:
             wall_union = unary_union(wall_polygons)
@@ -3067,9 +3322,6 @@ class MainWindow(QMainWindow):
                     area = shapely_concave_hull(wall_union, ratio=0.30, allow_holes=False)
                 except Exception:
                     area = None
-            # A closed wall ring may be returned as the wall material itself
-            # rather than the enclosed floor. Detect that case and fill the
-            # footprint using the convex hull so samples fall inside the plan.
             area_size = float(getattr(area, "area", 0.0)) if area is not None else 0.0
             wall_material_size = float(getattr(wall_union, "area", 0.0))
             if area is None or area.is_empty or area_size <= max(1e-9, wall_material_size * 1.05):
@@ -3086,8 +3338,9 @@ class MainWindow(QMainWindow):
                 area = area.buffer(0)
             if area.is_empty:
                 return None
-            self._planner_area_source_label = f"footprint inferred from {len(wall_polygons)} IFC/RF wall polygon(s)"
-            return area
+            return constrained(
+                area, f"footprint inferred from {len(wall_polygons)} IFC/RF wall polygon(s)"
+            )
         except Exception:
             return None
 
@@ -3284,10 +3537,18 @@ class MainWindow(QMainWindow):
             if settings.planning_area_mode == "spaces":
                 message = (
                     "This floor contains no usable IfcSpace geometry. Change Planning area source to "
-                    "Automatic or Infer floor footprint from IFC walls to plan APs without spaces."
+                    "Automatic, draw shared planner boundary boxes, or infer the footprint from walls."
+                )
+            elif settings.planning_area_mode == "boundaries":
+                message = (
+                    "No shared planner boundary boxes have been drawn. Use 'Draw planner boundary' "
+                    "and select two opposite corners; the boxes will apply to every IFC floor."
                 )
             else:
-                message = "No usable IFC space or wall geometry was found for the selected floor."
+                message = (
+                    "No usable planning area was found. Draw one or more shared planner boundary boxes "
+                    "or provide IFC space/wall geometry."
+                )
             QMessageBox.warning(self, "No plannable area", message)
             return
         walls = list(self.floor.walls)
@@ -3311,7 +3572,15 @@ class MainWindow(QMainWindow):
             try:
                 point = space.polygon.representative_point()
                 candidate = (float(point.x), float(point.y))
-                if candidate not in candidates and not self._planner_point_is_blocked(point, wall_tree, walls):
+                try:
+                    inside_area = area.covers(point)
+                except Exception:
+                    inside_area = area.contains(point)
+                if (
+                    inside_area
+                    and candidate not in candidates
+                    and not self._planner_point_is_blocked(point, wall_tree, walls)
+                ):
                     candidates.append(candidate)
             except Exception:
                 pass
@@ -3507,12 +3776,23 @@ class MainWindow(QMainWindow):
                     if wall.rf_geometry_customised:
                         override["polygon"] = [[float(x), float(y)] for x, y in wall.polygon.exterior.coords]
                     overrides.append(override)
+        planner_boundaries = [
+            {
+                "guid": boundary.guid,
+                "name": boundary.name,
+                "polygon": [
+                    [float(x), float(y)] for x, y in boundary.polygon.exterior.coords
+                ],
+            }
+            for boundary in self.planner_boundaries
+        ]
         return {
-            "format": "rf-attenuation-plan", "version": 1,
+            "format": "rf-attenuation-plan", "version": 2,
             "ifc_paths": [str(path) for path in self.loaded_ifc_paths],
             "selected_floor": self.floor.name if self.floor else "", "view_rotation_deg": self.view_rotation_deg,
             "ifc_alignment": {"dx": self.ifc_alignment.dx, "dy": self.ifc_alignment.dy, "rotation_deg": self.ifc_alignment.rotation_deg, "scale": self.ifc_alignment.scale},
             "auto_planner_settings": self.auto_planner_settings.to_dict(),
+            "planner_boundaries": planner_boundaries,
             "access_points": aps, "user_walls": user_walls, "wall_overrides": overrides,
         }
 
@@ -3606,6 +3886,29 @@ class MainWindow(QMainWindow):
                 rf_type_override=str(item.get("rf_type_override", item.get("type_name", "partition"))),
                 rf_customised=True, is_user_created=True, user_wall_thickness_m=float(item.get("thickness_m", 0.15)),
             ))
+        self.planner_boundaries = []
+        for item in data.get("planner_boundaries", []):
+            if not isinstance(item, dict):
+                continue
+            coords = item.get("polygon", [])
+            if not isinstance(coords, list) or len(coords) < 3:
+                continue
+            try:
+                polygon = Polygon([(float(value[0]), float(value[1])) for value in coords])
+                if not polygon.is_valid:
+                    polygon = polygon.buffer(0)
+                if polygon.is_empty:
+                    continue
+                minx, miny, maxx, maxy = polygon.bounds
+                polygon = box(minx, miny, maxx, maxy)
+                self.planner_boundaries.append(PlannerBoundary2D(
+                    guid=str(item.get("guid", f"planner-boundary-{uuid.uuid4().hex}")),
+                    name=str(item.get("name", f"Planner boundary {len(self.planner_boundaries) + 1}")),
+                    polygon=polygon,
+                ))
+            except Exception:
+                continue
+
         self.aps = []
         for item in data.get("access_points", []):
             if not isinstance(item, dict): continue
@@ -4096,6 +4399,8 @@ class MainWindow(QMainWindow):
                     wall.rf_original_polygon = affine_transform(wall.rf_original_polygon, delta)
             for space in floor.spaces:
                 space.polygon = affine_transform(space.polygon, delta)
+        for boundary in self.planner_boundaries:
+            boundary.polygon = affine_transform(boundary.polygon, delta)
         for ap in self.aps:
             a, b, d, e, xoff, yoff = delta
             old_x, old_y = float(ap.x), float(ap.y)
@@ -4293,12 +4598,15 @@ class MainWindow(QMainWindow):
         if replace:
             if getattr(self, "wall_draw_mode", False) or getattr(self, "_wall_draw_start", None) is not None:
                 self.cancel_user_wall_drawing()
+            if getattr(self, "boundary_draw_mode", False) or getattr(self, "_boundary_draw_start", None) is not None:
+                self.cancel_planner_boundary_drawing()
             if abs(float(getattr(self, "view_rotation_deg", 0.0))) > 1e-9:
                 self.reset_view_rotation()
             self.floors = {}
             self.loaded_ifc_paths = []
             self.ifc_origin_info = {}
             self.aps.clear()
+            self.planner_boundaries.clear()
             self.last_result = None
             self.ifc_alignment = AlignmentTransform()
         self.alignment_pick_mode: Optional[str] = None
@@ -4628,7 +4936,8 @@ class MainWindow(QMainWindow):
         self.clear_ap_action.setEnabled(not loading)
         self.load_pattern_action.setEnabled(not loading)
         for action_name in (
-            "planner_settings_action", "predict_aps_action", "draw_wall_action", "ifc_origin_action",
+            "planner_settings_action", "predict_aps_action", "draw_wall_action",
+            "draw_boundary_action", "clear_boundaries_action", "ifc_origin_action",
             "rotate_left_action", "rotate_right_action", "reset_rotation_action", "save_plan_action", "load_plan_action",
         ):
             action = getattr(self, action_name, None)
@@ -4639,6 +4948,8 @@ class MainWindow(QMainWindow):
     def select_floor(self, name: str):
         if getattr(self, "wall_draw_mode", False) or getattr(self, "_wall_draw_start", None) is not None:
             self.cancel_user_wall_drawing()
+        if getattr(self, "boundary_draw_mode", False) or getattr(self, "_boundary_draw_start", None) is not None:
+            self.cancel_planner_boundary_drawing()
         # Avoid calling ``self.floors.get(...)`` directly. A previous settings/UI
         # change could accidentally shadow a ``get`` attribute with a numeric
         # value, which causes: TypeError: 'float' object is not callable.
@@ -4725,6 +5036,7 @@ class MainWindow(QMainWindow):
         scene.clear()
         self._ifc_snap_marker_items = []
         self._wall_preview_items = []
+        self._boundary_preview_items = []
         if not self.floor:
             return
         # Draw heatmap first so the building geometry remains visible above it.
@@ -4753,6 +5065,21 @@ class MainWindow(QMainWindow):
                     scene, str(space.name), cx, cy,
                     colours["space_text"], self.heatmap_settings.space_label_font_size, Z_TEXT, bold=True
                 )
+
+        for boundary in self.planner_boundaries:
+            item = PlannerBoundaryGraphicsItem(self, boundary)
+            scene.addItem(item)
+            minx, miny, maxx, maxy = boundary.polygon.bounds
+            self._add_upright_text(
+                scene,
+                f"{boundary.name} (all floors)",
+                float(minx),
+                float(maxy),
+                QColor("#00A6D6"),
+                max(2, int(self.heatmap_settings.space_label_font_size)),
+                Z_TEXT + 3,
+                bold=True,
+            )
 
         for wall in self.floor.walls:
             coords = list(wall.polygon.exterior.coords)
