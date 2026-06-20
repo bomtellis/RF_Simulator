@@ -30,8 +30,8 @@ try:
 except Exception:
     contourpy = None
 
-from PySide6.QtCore import QPointF, Qt, Slot, QTimer
-from PySide6.QtGui import QAction, QColor, QBrush, QFont, QPen, QPolygonF, QPainterPath, QPalette, QTransform
+from PySide6.QtCore import QPointF, Qt, Slot, QTimer, QSize
+from PySide6.QtGui import QAction, QColor, QBrush, QFont, QPen, QPolygonF, QPainterPath, QPalette, QTransform, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -41,6 +41,8 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
+    QGridLayout,
     QGraphicsEllipseItem,
     QGraphicsItem,
     QGraphicsPathItem,
@@ -56,11 +58,16 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressDialog,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
+    QStyle,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QToolBar,
+    QToolButton,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -336,10 +343,10 @@ class AutoPlannerSettings:
     minimum_ap_spacing_m: float = 8.0
     maximum_aps: int = 64
     # ``auto`` uses IfcSpace footprints when present, otherwise shared user
-    # boundary boxes, and finally an inferred wall footprint. ``spaces``
-    # requires IfcSpace geometry; ``boundaries`` uses only the shared planner
-    # boxes; ``walls`` always uses the inferred footprint. Boundary boxes are
-    # a hard clipping limit in every mode whenever at least one exists.
+    # rectangular/polygon boundaries, and finally an inferred wall footprint.
+    # ``spaces`` requires IfcSpace geometry; ``boundaries`` uses only the shared
+    # planner boundaries; ``walls`` always uses the inferred footprint. User
+    # boundaries are a hard clipping limit in every mode whenever one exists.
     planning_area_mode: str = "auto"
     wall_footprint_margin_m: float = 0.0
     expected_clients: int = 250
@@ -400,7 +407,7 @@ class AutoPlannerSettings:
         raw_area_mode = str(data.get("planning_area_mode", data.get("planner_area_mode", base.planning_area_mode))).strip().lower()
         if raw_area_mode.startswith("space"):
             base.planning_area_mode = "spaces"
-        elif raw_area_mode.startswith("bound") or raw_area_mode.startswith("box"):
+        elif raw_area_mode.startswith("bound") or raw_area_mode.startswith("box") or raw_area_mode.startswith("poly"):
             base.planning_area_mode = "boundaries"
         elif raw_area_mode.startswith("wall") or raw_area_mode.startswith("floor"):
             base.planning_area_mode = "walls"
@@ -459,6 +466,7 @@ class PlannerBoundary2D:
     guid: str
     name: str
     polygon: Polygon
+    shape_type: str = "polygon"  # rectangle or polygon
 
 
 @dataclass
@@ -2095,9 +2103,9 @@ class AutoPlannerSettingsDialog(QDialog):
         self.minimum_spacing = QDoubleSpinBox(); self.minimum_spacing.setRange(0.0, 100.0); self.minimum_spacing.setSuffix(" m"); self.minimum_spacing.setValue(settings.minimum_ap_spacing_m)
         self.maximum_aps = QSpinBox(); self.maximum_aps.setRange(1, 10_000); self.maximum_aps.setValue(settings.maximum_aps)
         self.area_mode = QComboBox()
-        self.area_mode.addItem("Automatic — spaces, then shared boundary boxes, then walls", "auto")
+        self.area_mode.addItem("Automatic — spaces, then shared boundaries, then walls", "auto")
         self.area_mode.addItem("IFC spaces only", "spaces")
-        self.area_mode.addItem("Shared planner boundary boxes only", "boundaries")
+        self.area_mode.addItem("Shared planner boundaries only", "boundaries")
         self.area_mode.addItem("Infer floor footprint from IFC walls", "walls")
         area_index = self.area_mode.findData(settings.planning_area_mode)
         self.area_mode.setCurrentIndex(max(0, area_index))
@@ -2120,7 +2128,7 @@ class AutoPlannerSettingsDialog(QDialog):
         form.addRow(self.remove_planned)
         layout.addLayout(form)
 
-        note = QLabel("Spectrum occupancy reduces effective client capacity. Channels are allocated to minimise nearby co-channel reuse. Additional antenna gain is added to the selected pattern data. Shared planner boundary boxes apply to every IFC floor and are always a hard placement limit. When an IFC contains no IfcSpace objects, Automatic mode uses those boxes first and falls back to an inferred wall footprint only when no boxes have been drawn.")
+        note = QLabel("Spectrum occupancy reduces effective client capacity. Channels are allocated to minimise nearby co-channel reuse. Additional antenna gain is added to the selected pattern data. Shared rectangular and polygon planner boundaries apply to every IFC floor and are always a hard placement limit. When an IFC contains no IfcSpace objects, Automatic mode uses those boundaries first and falls back to an inferred wall footprint only when none have been drawn.")
         note.setWordWrap(True)
         layout.addWidget(note)
 
@@ -2316,12 +2324,13 @@ class WallGraphicsItem(QGraphicsPolygonItem):
         event.accept()
 
 
-class PlannerBoundaryGraphicsItem(QGraphicsRectItem):
+class PlannerBoundaryGraphicsItem(QGraphicsPolygonItem):
     """Selectable outline for a planner boundary shared across all floors."""
 
     def __init__(self, main, boundary: PlannerBoundary2D):
-        minx, miny, maxx, maxy = boundary.polygon.bounds
-        super().__init__(float(minx), float(miny), float(maxx - minx), float(maxy - miny))
+        coords = list(boundary.polygon.exterior.coords)
+        polygon = QPolygonF([QPointF(float(x), float(y)) for x, y in coords])
+        super().__init__(polygon)
         self.main = main
         self.boundary = boundary
         pen = QPen(QColor("#00A6D6"), 1.5)
@@ -2332,9 +2341,10 @@ class PlannerBoundaryGraphicsItem(QGraphicsRectItem):
         self.setZValue(Z_TEXT + 2)
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         self.setAcceptedMouseButtons(Qt.LeftButton | Qt.RightButton)
+        boundary_kind = "Polygon" if boundary.shape_type == "polygon" else "Rectangular"
         self.setToolTip(
-            f"{boundary.name}\nShared by all IFC floors\n"
-            "Predictive AP candidates cannot be placed outside the combined boundary boxes.\n"
+            f"{boundary.name}\n{boundary_kind} boundary shared by all IFC floors\n"
+            "Predictive AP candidates cannot be placed outside the combined planner boundaries.\n"
             "Right-click to delete."
         )
 
@@ -2412,9 +2422,12 @@ class PlanView(QGraphicsView):
         self.scale(factor, factor)
 
     def mouseMoveEvent(self, event):
-        if getattr(self.main, "boundary_draw_mode", False) and getattr(self.main, "_boundary_draw_start", None) is not None:
-            pos = self.mapToScene(event.position().toPoint())
-            self.main.show_planner_boundary_preview(pos)
+        if getattr(self.main, "boundary_draw_mode", False):
+            has_rectangle_start = getattr(self.main, "_boundary_draw_start", None) is not None
+            has_polygon_points = bool(getattr(self.main, "_boundary_polygon_points", []))
+            if has_rectangle_start or has_polygon_points:
+                pos = self.mapToScene(event.position().toPoint())
+                self.main.show_planner_boundary_preview(pos)
 
         if getattr(self.main, "wall_draw_mode", False) and getattr(self.main, "_wall_draw_start", None) is not None:
             pos = self.mapToScene(event.position().toPoint())
@@ -2439,7 +2452,13 @@ class PlanView(QGraphicsView):
     def mousePressEvent(self, event):
         if getattr(self.main, "boundary_draw_mode", False):
             if event.button() == Qt.RightButton:
-                self.main.cancel_planner_boundary_drawing()
+                if (
+                    getattr(self.main, "boundary_draw_shape", "rectangle") == "polygon"
+                    and len(getattr(self.main, "_boundary_polygon_points", [])) >= 3
+                ):
+                    self.main.finish_planner_polygon_boundary()
+                else:
+                    self.main.cancel_planner_boundary_drawing()
                 event.accept()
                 return
             if event.button() == Qt.LeftButton:
@@ -2546,7 +2565,9 @@ class MainWindow(QMainWindow):
         self._wall_preview_items: List[QGraphicsItem] = []
         self.planner_boundaries: List[PlannerBoundary2D] = []
         self.boundary_draw_mode: bool = False
+        self.boundary_draw_shape: str = "rectangle"
         self._boundary_draw_start: Optional[QPointF] = None
+        self._boundary_polygon_points: List[QPointF] = []
         self._boundary_preview_items: List[QGraphicsItem] = []
         self._pending_plan_data: Optional[Dict[str, object]] = None
         self.dxf_overlay: Optional[DxfOverlay] = None
@@ -2643,6 +2664,10 @@ class MainWindow(QMainWindow):
 
         controls = QWidget()
         form = QFormLayout(controls)
+        form.setContentsMargins(10, 10, 10, 10)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(8)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         form.addRow("Floor", self.floor_combo)
         form.addRow("RSSI view frequency", self.rssi_view_frequency)
         form.addRow("Grid resolution", self.resolution)
@@ -2659,15 +2684,56 @@ class MainWindow(QMainWindow):
         form.addRow("Slab loss 2.4 GHz", self.slab_att_24)
         form.addRow("Slab loss 5 GHz", self.slab_att_5)
         form.addRow("Slab loss 6 GHz", self.slab_att_6)
-        form.addRow(QLabel("Double-click the model to place an AP using the selected pattern/orientation."))
+        instruction = QLabel("Double-click the model to place an AP using the selected pattern and orientation.")
+        instruction.setWordWrap(True)
+        form.addRow(instruction)
+
+        for field in (
+            self.floor_combo, self.rssi_view_frequency, self.pattern_combo,
+            self.resolution, self.tx_power, self.freq, self.azimuth,
+            self.downtilt, self.mount_height, self.rx_height, self.ple,
+            self.min_client_rssi, self.slab_att_24, self.slab_att_5, self.slab_att_6,
+        ):
+            field.setMinimumWidth(170)
+
+        settings_scroll = QScrollArea()
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setFrameShape(QFrame.NoFrame)
+        settings_scroll.setWidget(controls)
+
+        ap_panel = QWidget()
+        ap_panel_layout = QVBoxLayout(ap_panel)
+        ap_panel_layout.setContentsMargins(4, 4, 4, 4)
+        ap_help = QLabel("Configure radios, channels, antenna patterns and client capacity for each access point.")
+        ap_help.setWordWrap(True)
+        ap_panel_layout.addWidget(ap_help)
+        ap_panel_layout.addWidget(self.ap_table, 1)
+
+        wall_panel = QWidget()
+        wall_panel_layout = QVBoxLayout(wall_panel)
+        wall_panel_layout.setContentsMargins(4, 4, 4, 4)
+        wall_help = QLabel("Review and edit RF attenuation values for IFC and user-created walls.")
+        wall_help.setWordWrap(True)
+        wall_panel_layout.addWidget(wall_help)
+        wall_panel_layout.addWidget(self.wall_table, 1)
+
+        self.inspector_tabs = QTabWidget()
+        self.inspector_tabs.setDocumentMode(True)
+        self.inspector_tabs.addTab(settings_scroll, "Settings")
+        self.inspector_tabs.addTab(ap_panel, "Access points")
+        self.inspector_tabs.addTab(wall_panel, "Walls")
 
         side = QWidget()
+        side.setMinimumWidth(390)
+        side.setMaximumWidth(720)
         side_layout = QVBoxLayout(side)
-        side_layout.addWidget(controls)
-        side_layout.addWidget(QLabel("Access points and antenna patterns"))
-        side_layout.addWidget(self.ap_table)
-        side_layout.addWidget(QLabel("Wall attenuation values"))
-        side_layout.addWidget(self.wall_table)
+        side_layout.setContentsMargins(4, 4, 4, 4)
+        side_layout.addWidget(self.inspector_tabs, 1)
+
+        self.ap_table.setAlternatingRowColors(True)
+        self.wall_table.setAlternatingRowColors(True)
+        self.ap_table.verticalHeader().setVisible(False)
+        self.wall_table.verticalHeader().setVisible(False)
 
         model_panel = QWidget()
         model_layout = QVBoxLayout(model_panel)
@@ -2677,14 +2743,15 @@ class MainWindow(QMainWindow):
         model_layout.addWidget(self.rssi_legend, 0)
 
         split = QSplitter()
+        split.setChildrenCollapsible(False)
         split.addWidget(model_panel)
         split.addWidget(side)
-        split.setSizes([1000, 400])
-        self.setCentralWidget(split)
+        split.setStretchFactor(0, 4)
+        split.setStretchFactor(1, 2)
+        split.setSizes([1020, 430])
+        self._main_splitter = split
         self._update_rssi_legend()
 
-        tb = QToolBar("Main")
-        self.addToolBar(tb)
         self.open_action = QAction("Open IFC(s)", self)
         self.open_action.triggered.connect(self.open_ifc)
         self.add_action = QAction("Add IFC(s)", self)
@@ -2714,9 +2781,16 @@ class MainWindow(QMainWindow):
         self.draw_wall_action = QAction("Draw RF wall", self)
         self.draw_wall_action.setCheckable(True)
         self.draw_wall_action.toggled.connect(self.toggle_wall_draw_mode)
-        self.draw_boundary_action = QAction("Draw planner boundary", self)
+        self.draw_boundary_action = QAction("Draw rectangular boundary", self)
         self.draw_boundary_action.setCheckable(True)
-        self.draw_boundary_action.toggled.connect(self.toggle_planner_boundary_draw_mode)
+        self.draw_boundary_action.toggled.connect(
+            lambda enabled: self.toggle_planner_boundary_draw_mode(enabled, "rectangle")
+        )
+        self.draw_polygon_boundary_action = QAction("Draw polygon boundary", self)
+        self.draw_polygon_boundary_action.setCheckable(True)
+        self.draw_polygon_boundary_action.toggled.connect(
+            lambda enabled: self.toggle_planner_boundary_draw_mode(enabled, "polygon")
+        )
         self.clear_boundaries_action = QAction("Clear planner boundaries", self)
         self.clear_boundaries_action.triggered.connect(self.clear_planner_boundaries)
         self.ifc_origin_action = QAction("IFC origin / orientation", self)
@@ -2731,16 +2805,222 @@ class MainWindow(QMainWindow):
         self.save_plan_action.triggered.connect(self.save_rf_plan)
         self.load_plan_action = QAction("Load RF plan", self)
         self.load_plan_action.triggered.connect(self.load_rf_plan)
-        tb.addActions([
-            self.open_action, self.add_action, self.open_dxf_action, self.align_ifc_action, self.two_point_align_action,
-            self.clear_dxf_action, self.ifc_origin_action, self.rotate_left_action, self.rotate_right_action,
-            self.reset_rotation_action, self.draw_wall_action, self.draw_boundary_action, self.clear_boundaries_action,
-            self.planner_settings_action, self.predict_aps_action,
-            self.sim_action, self.export_action, self.clear_ap_action, self.load_pattern_action,
-            self.load_heatmap_settings_action, self.save_plan_action, self.load_plan_action,
-        ])
+        self._configure_ribbon_actions()
+        self.ribbon = self._build_ribbon()
+
+        central = QWidget()
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+        central_layout.addWidget(self.ribbon, 0)
+        central_layout.addWidget(split, 1)
+        self.setCentralWidget(central)
+        self._apply_theme_styles()
+
         self.floor_combo.currentTextChanged.connect(self.select_floor)
         self.include_inter_floor.stateChanged.connect(lambda *_: self.draw_floor())
+
+    # ----------------------------- Ribbon interface -----------------------------
+
+    def _standard_icon(self, standard_name: str) -> QIcon:
+        standard = getattr(QStyle.StandardPixmap, standard_name, None)
+        if standard is None:
+            return QIcon()
+        return self.style().standardIcon(standard)
+
+    def _configure_ribbon_actions(self):
+        metadata = {
+            "open_action": (
+                "Open IFC models", "Replace the current project with one or more IFC models.",
+                "SP_DialogOpenButton", "Ctrl+O"
+            ),
+            "add_action": (
+                "Add IFC models", "Append one or more IFC models to the current project.",
+                "SP_FileDialogNewFolder", "Ctrl+Shift+O"
+            ),
+            "open_dxf_action": (
+                "Open DXF overlay", "Load a DXF drawing as a visual alignment reference.",
+                "SP_DirOpenIcon", ""
+            ),
+            "align_ifc_action": (
+                "Align IFC to DXF", "Open the interactive IFC-to-DXF alignment dialog.",
+                "SP_BrowserReload", ""
+            ),
+            "two_point_align_action": (
+                "Two-point alignment", "Align IFC and DXF using two corresponding snapped points.",
+                "SP_DialogApplyButton", ""
+            ),
+            "clear_dxf_action": (
+                "Clear DXF", "Remove the current DXF overlay without changing the IFC model.",
+                "SP_DialogDiscardButton", ""
+            ),
+            "sim_action": (
+                "Simulate RSSI", "Calculate RF coverage for all applicable frequencies and redraw the selected result.",
+                "SP_MediaPlay", "F5"
+            ),
+            "export_action": (
+                "Export results", "Export the calculated RF sample results to CSV.",
+                "SP_DialogSaveButton", "Ctrl+E"
+            ),
+            "clear_ap_action": (
+                "Clear access points", "Remove every access point from the project after confirmation.",
+                "SP_TrashIcon", ""
+            ),
+            "load_pattern_action": (
+                "Load antenna pattern", "Import a directional antenna pattern from a CSV file.",
+                "SP_FileIcon", ""
+            ),
+            "load_heatmap_settings_action": (
+                "Load display settings", "Load RF heatmap, colour, IFC and rendering settings from JSON.",
+                "SP_ComputerIcon", ""
+            ),
+            "planner_settings_action": (
+                "Planner settings", "Configure coverage targets, radios, client capacity, channels and spectrum occupancy.",
+                "SP_FileDialogDetailedView", ""
+            ),
+            "predict_aps_action": (
+                "Predict AP locations", "Automatically place and configure access points within the permitted planning area.",
+                "SP_DialogApplyButton", "Ctrl+P"
+            ),
+            "draw_wall_action": (
+                "Draw RF wall", "Draw a connected RF-blocking wall where the IFC model has missing geometry.",
+                "SP_FileDialogContentsView", ""
+            ),
+            "draw_boundary_action": (
+                "Rectangle boundary", "Draw a rectangular hard boundary shared by all IFC floors.",
+                "SP_TitleBarMaxButton", ""
+            ),
+            "draw_polygon_boundary_action": (
+                "Polygon boundary", "Draw a polygon hard boundary shared by all IFC floors; right-click to finish.",
+                "SP_DriveNetIcon", ""
+            ),
+            "clear_boundaries_action": (
+                "Clear boundaries", "Remove every rectangular and polygon planner boundary.",
+                "SP_TrashIcon", ""
+            ),
+            "ifc_origin_action": (
+                "IFC origin and orientation", "Inspect insertion points, site coordinates, CRS, map conversion and True North.",
+                "SP_MessageBoxInformation", ""
+            ),
+            "rotate_left_action": (
+                "Rotate view left", "Rotate the display 15 degrees counter-clockwise without changing model coordinates.",
+                "SP_ArrowBack", "Alt+Left"
+            ),
+            "rotate_right_action": (
+                "Rotate view right", "Rotate the display 15 degrees clockwise without changing model coordinates.",
+                "SP_ArrowForward", "Alt+Right"
+            ),
+            "reset_rotation_action": (
+                "Reset view rotation", "Return the display to the unrotated IFC model orientation.",
+                "SP_BrowserReload", "Alt+Home"
+            ),
+            "save_plan_action": (
+                "Save RF plan", "Save access points, channels, wall overrides, boundaries and alignment settings.",
+                "SP_DialogSaveButton", "Ctrl+S"
+            ),
+            "load_plan_action": (
+                "Load RF plan", "Load a previously saved RF plan and restore its project settings.",
+                "SP_DialogOpenButton", "Ctrl+L"
+            ),
+        }
+        for attribute, (label, tooltip, icon_name, shortcut) in metadata.items():
+            action = getattr(self, attribute)
+            action.setText(label)
+            action.setToolTip(tooltip)
+            action.setStatusTip(tooltip)
+            action.setIcon(self._standard_icon(icon_name))
+            if shortcut:
+                action.setShortcut(shortcut)
+
+    def _make_ribbon_button(self, action: QAction) -> QToolButton:
+        button = QToolButton()
+        button.setDefaultAction(action)
+        button.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        button.setIconSize(QSize(28, 28))
+        button.setAutoRaise(False)
+        button.setMinimumSize(92, 68)
+        button.setMaximumHeight(72)
+        button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        button.setFocusPolicy(Qt.NoFocus)
+        return button
+
+    def _make_ribbon_group(self, title: str, action_names: List[str]) -> QWidget:
+        group = QWidget()
+        group.setObjectName("RibbonGroup")
+        group_layout = QVBoxLayout(group)
+        group_layout.setContentsMargins(3, 3, 3, 2)
+        group_layout.setSpacing(1)
+
+        box = QFrame()
+        box.setObjectName("RibbonGroupBox")
+        box.setFrameShape(QFrame.StyledPanel)
+        button_layout = QGridLayout(box)
+        button_layout.setContentsMargins(4, 4, 4, 4)
+        button_layout.setHorizontalSpacing(3)
+        button_layout.setVerticalSpacing(0)
+        for column, action_name in enumerate(action_names):
+            action = getattr(self, action_name)
+            button_layout.addWidget(self._make_ribbon_button(action), 0, column)
+            button_layout.setColumnStretch(column, 1)
+        group_layout.addWidget(box, 1)
+
+        caption = QLabel(title)
+        caption.setObjectName("RibbonGroupCaption")
+        caption.setAlignment(Qt.AlignCenter)
+        caption.setMinimumHeight(18)
+        group_layout.addWidget(caption, 0)
+        group.setMinimumWidth(max(112, len(action_names) * 96 + 8))
+        group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        return group
+
+    def _make_ribbon_page(self, groups: List[Tuple[str, List[str]]]) -> QScrollArea:
+        content = QWidget()
+        layout = QHBoxLayout(content)
+        layout.setContentsMargins(4, 3, 4, 3)
+        layout.setSpacing(4)
+        for title, action_names in groups:
+            group = self._make_ribbon_group(title, action_names)
+            layout.addWidget(group, max(1, len(action_names)))
+        layout.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setObjectName("RibbonPage")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(content)
+        return scroll
+
+    def _build_ribbon(self) -> QTabWidget:
+        ribbon = QTabWidget()
+        ribbon.setObjectName("MainRibbon")
+        ribbon.setDocumentMode(False)
+        ribbon.setTabPosition(QTabWidget.North)
+        ribbon.setMovable(False)
+        ribbon.setMinimumHeight(128)
+        ribbon.setMaximumHeight(134)
+
+        ribbon.addTab(self._make_ribbon_page([
+            ("Project", ["open_action", "add_action", "load_plan_action", "save_plan_action"]),
+            ("Planning workflow", ["planner_settings_action", "predict_aps_action", "sim_action"]),
+            ("Results and cleanup", ["export_action", "clear_ap_action"]),
+        ]), "Home")
+        ribbon.addTab(self._make_ribbon_page([
+            ("IFC information", ["ifc_origin_action"]),
+            ("DXF and alignment", ["open_dxf_action", "align_ifc_action", "two_point_align_action", "clear_dxf_action"]),
+            ("View orientation", ["rotate_left_action", "rotate_right_action", "reset_rotation_action"]),
+        ]), "Model and view")
+        ribbon.addTab(self._make_ribbon_page([
+            ("RF obstructions", ["draw_wall_action"]),
+            ("Permitted planning area", ["draw_boundary_action", "draw_polygon_boundary_action", "clear_boundaries_action"]),
+        ]), "Walls and boundaries")
+        ribbon.addTab(self._make_ribbon_page([
+            ("Antenna data", ["load_pattern_action"]),
+            ("Heatmap and IFC display", ["load_heatmap_settings_action"]),
+            ("Analysis", ["sim_action", "export_action"]),
+        ]), "Radio and analysis")
+        return ribbon
 
     # ----------------------------- View/origin tools -----------------------------
 
@@ -2827,12 +3107,23 @@ class MainWindow(QMainWindow):
                 pass
         self._boundary_preview_items = []
 
-    def toggle_planner_boundary_draw_mode(self, enabled: bool):
+    def toggle_planner_boundary_draw_mode(self, enabled: bool, shape: str = "rectangle"):
+        shape = "polygon" if str(shape).lower() == "polygon" else "rectangle"
+        if not enabled and (
+            not self.boundary_draw_mode or self.boundary_draw_shape != shape
+        ):
+            return
         if enabled and getattr(self, "wall_draw_mode", False):
             self.cancel_user_wall_drawing()
+        if enabled and self.boundary_draw_mode and self.boundary_draw_shape != shape:
+            self.cancel_planner_boundary_drawing(show_status=False)
+
         self.boundary_draw_mode = bool(enabled)
+        self.boundary_draw_shape = shape
         self._boundary_draw_start = None
+        self._boundary_polygon_points = []
         self._clear_boundary_preview()
+
         if enabled:
             if not self.floor:
                 QMessageBox.information(
@@ -2840,56 +3131,138 @@ class MainWindow(QMainWindow):
                     "No floor selected",
                     "Load an IFC and select a floor before drawing a shared planner boundary.",
                 )
-                self.draw_boundary_action.blockSignals(True)
-                self.draw_boundary_action.setChecked(False)
-                self.draw_boundary_action.blockSignals(False)
-                self.boundary_draw_mode = False
+                self.cancel_planner_boundary_drawing(show_status=False)
                 return
-            self.view.setCursor(Qt.CrossCursor)
-            self.statusBar().showMessage(
-                "Draw shared planner boundary: click two opposite corners. "
-                "The box applies to every IFC floor. Right-click to finish."
+            other_action = (
+                getattr(self, "draw_polygon_boundary_action", None)
+                if shape == "rectangle"
+                else getattr(self, "draw_boundary_action", None)
             )
+            if other_action is not None:
+                other_action.blockSignals(True)
+                other_action.setChecked(False)
+                other_action.blockSignals(False)
+            self.view.setCursor(Qt.CrossCursor)
+            if shape == "polygon":
+                self.statusBar().showMessage(
+                    "Draw shared polygon boundary: left-click each vertex; click the first vertex or right-click after at least three vertices to finish."
+                )
+            else:
+                self.statusBar().showMessage(
+                    "Draw shared rectangular boundary: click two opposite corners. Right-click to cancel."
+                )
         else:
             self.view.setCursor(Qt.ArrowCursor)
             self.statusBar().showMessage("Planner boundary drawing stopped")
 
-    def cancel_planner_boundary_drawing(self):
+    def cancel_planner_boundary_drawing(self, show_status: bool = True):
         self._boundary_draw_start = None
+        self._boundary_polygon_points = []
         self._clear_boundary_preview()
         self.boundary_draw_mode = False
-        if hasattr(self, "draw_boundary_action"):
-            self.draw_boundary_action.blockSignals(True)
-            self.draw_boundary_action.setChecked(False)
-            self.draw_boundary_action.blockSignals(False)
+        for action_name in ("draw_boundary_action", "draw_polygon_boundary_action"):
+            action = getattr(self, action_name, None)
+            if action is not None:
+                action.blockSignals(True)
+                action.setChecked(False)
+                action.blockSignals(False)
         self.view.setCursor(Qt.ArrowCursor)
-        self.statusBar().showMessage("Planner boundary drawing cancelled")
+        if show_status:
+            self.statusBar().showMessage("Planner boundary drawing cancelled")
 
     def show_planner_boundary_preview(self, end_point: QPointF):
         self._clear_boundary_preview()
-        if self._boundary_draw_start is None or self.view.scene() is None:
+        if self.view.scene() is None:
+            return
+        pen = QPen(QColor("#00A6D6"), 1.5)
+        pen.setCosmetic(True)
+        pen.setStyle(Qt.DashLine)
+
+        if self.boundary_draw_shape == "polygon":
+            points = list(self._boundary_polygon_points)
+            if not points:
+                return
+            points.append(QPointF(float(end_point.x()), float(end_point.y())))
+            polygon = QPolygonF(points)
+            preview = QGraphicsPolygonItem(polygon)
+            preview.setPen(pen)
+            fill = QColor("#00A6D6")
+            fill.setAlpha(24 if len(points) >= 3 else 0)
+            preview.setBrush(QBrush(fill) if fill.alpha() else QBrush(Qt.NoBrush))
+            preview.setZValue(Z_AP_LABEL + 20)
+            self.view.scene().addItem(preview)
+            items: List[QGraphicsItem] = [preview]
+            marker_pen = QPen(QColor("#00A6D6"), 1.0)
+            marker_pen.setCosmetic(True)
+            marker_brush = QBrush(QColor("#FFFFFF"))
+            for vertex in self._boundary_polygon_points:
+                marker = self.view.scene().addEllipse(
+                    float(vertex.x()) - 0.08,
+                    float(vertex.y()) - 0.08,
+                    0.16,
+                    0.16,
+                    marker_pen,
+                    marker_brush,
+                )
+                marker.setZValue(Z_AP_LABEL + 21)
+                items.append(marker)
+            self._boundary_preview_items = items
+            return
+
+        if self._boundary_draw_start is None:
             return
         start = self._boundary_draw_start
         minx, maxx = sorted((float(start.x()), float(end_point.x())))
         miny, maxy = sorted((float(start.y()), float(end_point.y())))
-        pen = QPen(QColor("#00A6D6"), 1.5)
-        pen.setCosmetic(True)
-        pen.setStyle(Qt.DashLine)
         item = self.view.scene().addRect(
             minx, miny, maxx - minx, maxy - miny, pen, QBrush(Qt.NoBrush)
         )
         item.setZValue(Z_AP_LABEL + 20)
         self._boundary_preview_items = [item]
 
+    @staticmethod
+    def _planner_points_are_close(first: QPointF, second: QPointF, tolerance_m: float = 0.25) -> bool:
+        return math.hypot(
+            float(first.x()) - float(second.x()),
+            float(first.y()) - float(second.y()),
+        ) <= float(tolerance_m)
+
     def capture_planner_boundary_point(self, scene_pos: QPointF):
         if not self.floor:
             return
         point = QPointF(float(scene_pos.x()), float(scene_pos.y()))
+
+        if self.boundary_draw_shape == "polygon":
+            if (
+                len(self._boundary_polygon_points) >= 3
+                and self._planner_points_are_close(self._boundary_polygon_points[0], point)
+            ):
+                self.finish_planner_polygon_boundary()
+                return
+            if (
+                self._boundary_polygon_points
+                and self._planner_points_are_close(self._boundary_polygon_points[-1], point, 0.05)
+            ):
+                self.statusBar().showMessage("Polygon vertices must be at least 0.05 m apart.")
+                return
+            self._boundary_polygon_points.append(point)
+            self.show_planner_boundary_preview(point)
+            count = len(self._boundary_polygon_points)
+            if count < 3:
+                self.statusBar().showMessage(
+                    f"Polygon vertex {count} captured. Add at least {3 - count} more vertex/vertices."
+                )
+            else:
+                self.statusBar().showMessage(
+                    f"Polygon vertex {count} captured. Right-click or click the first vertex to finish."
+                )
+            return
+
         if self._boundary_draw_start is None:
             self._boundary_draw_start = point
             self.show_planner_boundary_preview(point)
             self.statusBar().showMessage(
-                "First planner-boundary corner captured. Click the opposite corner."
+                "First rectangular-boundary corner captured. Click the opposite corner."
             )
             return
         start = self._boundary_draw_start
@@ -2904,6 +3277,7 @@ class MainWindow(QMainWindow):
             guid=f"planner-boundary-{uuid.uuid4().hex}",
             name=f"Planner boundary {len(self.planner_boundaries) + 1}",
             polygon=box(minx, miny, maxx, maxy),
+            shape_type="rectangle",
         )
         self.planner_boundaries.append(boundary)
         self._boundary_draw_start = None
@@ -2912,7 +3286,38 @@ class MainWindow(QMainWindow):
         self.draw_floor()
         self.statusBar().showMessage(
             f"Created {boundary.name}; it now constrains AP planning on all IFC floors. "
-            "Click two more corners to add another box, or right-click to finish."
+            "Click two more corners to add another rectangle, or right-click to finish."
+        )
+
+    def finish_planner_polygon_boundary(self):
+        points = list(self._boundary_polygon_points)
+        if len(points) < 3:
+            self.statusBar().showMessage("A polygon boundary requires at least three vertices.")
+            return
+        coordinates = [(float(point.x()), float(point.y())) for point in points]
+        polygon = Polygon(coordinates)
+        if polygon.is_empty or float(polygon.area) < 0.01:
+            self.statusBar().showMessage("Polygon boundary area must be at least 0.01 m².")
+            return
+        if not polygon.is_valid:
+            self.statusBar().showMessage(
+                "Polygon boundary is self-intersecting or otherwise invalid. Adjust the vertices or cancel drawing."
+            )
+            return
+        boundary = PlannerBoundary2D(
+            guid=f"planner-boundary-{uuid.uuid4().hex}",
+            name=f"Planner boundary {len(self.planner_boundaries) + 1}",
+            polygon=polygon,
+            shape_type="polygon",
+        )
+        self.planner_boundaries.append(boundary)
+        self._boundary_polygon_points = []
+        self._clear_boundary_preview()
+        self.last_result = None
+        self.draw_floor()
+        self.statusBar().showMessage(
+            f"Created {boundary.name} with {len(coordinates)} vertices; it constrains AP planning on all IFC floors. "
+            "Left-click to start another polygon or toggle the tool off."
         )
 
     def delete_planner_boundary(self, boundary: PlannerBoundary2D):
@@ -2930,7 +3335,7 @@ class MainWindow(QMainWindow):
         answer = QMessageBox.question(
             self,
             "Clear planner boundaries",
-            "Delete all planner boundary boxes shared by every IFC floor?",
+            "Delete all rectangular and polygon planner boundaries shared by every IFC floor?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -3239,10 +3644,10 @@ class MainWindow(QMainWindow):
     def _planner_floor_area(self):
         """Return the area sampled by the predictive planner.
 
-        Shared user boundary boxes apply to every IFC floor. Whenever at least
+        Shared user boundaries apply to every IFC floor. Whenever at least
         one exists, their union is a hard clipping mask: no candidate or sample
         point can be generated outside it. In automatic mode, IFC spaces are
-        preferred; if spaces are absent, the shared boundary boxes become the
+        preferred; if spaces are absent, the shared boundaries become the
         planning area; wall-derived geometry is used only as the final fallback.
         """
         if not self.floor:
@@ -3251,6 +3656,7 @@ class MainWindow(QMainWindow):
         mode = str(getattr(settings, "planning_area_mode", "auto") or "auto").lower()
         boundary_area = self._planner_boundary_area()
         boundary_count = len(self.planner_boundaries)
+        boundary_description = f"{boundary_count} shared planner {'boundary' if boundary_count == 1 else 'boundaries'}"
         spaces = [
             space.polygon for space in self.floor.spaces
             if space.polygon is not None and not space.polygon.is_empty
@@ -3268,18 +3674,18 @@ class MainWindow(QMainWindow):
                     area = area.buffer(0)
                 if area.is_empty:
                     self._planner_area_source_label = (
-                        f"{source_label}; no overlap with {boundary_count} shared boundary box(es)"
+                        f"{source_label}; no overlap with {boundary_description}"
                     )
                     return None
-                source_label += f", clipped by {boundary_count} shared boundary box(es)"
+                source_label += f", clipped by {boundary_description}"
             self._planner_area_source_label = source_label
             return area
 
         if mode == "boundaries":
             if boundary_area is None:
-                self._planner_area_source_label = "shared planner boundary boxes only (none drawn)"
+                self._planner_area_source_label = "shared planner boundaries only (none drawn)"
                 return None
-            self._planner_area_source_label = f"{boundary_count} shared planner boundary box(es)"
+            self._planner_area_source_label = boundary_description
             return boundary_area
 
         if mode in {"auto", "spaces"} and spaces:
@@ -3296,10 +3702,10 @@ class MainWindow(QMainWindow):
             self._planner_area_source_label = "IFC spaces only (none available)"
             return None
 
-        # When spaces are unavailable, user boxes are an explicit and safer
+        # When spaces are unavailable, user boundaries are an explicit and safer
         # planning extent than an automatically inferred convex/concave hull.
         if mode == "auto" and boundary_area is not None:
-            self._planner_area_source_label = f"{boundary_count} shared planner boundary box(es)"
+            self._planner_area_source_label = boundary_description
             return boundary_area
 
         wall_polygons = [
@@ -3307,7 +3713,7 @@ class MainWindow(QMainWindow):
             if wall.polygon is not None and not wall.polygon.is_empty
         ]
         if not wall_polygons:
-            self._planner_area_source_label = "no IFC spaces, shared boundary boxes, or wall geometry"
+            self._planner_area_source_label = "no IFC spaces, shared planner boundaries, or wall geometry"
             return None
         try:
             wall_union = unary_union(wall_polygons)
@@ -3537,16 +3943,16 @@ class MainWindow(QMainWindow):
             if settings.planning_area_mode == "spaces":
                 message = (
                     "This floor contains no usable IfcSpace geometry. Change Planning area source to "
-                    "Automatic, draw shared planner boundary boxes, or infer the footprint from walls."
+                    "Automatic, draw shared planner boundaries, or infer the footprint from walls."
                 )
             elif settings.planning_area_mode == "boundaries":
                 message = (
-                    "No shared planner boundary boxes have been drawn. Use 'Draw planner boundary' "
-                    "and select two opposite corners; the boxes will apply to every IFC floor."
+                    "No shared planner boundaries have been drawn. Use 'Draw rectangular boundary' or 'Draw polygon boundary' "
+                    "and define the permitted area; the boundaries will apply to every IFC floor."
                 )
             else:
                 message = (
-                    "No usable planning area was found. Draw one or more shared planner boundary boxes "
+                    "No usable planning area was found. Draw one or more shared rectangular or polygon planner boundaries "
                     "or provide IFC space/wall geometry."
                 )
             QMessageBox.warning(self, "No plannable area", message)
@@ -3780,6 +4186,7 @@ class MainWindow(QMainWindow):
             {
                 "guid": boundary.guid,
                 "name": boundary.name,
+                "shape_type": boundary.shape_type,
                 "polygon": [
                     [float(x), float(y)] for x, y in boundary.polygon.exterior.coords
                 ],
@@ -3787,7 +4194,7 @@ class MainWindow(QMainWindow):
             for boundary in self.planner_boundaries
         ]
         return {
-            "format": "rf-attenuation-plan", "version": 2,
+            "format": "rf-attenuation-plan", "version": 3,
             "ifc_paths": [str(path) for path in self.loaded_ifc_paths],
             "selected_floor": self.floor.name if self.floor else "", "view_rotation_deg": self.view_rotation_deg,
             "ifc_alignment": {"dx": self.ifc_alignment.dx, "dy": self.ifc_alignment.dy, "rotation_deg": self.ifc_alignment.rotation_deg, "scale": self.ifc_alignment.scale},
@@ -3899,12 +4306,21 @@ class MainWindow(QMainWindow):
                     polygon = polygon.buffer(0)
                 if polygon.is_empty:
                     continue
-                minx, miny, maxx, maxy = polygon.bounds
-                polygon = box(minx, miny, maxx, maxy)
+                if polygon.geom_type != "Polygon":
+                    polygons = list(getattr(polygon, "geoms", []))
+                    if not polygons:
+                        continue
+                    polygon = max(polygons, key=lambda value: float(value.area))
+                if float(polygon.area) < 0.01:
+                    continue
+                shape_type = str(item.get("shape_type", "polygon")).strip().lower()
+                if shape_type not in {"rectangle", "polygon"}:
+                    shape_type = "polygon"
                 self.planner_boundaries.append(PlannerBoundary2D(
                     guid=str(item.get("guid", f"planner-boundary-{uuid.uuid4().hex}")),
                     name=str(item.get("name", f"Planner boundary {len(self.planner_boundaries) + 1}")),
                     polygon=polygon,
+                    shape_type=shape_type,
                 ))
             except Exception:
                 continue
@@ -4017,6 +4433,36 @@ class MainWindow(QMainWindow):
                     fg=colours["legend_text"].name(),
                     border=colours["legend_border"].name(),
                 )
+            )
+        if hasattr(self, "ribbon"):
+            dark = bool(getattr(self, "dark_theme", False))
+            ribbon_bg = "#2F3338" if dark else "#F3F5F7"
+            group_bg = "#383D43" if dark else "#FFFFFF"
+            button_bg = "#434950" if dark else "#FAFBFC"
+            hover_bg = "#505861" if dark else "#E8F1FB"
+            checked_bg = "#405A72" if dark else "#D6E9FB"
+            text_colour = "#F2F2F2" if dark else "#202124"
+            border = "#555C64" if dark else "#C8CDD3"
+            self.ribbon.setStyleSheet(
+                "QTabWidget#MainRibbon::pane { border: 0; border-bottom: 1px solid %(border)s; background: %(ribbon_bg)s; }"
+                "QTabWidget#MainRibbon QTabBar::tab { min-width: 120px; padding: 6px 16px; color: %(text)s; }"
+                "QTabWidget#MainRibbon QTabBar::tab:selected { background: %(group_bg)s; border: 1px solid %(border)s; border-bottom: 0; }"
+                "QScrollArea#RibbonPage { background: %(ribbon_bg)s; }"
+                "QWidget#RibbonGroup { background: transparent; }"
+                "QFrame#RibbonGroupBox { background: %(group_bg)s; border: 1px solid %(border)s; border-radius: 3px; }"
+                "QLabel#RibbonGroupCaption { color: %(text)s; font-size: 10px; padding-top: 1px; }"
+                "QToolButton { background: %(button_bg)s; color: %(text)s; border: 1px solid transparent; border-radius: 3px; padding: 3px 5px; }"
+                "QToolButton:hover { background: %(hover_bg)s; border-color: %(border)s; }"
+                "QToolButton:pressed, QToolButton:checked { background: %(checked_bg)s; border-color: %(border)s; }"
+                % {
+                    "ribbon_bg": ribbon_bg,
+                    "group_bg": group_bg,
+                    "button_bg": button_bg,
+                    "hover_bg": hover_bg,
+                    "checked_bg": checked_bg,
+                    "text": text_colour,
+                    "border": border,
+                }
             )
 
     @staticmethod
@@ -4156,7 +4602,7 @@ class MainWindow(QMainWindow):
     def open_dxf_overlay(self):
         """Open a DXF reference drawing directly without alignment.
 
-        For project alignment use the toolbar action "2-point align IFC/DXF".
+        For project alignment use Model and view > Two-point alignment in the ribbon.
         That workflow asks for two snapped IFC points first, then opens the DXF
         in a separate alignment window before inserting the corrected overlay.
         """
@@ -4386,7 +4832,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             "Use DXF pre-alignment dialog",
-            "Use the toolbar action '2-point align IFC/DXF'. The new workflow "
+            "Use Model and view > Two-point alignment in the ribbon. The workflow "
             "selects two IFC points first and then opens the DXF in a separate "
             "snapping alignment window."
         )
@@ -4598,7 +5044,11 @@ class MainWindow(QMainWindow):
         if replace:
             if getattr(self, "wall_draw_mode", False) or getattr(self, "_wall_draw_start", None) is not None:
                 self.cancel_user_wall_drawing()
-            if getattr(self, "boundary_draw_mode", False) or getattr(self, "_boundary_draw_start", None) is not None:
+            if (
+                getattr(self, "boundary_draw_mode", False)
+                or getattr(self, "_boundary_draw_start", None) is not None
+                or bool(getattr(self, "_boundary_polygon_points", []))
+            ):
                 self.cancel_planner_boundary_drawing()
             if abs(float(getattr(self, "view_rotation_deg", 0.0))) > 1e-9:
                 self.reset_view_rotation()
@@ -4937,7 +5387,7 @@ class MainWindow(QMainWindow):
         self.load_pattern_action.setEnabled(not loading)
         for action_name in (
             "planner_settings_action", "predict_aps_action", "draw_wall_action",
-            "draw_boundary_action", "clear_boundaries_action", "ifc_origin_action",
+            "draw_boundary_action", "draw_polygon_boundary_action", "clear_boundaries_action", "ifc_origin_action",
             "rotate_left_action", "rotate_right_action", "reset_rotation_action", "save_plan_action", "load_plan_action",
         ):
             action = getattr(self, action_name, None)
@@ -4948,7 +5398,11 @@ class MainWindow(QMainWindow):
     def select_floor(self, name: str):
         if getattr(self, "wall_draw_mode", False) or getattr(self, "_wall_draw_start", None) is not None:
             self.cancel_user_wall_drawing()
-        if getattr(self, "boundary_draw_mode", False) or getattr(self, "_boundary_draw_start", None) is not None:
+        if (
+            getattr(self, "boundary_draw_mode", False)
+            or getattr(self, "_boundary_draw_start", None) is not None
+            or bool(getattr(self, "_boundary_polygon_points", []))
+        ):
             self.cancel_planner_boundary_drawing()
         # Avoid calling ``self.floors.get(...)`` directly. A previous settings/UI
         # change could accidentally shadow a ``get`` attribute with a numeric
