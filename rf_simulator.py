@@ -82,6 +82,10 @@ try:
     from shapely.geometry import LineString, Point, Polygon, box
     from shapely.ops import unary_union
     from shapely.affinity import affine_transform
+    try:
+        from shapely import concave_hull as shapely_concave_hull
+    except Exception:  # Shapely < 2.0
+        shapely_concave_hull = None
 except Exception as exc:  # pragma: no cover
     raise SystemExit("Install shapely: pip install shapely") from exc
 
@@ -117,6 +121,11 @@ class Wall2D:
     rf_customised: bool = False
     is_user_created: bool = False
     user_wall_thickness_m: float = 0.15
+    # RF-only geometry edits retained for compatibility with saved plans. The
+    # original polygon remains available so a plan can restore imported IFC
+    # geometry before applying any saved RF geometry override.
+    rf_geometry_customised: bool = False
+    rf_original_polygon: Optional[Polygon] = field(default=None, repr=False, compare=False)
 
     @property
     def label(self) -> str:
@@ -326,6 +335,11 @@ class AutoPlannerSettings:
     candidate_spacing_m: float = 6.0
     minimum_ap_spacing_m: float = 8.0
     maximum_aps: int = 64
+    # ``auto`` uses IfcSpace footprints when present and infers a planning
+    # footprint from walls when spaces have not been modelled. ``spaces``
+    # requires IfcSpace geometry; ``walls`` always uses the inferred footprint.
+    planning_area_mode: str = "auto"
+    wall_footprint_margin_m: float = 0.0
     expected_clients: int = 250
     clients_per_ap: int = 50
     keep_existing_aps: bool = True
@@ -356,6 +370,8 @@ class AutoPlannerSettings:
             "candidate_spacing_m": self.candidate_spacing_m,
             "minimum_ap_spacing_m": self.minimum_ap_spacing_m,
             "maximum_aps": self.maximum_aps,
+            "planning_area_mode": self.planning_area_mode,
+            "wall_footprint_margin_m": self.wall_footprint_margin_m,
             "expected_clients": self.expected_clients,
             "clients_per_ap": self.clients_per_ap,
             "keep_existing_aps": self.keep_existing_aps,
@@ -378,7 +394,15 @@ class AutoPlannerSettings:
         base.sample_spacing_m = max(0.5, float(data.get("sample_spacing_m", base.sample_spacing_m)))
         base.candidate_spacing_m = max(1.0, float(data.get("candidate_spacing_m", base.candidate_spacing_m)))
         base.minimum_ap_spacing_m = max(0.0, float(data.get("minimum_ap_spacing_m", base.minimum_ap_spacing_m)))
-        base.maximum_aps = max(1, int(data.get("maximum_aps", base.maximum_aps)))
+        base.maximum_aps = max(1, min(10_000, int(data.get("maximum_aps", base.maximum_aps))))
+        raw_area_mode = str(data.get("planning_area_mode", data.get("planner_area_mode", base.planning_area_mode))).strip().lower()
+        if raw_area_mode.startswith("space"):
+            base.planning_area_mode = "spaces"
+        elif raw_area_mode.startswith("wall") or raw_area_mode.startswith("floor"):
+            base.planning_area_mode = "walls"
+        else:
+            base.planning_area_mode = "auto"
+        base.wall_footprint_margin_m = max(0.0, min(100.0, float(data.get("wall_footprint_margin_m", base.wall_footprint_margin_m))))
         base.expected_clients = max(0, int(data.get("expected_clients", base.expected_clients)))
         base.clients_per_ap = max(1, int(data.get("clients_per_ap", base.clients_per_ap)))
         base.keep_existing_aps = bool(data.get("keep_existing_aps", base.keep_existing_aps))
@@ -1745,10 +1769,17 @@ def _ifc_local_placement_summary(product) -> Dict[str, float]:
 
 def _extract_ifc_origin_information(model, path: Path) -> Dict[str, object]:
     """Extract import origin, site orientation, true north and map CRS metadata."""
+    try:
+        import ifcopenshell.util.unit as ifc_unit_util
+        length_unit_scale_to_m = float(ifc_unit_util.calculate_unit_scale(model) or 1.0)
+    except Exception:
+        length_unit_scale_to_m = 1.0
+
     info: Dict[str, object] = {
         "file": path.name,
         "path": str(path),
         "schema": str(getattr(model, "schema", "")),
+        "length_unit_scale_to_m": length_unit_scale_to_m,
         "project": {},
         "sites": [],
         "buildings": [],
@@ -2049,7 +2080,14 @@ class AutoPlannerSettingsDialog(QDialog):
         self.sample_spacing = QDoubleSpinBox(); self.sample_spacing.setRange(0.5, 25.0); self.sample_spacing.setSuffix(" m"); self.sample_spacing.setValue(settings.sample_spacing_m)
         self.candidate_spacing = QDoubleSpinBox(); self.candidate_spacing.setRange(1.0, 50.0); self.candidate_spacing.setSuffix(" m"); self.candidate_spacing.setValue(settings.candidate_spacing_m)
         self.minimum_spacing = QDoubleSpinBox(); self.minimum_spacing.setRange(0.0, 100.0); self.minimum_spacing.setSuffix(" m"); self.minimum_spacing.setValue(settings.minimum_ap_spacing_m)
-        self.maximum_aps = QSpinBox(); self.maximum_aps.setRange(1, 1000); self.maximum_aps.setValue(settings.maximum_aps)
+        self.maximum_aps = QSpinBox(); self.maximum_aps.setRange(1, 10_000); self.maximum_aps.setValue(settings.maximum_aps)
+        self.area_mode = QComboBox()
+        self.area_mode.addItem("Automatic — use IFC spaces, otherwise infer from walls", "auto")
+        self.area_mode.addItem("IFC spaces only", "spaces")
+        self.area_mode.addItem("Infer floor footprint from IFC walls", "walls")
+        area_index = self.area_mode.findData(settings.planning_area_mode)
+        self.area_mode.setCurrentIndex(max(0, area_index))
+        self.wall_margin = QDoubleSpinBox(); self.wall_margin.setRange(0.0, 100.0); self.wall_margin.setDecimals(2); self.wall_margin.setSuffix(" m"); self.wall_margin.setValue(settings.wall_footprint_margin_m)
         self.expected_clients = QSpinBox(); self.expected_clients.setRange(0, 1000000); self.expected_clients.setValue(settings.expected_clients)
         self.clients_per_ap = QSpinBox(); self.clients_per_ap.setRange(1, 10000); self.clients_per_ap.setValue(settings.clients_per_ap)
         self.keep_existing = QCheckBox("Count and retain manually placed APs on this floor"); self.keep_existing.setChecked(settings.keep_existing_aps)
@@ -2060,13 +2098,15 @@ class AutoPlannerSettingsDialog(QDialog):
         form.addRow("Candidate AP spacing", self.candidate_spacing)
         form.addRow("Minimum AP separation", self.minimum_spacing)
         form.addRow("Maximum planned APs", self.maximum_aps)
+        form.addRow("Planning area source", self.area_mode)
+        form.addRow("Inferred wall-footprint margin", self.wall_margin)
         form.addRow("Expected connected clients", self.expected_clients)
         form.addRow("Maximum clients per AP", self.clients_per_ap)
         form.addRow(self.keep_existing)
         form.addRow(self.remove_planned)
         layout.addLayout(form)
 
-        note = QLabel("Spectrum occupancy reduces effective client capacity. Channels are allocated to minimise nearby co-channel reuse. Additional antenna gain is added to the selected pattern data.")
+        note = QLabel("Spectrum occupancy reduces effective client capacity. Channels are allocated to minimise nearby co-channel reuse. Additional antenna gain is added to the selected pattern data. When an IFC contains no IfcSpace objects, Automatic mode derives a floor footprint from imported wall geometry so APs can still be positioned.")
         note.setWordWrap(True)
         layout.addWidget(note)
 
@@ -2098,8 +2138,18 @@ class AutoPlannerSettingsDialog(QDialog):
         ]
         for col, value in enumerate(values):
             self.table.setItem(row, col, QTableWidgetItem(str(value)))
-        pattern = QComboBox(); pattern.addItems(self.pattern_names); pattern.setEditable(True); pattern.setCurrentText(radio.antenna_pattern)
+        # Do not retain a QTableWidgetItem underneath the live combo box. Some
+        # Qt styles paint both objects, which makes the pattern text appear
+        # duplicated/overlaid across the control.
+        self.table.takeItem(row, 3)
+        pattern = QComboBox()
+        pattern.addItems(self.pattern_names)
+        pattern.setEditable(True)
+        pattern.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        pattern.setMinimumContentsLength(18)
+        pattern.setCurrentText(radio.antenna_pattern)
         self.table.setCellWidget(row, 3, pattern)
+        self.table.setRowHeight(row, max(self.table.rowHeight(row), pattern.sizeHint().height() + 4))
 
     def _remove_selected(self):
         row = self.table.currentRow()
@@ -2131,6 +2181,8 @@ class AutoPlannerSettingsDialog(QDialog):
             target_coverage_percent=float(self.target.value()), coverage_mode=str(self.coverage_mode.currentData()),
             sample_spacing_m=float(self.sample_spacing.value()), candidate_spacing_m=float(self.candidate_spacing.value()),
             minimum_ap_spacing_m=float(self.minimum_spacing.value()), maximum_aps=int(self.maximum_aps.value()),
+            planning_area_mode=str(self.area_mode.currentData() or "auto"),
+            wall_footprint_margin_m=float(self.wall_margin.value()),
             expected_clients=int(self.expected_clients.value()), clients_per_ap=int(self.clients_per_ap.value()),
             keep_existing_aps=self.keep_existing.isChecked(), remove_previous_planned_aps=self.remove_planned.isChecked(),
             radio_requirements=radios,
@@ -2178,6 +2230,7 @@ class IFCOriginDialog(QDialog):
             lines.append(f"FILE: {info.get('file', key)}")
             lines.append(f"  Path: {info.get('path', '')}")
             lines.append(f"  Schema: {info.get('schema', '')}")
+            lines.append(f"  IFC length-unit scale: {float(info.get('length_unit_scale_to_m', 1.0) or 1.0):.12g} m/unit")
             project = info.get("project", {}) or {}
             lines.append(f"  Project: {project.get('name', '')}  [{project.get('global_id', '')}]")
             for label, collection in (("Site", info.get("sites", [])), ("Building", info.get("buildings", []))):
@@ -2225,7 +2278,13 @@ class WallGraphicsItem(QGraphicsPolygonItem):
 
     def contextMenuEvent(self, event):
         menu = QMenu()
+        self.setSelected(True)
         edit_action = menu.addAction("Edit wall type and attenuation…")
+        rotate_ifc_action = None
+        if not self.wall.is_user_created:
+            rotate_ifc_action = menu.addAction(
+                "Rotate IFC about insertion point so this wall is 0° to X-axis"
+            )
         reset_action = menu.addAction("Reset RF attenuation from IFC type/material")
         delete_action = None
         if self.wall.is_user_created:
@@ -2234,6 +2293,8 @@ class WallGraphicsItem(QGraphicsPolygonItem):
         chosen = menu.exec(event.screenPos())
         if chosen == edit_action:
             self.main.edit_wall_rf_properties(self.wall)
+        elif rotate_ifc_action is not None and chosen == rotate_ifc_action:
+            self.main.rotate_ifc_to_align_wall_with_x_axis(self.wall)
         elif chosen == reset_action:
             self.main.reset_wall_rf_properties(self.wall)
         elif delete_action is not None and chosen == delete_action:
@@ -2790,6 +2851,146 @@ class MainWindow(QMainWindow):
         self.populate_wall_table(); self.draw_floor()
         self.statusBar().showMessage(f"Updated RF attenuation for {wall.name or wall.guid}")
 
+    @staticmethod
+    def _wall_major_axis_angle_deg(polygon: Polygon) -> float:
+        """Return the dominant, unoriented plan angle of a wall polygon."""
+        if polygon is None or polygon.is_empty:
+            raise ValueError("The selected wall has no usable geometry.")
+        rectangle = polygon.minimum_rotated_rectangle
+        coords = list(rectangle.exterior.coords)
+        if len(coords) < 3:
+            raise ValueError("The selected wall has no usable axis.")
+        edges = []
+        for start, end in zip(coords, coords[1:]):
+            dx = float(end[0]) - float(start[0])
+            dy = float(end[1]) - float(start[1])
+            length = math.hypot(dx, dy)
+            if length > 1e-9:
+                edges.append((length, math.degrees(math.atan2(dy, dx))))
+        if not edges:
+            raise ValueError("The selected wall has no usable axis.")
+        return max(edges, key=lambda value: value[0])[1]
+
+    def _origin_information_for_wall(self, wall: Wall2D) -> Optional[Dict[str, object]]:
+        """Return imported origin metadata for the IFC that supplied ``wall``."""
+        source_name = Path(str(wall.source_file or "")).name.casefold()
+        if not source_name:
+            return None
+        for key, info in self.ifc_origin_info.items():
+            if not isinstance(info, dict):
+                continue
+            candidates = {
+                Path(str(key)).name.casefold(),
+                Path(str(info.get("path", ""))).name.casefold(),
+                Path(str(info.get("file", ""))).name.casefold(),
+            }
+            if source_name in candidates:
+                return info
+        return None
+
+    def _ifc_insertion_point_for_wall(self, wall: Wall2D) -> Tuple[float, float, str]:
+        """Return the selected IFC insertion point in current scene coordinates.
+
+        Site placement is preferred, followed by building placement and the
+        geometric representation context world origin. Placement coordinates
+        are converted to metres before the current IFC alignment is applied.
+        """
+        info = self._origin_information_for_wall(wall)
+        raw_x = raw_y = 0.0
+        source = "IFC model origin"
+        if info is not None:
+            try:
+                unit_scale = float(info.get("length_unit_scale_to_m", 1.0) or 1.0)
+            except Exception:
+                unit_scale = 1.0
+
+            placement = None
+            for collection_name, label in (("sites", "IfcSite placement"), ("buildings", "IfcBuilding placement")):
+                collection = info.get(collection_name, []) or []
+                if collection and isinstance(collection[0], dict):
+                    candidate = collection[0].get("placement", {})
+                    if isinstance(candidate, dict):
+                        placement = candidate
+                        source = label
+                        break
+            if placement is not None:
+                raw_x = float(placement.get("x", 0.0) or 0.0) * unit_scale
+                raw_y = float(placement.get("y", 0.0) or 0.0) * unit_scale
+            else:
+                for context in info.get("contexts", []) or []:
+                    if not isinstance(context, dict):
+                        continue
+                    origin = context.get("world_origin", [])
+                    if isinstance(origin, (list, tuple)) and len(origin) >= 2:
+                        raw_x = float(origin[0]) * unit_scale
+                        raw_y = float(origin[1]) * unit_scale
+                        source = "IFC world-coordinate origin"
+                        break
+
+        scene_x, scene_y = self.ifc_alignment.map_xy(raw_x, raw_y)
+        return float(scene_x), float(scene_y), source
+
+    @staticmethod
+    def _rotation_about_point_matrix(angle_deg: float, pivot_x: float, pivot_y: float) -> Tuple[float, float, float, float, float, float]:
+        """Return a Shapely affine matrix that rotates about ``pivot``."""
+        angle = math.radians(float(angle_deg))
+        cos_a = math.cos(angle)
+        sin_a = math.sin(angle)
+        return (
+            cos_a,
+            -sin_a,
+            sin_a,
+            cos_a,
+            float(pivot_x) - cos_a * float(pivot_x) + sin_a * float(pivot_y),
+            float(pivot_y) - sin_a * float(pivot_x) - cos_a * float(pivot_y),
+        )
+
+    def rotate_ifc_to_align_wall_with_x_axis(self, wall: Wall2D):
+        """Rotate the complete IFC model about its insertion point.
+
+        The selected imported wall becomes 0 degrees to model +X. All imported
+        walls, spaces, user RF walls and access points are transformed together
+        so RF geometry remains registered. The DXF overlay and display-only view
+        rotation are intentionally unchanged.
+        """
+        if wall.is_user_created:
+            QMessageBox.information(
+                self,
+                "Imported IFC wall required",
+                "Select a wall imported from an IFC file to define the IFC X-axis.",
+            )
+            return
+        try:
+            current_angle = self._wall_major_axis_angle_deg(wall.polygon)
+            # Wall axes are unoriented, so select the smallest equivalent turn.
+            delta = ((-current_angle + 90.0) % 180.0) - 90.0
+            pivot_x, pivot_y, pivot_source = self._ifc_insertion_point_for_wall(wall)
+            if abs(delta) <= 1e-9:
+                self.statusBar().showMessage(
+                    f"{wall.name or wall.guid} is already aligned to model X; "
+                    f"IFC insertion point ({pivot_source}) is ({pivot_x:.3f}, {pivot_y:.3f}) m."
+                )
+                return
+            delta_matrix = self._rotation_about_point_matrix(delta, pivot_x, pivot_y)
+            self.apply_ifc_delta_alignment(
+                delta_matrix,
+                status_prefix=(
+                    f"Rotated IFC {delta:.3f}° about {pivot_source} "
+                    f"({pivot_x:.3f}, {pivot_y:.3f}) m"
+                ),
+            )
+            self.last_result = None
+            self.rssi_results_by_frequency = {}
+            aligned_angle = self._wall_major_axis_angle_deg(wall.polygon)
+            aligned_error = ((aligned_angle + 90.0) % 180.0) - 90.0
+            self.statusBar().showMessage(
+                f"Rotated IFC {delta:.3f}° about {pivot_source} "
+                f"({pivot_x:.3f}, {pivot_y:.3f}) m; selected wall is "
+                f"{aligned_error:.6f}° to model X."
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "IFC rotation failed", str(exc))
+
     def reset_wall_rf_properties(self, wall: Wall2D):
         for instance in self._wall_instances(wall):
             instance.rf_type_override = ""
@@ -2820,18 +3021,75 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Predictive AP planner settings updated")
 
     def _planner_floor_area(self):
+        """Return the area sampled by the predictive planner.
+
+        IFC files frequently omit IfcSpace objects. In ``auto`` mode the
+        planner therefore uses spaces when available and otherwise derives a
+        practical footprint from the wall geometry. The inferred footprint is
+        only a planning mask: wall polygons still provide the RF attenuation
+        and candidate-point blocking behaviour.
+        """
         if not self.floor:
             return None
-        polygons = [space.polygon for space in self.floor.spaces if not space.polygon.is_empty]
-        if polygons:
+        settings = self.auto_planner_settings
+        mode = str(getattr(settings, "planning_area_mode", "auto") or "auto").lower()
+        spaces = [space.polygon for space in self.floor.spaces if space.polygon is not None and not space.polygon.is_empty]
+
+        if mode in {"auto", "spaces"} and spaces:
             try:
-                area = unary_union(polygons)
+                area = unary_union(spaces)
+                if not area.is_valid:
+                    area = area.buffer(0)
                 if not area.is_empty:
+                    self._planner_area_source_label = f"{len(spaces)} IFC space footprint(s)"
                     return area
             except Exception:
-                pass
-        minx, miny, maxx, maxy = RFEngine._floor_bounds(self.floor, [])
-        return box(minx, miny, maxx, maxy)
+                if mode == "spaces":
+                    return None
+        if mode == "spaces":
+            self._planner_area_source_label = "IFC spaces only (none available)"
+            return None
+
+        wall_polygons = [wall.polygon for wall in self.floor.walls if wall.polygon is not None and not wall.polygon.is_empty]
+        if not wall_polygons:
+            self._planner_area_source_label = "no IFC spaces or wall geometry"
+            return None
+        try:
+            wall_union = unary_union(wall_polygons)
+            if not wall_union.is_valid:
+                wall_union = wall_union.buffer(0)
+            if wall_union.is_empty:
+                return None
+
+            area = None
+            if shapely_concave_hull is not None:
+                try:
+                    area = shapely_concave_hull(wall_union, ratio=0.30, allow_holes=False)
+                except Exception:
+                    area = None
+            # A closed wall ring may be returned as the wall material itself
+            # rather than the enclosed floor. Detect that case and fill the
+            # footprint using the convex hull so samples fall inside the plan.
+            area_size = float(getattr(area, "area", 0.0)) if area is not None else 0.0
+            wall_material_size = float(getattr(wall_union, "area", 0.0))
+            if area is None or area.is_empty or area_size <= max(1e-9, wall_material_size * 1.05):
+                area = wall_union.convex_hull
+            if area is None or area.is_empty or float(getattr(area, "area", 0.0)) <= 1e-9:
+                minx, miny, maxx, maxy = wall_union.bounds
+                pad = max(0.5, float(getattr(settings, "candidate_spacing_m", 6.0)) / 2.0)
+                area = box(minx - pad, miny - pad, maxx + pad, maxy + pad)
+
+            margin = max(0.0, float(getattr(settings, "wall_footprint_margin_m", 0.0)))
+            if margin > 0.0:
+                area = area.buffer(margin, join_style=2)
+            if not area.is_valid:
+                area = area.buffer(0)
+            if area.is_empty:
+                return None
+            self._planner_area_source_label = f"footprint inferred from {len(wall_polygons)} IFC/RF wall polygon(s)"
+            return area
+        except Exception:
+            return None
 
     @staticmethod
     def _planner_tree_hits(tree, walls: List[Wall2D], geometry) -> List[Wall2D]:
@@ -2865,6 +3123,16 @@ class MainWindow(QMainWindow):
     def _planner_grid_points(self, area, spacing: float, tree, walls: List[Wall2D], limit: int) -> List[Tuple[float, float]]:
         minx, miny, maxx, maxy = area.bounds
         spacing = max(0.25, float(spacing))
+        # Avoid constructing an enormous intermediate grid merely to discard
+        # most of it. Treat the configured spacing as the preferred minimum
+        # and increase it only when the geometric area would exceed the point
+        # budget by a substantial amount.
+        try:
+            estimated_points = max(0.0, float(area.area)) / max(1e-9, spacing * spacing)
+            if limit > 0 and estimated_points > float(limit) * 1.25:
+                spacing *= math.sqrt(estimated_points / float(limit))
+        except Exception:
+            pass
         points: List[Tuple[float, float]] = []
         y = miny + spacing / 2.0
         while y <= maxy:
@@ -3013,7 +3281,14 @@ class MainWindow(QMainWindow):
         existing = [ap for ap in self.aps if ap.floor == self.floor.name and settings.keep_existing_aps]
         area = self._planner_floor_area()
         if area is None or area.is_empty:
-            QMessageBox.warning(self, "No plannable area", "No IFC spaces or usable floor bounds were found.")
+            if settings.planning_area_mode == "spaces":
+                message = (
+                    "This floor contains no usable IfcSpace geometry. Change Planning area source to "
+                    "Automatic or Infer floor footprint from IFC walls to plan APs without spaces."
+                )
+            else:
+                message = "No usable IFC space or wall geometry was found for the selected floor."
+            QMessageBox.warning(self, "No plannable area", message)
             return
         walls = list(self.floor.walls)
         try:
@@ -3023,7 +3298,14 @@ class MainWindow(QMainWindow):
             wall_tree = None
 
         samples = self._planner_grid_points(area, settings.sample_spacing_m, wall_tree, walls, 2500)
-        candidates = self._planner_grid_points(area, settings.candidate_spacing_m, wall_tree, walls, 450)
+        # The previous fixed 450-location cap prevented the planner from ever
+        # reaching the newly supported 10,000-AP limit. Scale the candidate
+        # budget with the configured maximum while retaining a practical lower
+        # bound for ordinary floor plans.
+        candidate_location_limit = min(10_000, max(450, int(settings.maximum_aps) * 2))
+        candidates = self._planner_grid_points(
+            area, settings.candidate_spacing_m, wall_tree, walls, candidate_location_limit
+        )
         # Include room representative points because they often place APs more naturally than a global grid.
         for space in self.floor.spaces:
             try:
@@ -3040,8 +3322,9 @@ class MainWindow(QMainWindow):
         directional = any(not req.antenna_pattern.lower().startswith("omni") for req in requirements)
         azimuths = list(range(0, 360, 45)) if directional else [0]
         candidate_specs = [(x, y, float(az)) for x, y in candidates for az in azimuths]
-        if len(candidate_specs) > 700:
-            indices = np.linspace(0, len(candidate_specs) - 1, 700, dtype=int)
+        candidate_spec_limit = min(20_000, max(700, int(settings.maximum_aps) * 2))
+        if len(candidate_specs) > candidate_spec_limit:
+            indices = np.linspace(0, len(candidate_specs) - 1, candidate_spec_limit, dtype=int)
             candidate_specs = [candidate_specs[int(i)] for i in indices]
 
         progress = QProgressDialog("Evaluating predictive AP locations…", "Cancel", 0, len(candidate_specs) + settings.maximum_aps, self)
@@ -3119,8 +3402,14 @@ class MainWindow(QMainWindow):
                 progress.setValue(len(candidate_specs) + len(selected)); QApplication.processEvents()
 
             new_aps: List[AccessPoint] = []
+            used_names = {ap.name for ap in self.aps}
+            next_name_index = 1
             for candidate_ap, _ in selected:
-                candidate_ap.name = self._next_ap_name()
+                while f"AP-{next_name_index}" in used_names:
+                    next_name_index += 1
+                candidate_ap.name = f"AP-{next_name_index}"
+                used_names.add(candidate_ap.name)
+                next_name_index += 1
                 candidate_ap.tx_power_dbm = candidate_ap.radios[0].tx_power_dbm
                 candidate_ap.frequency_mhz = candidate_ap.radios[0].frequency_mhz
                 candidate_ap.antenna_pattern = candidate_ap.radios[0].antenna_pattern
@@ -3156,6 +3445,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self, "Predictive AP plan complete",
             f"Added {len(new_aps)} predicted AP(s) on {self.floor.name}.\n"
+            f"Planning area: {getattr(self, '_planner_area_source_label', 'selected floor geometry')}.\n"
             f"Overall coverage ({'every band' if settings.coverage_mode == 'all' else 'any band'}): {overall_pct:.1f}%\n"
             f"Effective client capacity after {average_occupancy:.1f}% average spectrum occupancy: approximately {available_capacity} clients.\n\n"
             + "\n".join(band_lines) + warning,
@@ -3207,11 +3497,16 @@ class MainWindow(QMainWindow):
                         "attenuation_by_band_db": {str(k): float(v) for k, v in wall.attenuation_by_band_db.items()},
                         "thickness_m": wall.user_wall_thickness_m,
                     })
-                elif wall.rf_customised:
-                    overrides.append({
-                        "guid": wall.guid, "source_file": wall.source_file, "rf_type_override": wall.rf_type_override,
+                elif wall.rf_customised or wall.rf_geometry_customised:
+                    override = {
+                        "guid": wall.guid, "source_file": wall.source_file, "floor": wall.floor,
+                        "rf_type_override": wall.rf_type_override, "rf_customised": wall.rf_customised,
                         "attenuation_by_band_db": {str(k): float(v) for k, v in wall.attenuation_by_band_db.items()},
-                    })
+                        "rf_geometry_customised": wall.rf_geometry_customised,
+                    }
+                    if wall.rf_geometry_customised:
+                        override["polygon"] = [[float(x), float(y)] for x, y in wall.polygon.exterior.coords]
+                    overrides.append(override)
         return {
             "format": "rf-attenuation-plan", "version": 1,
             "ifc_paths": [str(path) for path in self.loaded_ifc_paths],
@@ -3264,18 +3559,38 @@ class MainWindow(QMainWindow):
         for floor in self.floors.values():
             floor.walls = [wall for wall in floor.walls if not wall.is_user_created]
             for wall in floor.walls:
+                if wall.rf_original_polygon is not None:
+                    wall.polygon = wall.rf_original_polygon
+                wall.rf_original_polygon = None
+                wall.rf_geometry_customised = False
                 wall.rf_customised = False; wall.rf_type_override = ""
                 wall.attenuation_by_band_db = self._profile_for_wall_from_settings(wall)
-        override_lookup = {
+        override_lookup_exact = {
+            (str(item.get("source_file", "")), str(item.get("guid", "")), str(item.get("floor", ""))): item
+            for item in data.get("wall_overrides", []) if isinstance(item, dict) and str(item.get("floor", ""))
+        }
+        override_lookup_legacy = {
             (str(item.get("source_file", "")), str(item.get("guid", ""))): item
             for item in data.get("wall_overrides", []) if isinstance(item, dict)
         }
         for floor in self.floors.values():
             for wall in floor.walls:
-                item = override_lookup.get((wall.source_file, wall.guid))
+                item = override_lookup_exact.get((wall.source_file, wall.guid, wall.floor))
+                if item is None:
+                    item = override_lookup_legacy.get((wall.source_file, wall.guid))
                 if item:
-                    wall.rf_type_override = str(item.get("rf_type_override", "")); wall.rf_customised = True
+                    wall.rf_type_override = str(item.get("rf_type_override", ""))
+                    wall.rf_customised = bool(item.get("rf_customised", bool(wall.rf_type_override)))
                     wall.attenuation_by_band_db.update({float(k): float(v) for k, v in dict(item.get("attenuation_by_band_db", {})).items()})
+                    coords = item.get("polygon", [])
+                    if bool(item.get("rf_geometry_customised", False)) and isinstance(coords, list) and len(coords) >= 3:
+                        polygon = Polygon([(float(value[0]), float(value[1])) for value in coords])
+                        if not polygon.is_valid:
+                            polygon = polygon.buffer(0)
+                        if not polygon.is_empty:
+                            wall.rf_original_polygon = wall.polygon
+                            wall.polygon = polygon
+                            wall.rf_geometry_customised = True
         for item in data.get("user_walls", []):
             if not isinstance(item, dict): continue
             floor = self.floors.get(str(item.get("floor", "")))
@@ -3777,6 +4092,8 @@ class MainWindow(QMainWindow):
         for floor in self.floors.values():
             for wall in floor.walls:
                 wall.polygon = affine_transform(wall.polygon, delta)
+                if wall.rf_original_polygon is not None:
+                    wall.rf_original_polygon = affine_transform(wall.rf_original_polygon, delta)
             for space in floor.spaces:
                 space.polygon = affine_transform(space.polygon, delta)
         for ap in self.aps:

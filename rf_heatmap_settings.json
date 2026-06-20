@@ -279,7 +279,7 @@
     "exterior",
     "outer",
     "facade",
-    "fa\u00e7ade",
+    "façade",
     "curtain",
     "envelope",
     "perimeter"
@@ -388,7 +388,9 @@
         "minimum_rssi_dbm": -67,
         "cutoff_radius_m": 30
       }
-    ]
+    ],
+    "planning_area_mode": "auto",
+    "wall_footprint_margin_m": 0.0
   },
   "user_wall_default_type": "partition",
   "user_wall_default_thickness_m": 0.15
