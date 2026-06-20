@@ -338,6 +338,10 @@ class PlannerRadioRequirement:
 class AutoPlannerSettings:
     target_coverage_percent: float = 95.0
     coverage_mode: str = "all"  # all selected frequencies, or any selected frequency
+    handover_enabled: bool = True
+    target_handover_percent: float = 20.0
+    handover_margin_db: float = 3.0
+    prefer_non_overlapping_handover_channels: bool = True
     sample_spacing_m: float = 3.0
     candidate_spacing_m: float = 6.0
     minimum_ap_spacing_m: float = 8.0
@@ -375,6 +379,10 @@ class AutoPlannerSettings:
         return {
             "target_coverage_percent": self.target_coverage_percent,
             "coverage_mode": self.coverage_mode,
+            "handover_enabled": self.handover_enabled,
+            "target_handover_percent": self.target_handover_percent,
+            "handover_margin_db": self.handover_margin_db,
+            "prefer_non_overlapping_handover_channels": self.prefer_non_overlapping_handover_channels,
             "sample_spacing_m": self.sample_spacing_m,
             "candidate_spacing_m": self.candidate_spacing_m,
             "minimum_ap_spacing_m": self.minimum_ap_spacing_m,
@@ -400,6 +408,12 @@ class AutoPlannerSettings:
                 base.radio_requirements = parsed
         base.target_coverage_percent = max(1.0, min(100.0, float(data.get("target_coverage_percent", base.target_coverage_percent))))
         base.coverage_mode = "any" if str(data.get("coverage_mode", base.coverage_mode)).lower().startswith("any") else "all"
+        base.handover_enabled = bool(data.get("handover_enabled", base.handover_enabled))
+        base.target_handover_percent = max(0.0, min(100.0, float(data.get("target_handover_percent", base.target_handover_percent))))
+        base.handover_margin_db = max(0.0, min(30.0, float(data.get("handover_margin_db", base.handover_margin_db))))
+        base.prefer_non_overlapping_handover_channels = bool(data.get(
+            "prefer_non_overlapping_handover_channels", base.prefer_non_overlapping_handover_channels
+        ))
         base.sample_spacing_m = max(0.5, float(data.get("sample_spacing_m", base.sample_spacing_m)))
         base.candidate_spacing_m = max(1.0, float(data.get("candidate_spacing_m", base.candidate_spacing_m)))
         base.minimum_ap_spacing_m = max(0.0, float(data.get("minimum_ap_spacing_m", base.minimum_ap_spacing_m)))
@@ -2098,6 +2112,18 @@ class AutoPlannerSettingsDialog(QDialog):
         form = QFormLayout()
         self.target = QDoubleSpinBox(); self.target.setRange(1.0, 100.0); self.target.setSuffix(" %"); self.target.setValue(settings.target_coverage_percent)
         self.coverage_mode = QComboBox(); self.coverage_mode.addItem("Each selected frequency", "all"); self.coverage_mode.addItem("Any selected frequency", "any"); self.coverage_mode.setCurrentIndex(1 if settings.coverage_mode == "any" else 0)
+        self.handover_enabled = QCheckBox("Require overlapping service from a second AP for handover")
+        self.handover_enabled.setChecked(settings.handover_enabled)
+        self.handover_target = QDoubleSpinBox(); self.handover_target.setRange(0.0, 100.0); self.handover_target.setSuffix(" %"); self.handover_target.setValue(settings.target_handover_percent)
+        self.handover_margin = QDoubleSpinBox(); self.handover_margin.setRange(0.0, 30.0); self.handover_margin.setSuffix(" dB"); self.handover_margin.setValue(settings.handover_margin_db)
+        self.handover_channels = QCheckBox("Prefer non-overlapping channels where AP handover coverage overlaps")
+        self.handover_channels.setChecked(settings.prefer_non_overlapping_handover_channels)
+        self.handover_enabled.toggled.connect(self.handover_target.setEnabled)
+        self.handover_enabled.toggled.connect(self.handover_margin.setEnabled)
+        self.handover_enabled.toggled.connect(self.handover_channels.setEnabled)
+        self.handover_target.setEnabled(settings.handover_enabled)
+        self.handover_margin.setEnabled(settings.handover_enabled)
+        self.handover_channels.setEnabled(settings.handover_enabled)
         self.sample_spacing = QDoubleSpinBox(); self.sample_spacing.setRange(0.5, 25.0); self.sample_spacing.setSuffix(" m"); self.sample_spacing.setValue(settings.sample_spacing_m)
         self.candidate_spacing = QDoubleSpinBox(); self.candidate_spacing.setRange(1.0, 50.0); self.candidate_spacing.setSuffix(" m"); self.candidate_spacing.setValue(settings.candidate_spacing_m)
         self.minimum_spacing = QDoubleSpinBox(); self.minimum_spacing.setRange(0.0, 100.0); self.minimum_spacing.setSuffix(" m"); self.minimum_spacing.setValue(settings.minimum_ap_spacing_m)
@@ -2116,6 +2142,10 @@ class AutoPlannerSettingsDialog(QDialog):
         self.remove_planned = QCheckBox("Replace APs created by the previous planner run"); self.remove_planned.setChecked(settings.remove_previous_planned_aps)
         form.addRow("Target floor coverage", self.target)
         form.addRow("Frequency coverage rule", self.coverage_mode)
+        form.addRow(self.handover_enabled)
+        form.addRow("Target handover overlap", self.handover_target)
+        form.addRow("Secondary AP RSSI allowance", self.handover_margin)
+        form.addRow(self.handover_channels)
         form.addRow("Coverage sample spacing", self.sample_spacing)
         form.addRow("Candidate AP spacing", self.candidate_spacing)
         form.addRow("Minimum AP separation", self.minimum_spacing)
@@ -2128,7 +2158,7 @@ class AutoPlannerSettingsDialog(QDialog):
         form.addRow(self.remove_planned)
         layout.addLayout(form)
 
-        note = QLabel("Spectrum occupancy reduces effective client capacity. Channels are allocated to minimise nearby co-channel reuse. Additional antenna gain is added to the selected pattern data. Shared rectangular and polygon planner boundaries apply to every IFC floor and are always a hard placement limit. When an IFC contains no IfcSpace objects, Automatic mode uses those boundaries first and falls back to an inferred wall footprint only when none have been drawn.")
+        note = QLabel("AP positions are selected from simulated RSSI values: the planner prioritises the samples with the largest dB shortfall instead of relying only on geometric spacing. When handover is enabled, a sample contributes to the handover target only when a second distinct AP reaches the configured secondary threshold. The second AP may use a different channel; channel allocation prefers non-overlapping channels in shared coverage areas. Spectrum occupancy reduces effective client capacity. Shared rectangular and polygon planner boundaries apply to every IFC floor and remain a hard placement limit.")
         note.setWordWrap(True)
         layout.addWidget(note)
 
@@ -2201,6 +2231,10 @@ class AutoPlannerSettingsDialog(QDialog):
             raise ValueError("At least one radio requirement is required.")
         return AutoPlannerSettings(
             target_coverage_percent=float(self.target.value()), coverage_mode=str(self.coverage_mode.currentData()),
+            handover_enabled=self.handover_enabled.isChecked(),
+            target_handover_percent=float(self.handover_target.value()),
+            handover_margin_db=float(self.handover_margin.value()),
+            prefer_non_overlapping_handover_channels=self.handover_channels.isChecked(),
             sample_spacing_m=float(self.sample_spacing.value()), candidate_spacing_m=float(self.candidate_spacing.value()),
             minimum_ap_spacing_m=float(self.minimum_spacing.value()), maximum_aps=int(self.maximum_aps.value()),
             planning_area_mode=str(self.area_mode.currentData() or "auto"),
@@ -3846,21 +3880,84 @@ class MainWindow(QMainWindow):
             return np.logical_or.reduce(masks)
         return np.logical_and.reduce(masks)
 
-    def _planner_ap_masks(self, ap: AccessPoint, requirements: List[PlannerRadioRequirement], samples: List[Tuple[float, float]], wall_tree, walls: List[Wall2D]) -> List[np.ndarray]:
-        masks: List[np.ndarray] = []
+    def _planner_ap_rssi_values(self, ap: AccessPoint, requirements: List[PlannerRadioRequirement], samples: List[Tuple[float, float]], wall_tree, walls: List[Wall2D]) -> List[np.ndarray]:
+        """Return the strongest RSSI from one physical AP for each required band.
+
+        Multiple radios in the same band still count as one AP for handover. This
+        prevents two radios fitted to one chassis from being mistaken for two
+        independently located handover cells.
+        """
+        disconnected = float(self.heatmap_settings.disconnected_rssi_dbm)
+        values_by_radio: List[np.ndarray] = []
         for requirement in requirements:
             matching = [
                 radio for radio in ap.active_radios()
                 if abs(float(radio.frequency_mhz) - float(requirement.frequency_mhz)) < 1.0
             ]
-            values = np.zeros(len(samples), dtype=bool)
+            values = np.full(len(samples), disconnected, dtype=np.float32)
             for radio in matching:
-                for idx, (x, y) in enumerate(samples):
-                    if values[idx]:
-                        continue
-                    values[idx] = self._planner_rssi(x, y, ap, radio, wall_tree, walls) >= requirement.minimum_rssi_dbm
-            masks.append(values)
-        return masks
+                radio_values = np.fromiter(
+                    (self._planner_rssi(x, y, ap, radio, wall_tree, walls) for x, y in samples),
+                    dtype=np.float32, count=len(samples),
+                )
+                np.maximum(values, radio_values, out=values)
+            values_by_radio.append(values)
+        return values_by_radio
+
+    def _planner_ap_masks(self, ap: AccessPoint, requirements: List[PlannerRadioRequirement], samples: List[Tuple[float, float]], wall_tree, walls: List[Wall2D]) -> List[np.ndarray]:
+        values_by_radio = self._planner_ap_rssi_values(ap, requirements, samples, wall_tree, walls)
+        return [
+            values >= float(requirement.minimum_rssi_dbm)
+            for requirement, values in zip(requirements, values_by_radio)
+        ]
+
+    @staticmethod
+    def _planner_insert_rssi(
+        strongest: np.ndarray, second_strongest: np.ndarray, candidate: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Insert one AP's RSSI into the strongest/second-strongest arrays."""
+        candidate = np.asarray(candidate, dtype=np.float32)
+        stronger = candidate >= strongest
+        new_strongest = np.where(stronger, candidate, strongest)
+        new_second = np.where(stronger, strongest, np.maximum(second_strongest, candidate))
+        return new_strongest.astype(np.float32, copy=False), new_second.astype(np.float32, copy=False)
+
+    @staticmethod
+    def _planner_rssi_deficit(
+        values_by_radio: List[np.ndarray], requirements: List[PlannerRadioRequirement],
+        mode: str, threshold_margin_db: float = 0.0,
+    ) -> np.ndarray:
+        """Return per-sample dB shortfall against the configured RSSI targets."""
+        if not values_by_radio:
+            return np.zeros(0, dtype=np.float32)
+        deficits = np.vstack([
+            np.maximum(
+                0.0,
+                float(requirement.minimum_rssi_dbm) - float(threshold_margin_db) - values,
+            )
+            for requirement, values in zip(requirements, values_by_radio)
+        ]).astype(np.float32, copy=False)
+        if str(mode).lower() == "any":
+            return np.min(deficits, axis=0)
+        return np.sum(deficits, axis=0)
+
+    def _planner_top_rssi_masks(
+        self, strongest_by_radio: List[np.ndarray], second_by_radio: List[np.ndarray],
+        requirements: List[PlannerRadioRequirement], settings: AutoPlannerSettings, sample_count: int,
+    ) -> Tuple[List[np.ndarray], List[np.ndarray], np.ndarray, np.ndarray]:
+        coverage_by_radio = [
+            strongest >= float(requirement.minimum_rssi_dbm)
+            for requirement, strongest in zip(requirements, strongest_by_radio)
+        ]
+        secondary_by_radio = [
+            second >= float(requirement.minimum_rssi_dbm) - float(settings.handover_margin_db)
+            for requirement, second in zip(requirements, second_by_radio)
+        ]
+        overall = self._combine_frequency_masks(coverage_by_radio, settings.coverage_mode, sample_count)
+        handover = self._combine_frequency_masks(secondary_by_radio, settings.coverage_mode, sample_count)
+        # Handover is meaningful only where the primary service requirement is met.
+        handover = handover & overall
+        return coverage_by_radio, secondary_by_radio, overall, handover
 
     def _next_ap_name(self) -> str:
         used = {ap.name for ap in self.aps}
@@ -3896,33 +3993,89 @@ class MainWindow(QMainWindow):
         separation = abs(center_a - center_b)
         return max(0.0, 1.0 - separation / half_total)
 
-    def _assign_planner_channels(self, new_aps: List[AccessPoint], requirements: List[PlannerRadioRequirement]):
+    def _assign_planner_channels(
+        self, new_aps: List[AccessPoint], requirements: List[PlannerRadioRequirement],
+        samples: Optional[List[Tuple[float, float]]] = None, wall_tree=None,
+        walls: Optional[List[Wall2D]] = None,
+    ):
+        """Assign channels, strongly avoiding co-channel reuse in handover overlap.
+
+        Handover coverage deliberately counts distinct APs irrespective of channel.
+        This assignment pass then prefers non-overlapping channels between APs
+        whose usable RF cells overlap, allowing clients to roam between channels.
+        """
+        if not new_aps:
+            return
+        walls = walls or []
         new_ids = {id(ap) for ap in new_aps}
-        assigned = [ap for ap in self.aps if id(ap) not in new_ids]
+        target_floor = new_aps[0].floor
+        assigned = [
+            ap for ap in self.aps
+            if id(ap) not in new_ids and ap.floor == target_floor
+        ]
+        overlap_mask_cache: Dict[Tuple[int, int], np.ndarray] = {}
+
+        def overlap_mask(ap: AccessPoint, req_index: int) -> Optional[np.ndarray]:
+            if not samples:
+                return None
+            key = (id(ap), req_index)
+            cached = overlap_mask_cache.get(key)
+            if cached is not None:
+                return cached
+            requirement = requirements[req_index]
+            values = self._planner_ap_rssi_values(
+                ap, [requirement], samples, wall_tree, walls
+            )[0]
+            threshold = float(requirement.minimum_rssi_dbm) - float(self.auto_planner_settings.handover_margin_db)
+            cached = values >= threshold
+            overlap_mask_cache[key] = cached
+            return cached
+
         for ap in new_aps:
-            for req, radio in zip(requirements, ap.radios):
+            for req_index, (req, radio) in enumerate(zip(requirements, ap.radios)):
                 channels = list(req.channels) or [""]
                 best_channel = channels[0]
                 best_cost = float("inf")
-                radius = req.cutoff_radius_m or float(self.heatmap_settings.ap_cutoff_radius_by_frequency_m.get(req.frequency_mhz, 35.0))
+                radius = req.cutoff_radius_m or float(
+                    self.heatmap_settings.ap_cutoff_radius_by_frequency_m.get(req.frequency_mhz, 35.0)
+                )
+                candidate_mask = overlap_mask(ap, req_index)
                 for channel in channels:
                     cost = 0.0
                     for other in assigned:
                         distance = math.hypot(ap.x - other.x, ap.y - other.y)
-                        if distance > max(radius * 1.5, 10.0):
+                        if distance > max(radius * 2.0, 15.0):
                             continue
                         for other_radio in other.active_radios():
                             if abs(other_radio.frequency_mhz - req.frequency_mhz) >= 1.0 or not str(other_radio.channel):
                                 continue
-                            overlap = self._channel_overlap_fraction(
+                            spectral_overlap = self._channel_overlap_fraction(
                                 req.frequency_mhz, str(channel), req.channel_width_mhz,
                                 str(other_radio.channel), float(other_radio.channel_width_mhz),
                             )
-                            if overlap > 0.0:
-                                cost += overlap * (1.0 + req.spectrum_occupancy_percent / 100.0) / max(distance, 1.0)
+                            if spectral_overlap <= 0.0:
+                                continue
+                            occupancy_weight = 1.0 + req.spectrum_occupancy_percent / 100.0
+                            spatial_weight = 1.0 / max(distance, 1.0)
+                            if (
+                                self.auto_planner_settings.prefer_non_overlapping_handover_channels
+                                and candidate_mask is not None
+                            ):
+                                other_mask = overlap_mask(other, req_index)
+                                if other_mask is not None:
+                                    shared = int(np.count_nonzero(candidate_mask & other_mask))
+                                    if shared > 0:
+                                        union = int(np.count_nonzero(candidate_mask | other_mask))
+                                        shared_fraction = shared / max(1, union)
+                                        # Shared usable cells dominate simple distance: these
+                                        # are exactly the cells in which a client may roam.
+                                        spatial_weight += 20.0 * shared_fraction
+                            cost += spectral_overlap * occupancy_weight * spatial_weight
                     if cost < best_cost:
-                        best_cost = cost; best_channel = channel
+                        best_cost = cost
+                        best_channel = channel
                 radio.channel = str(best_channel)
+                overlap_mask_cache.pop((id(ap), req_index), None)
             assigned.append(ap)
 
     def run_auto_planner(self):
@@ -3965,15 +4118,12 @@ class MainWindow(QMainWindow):
             wall_tree = None
 
         samples = self._planner_grid_points(area, settings.sample_spacing_m, wall_tree, walls, 2500)
-        # The previous fixed 450-location cap prevented the planner from ever
-        # reaching the newly supported 10,000-AP limit. Scale the candidate
-        # budget with the configured maximum while retaining a practical lower
-        # bound for ordinary floor plans.
         candidate_location_limit = min(10_000, max(450, int(settings.maximum_aps) * 2))
         candidates = self._planner_grid_points(
             area, settings.candidate_spacing_m, wall_tree, walls, candidate_location_limit
         )
-        # Include room representative points because they often place APs more naturally than a global grid.
+        # Room representative points supplement the global grid, but boundaries
+        # remain a hard limit even when IfcSpace geometry is present.
         for space in self.floor.spaces:
             try:
                 point = space.polygon.representative_point()
@@ -4002,15 +4152,25 @@ class MainWindow(QMainWindow):
             indices = np.linspace(0, len(candidate_specs) - 1, candidate_spec_limit, dtype=int)
             candidate_specs = [candidate_specs[int(i)] for i in indices]
 
-        progress = QProgressDialog("Evaluating predictive AP locations…", "Cancel", 0, len(candidate_specs) + settings.maximum_aps, self)
-        progress.setWindowTitle("Predictive AP planner"); progress.setWindowModality(Qt.WindowModal); progress.setMinimumDuration(0); progress.show()
+        progress = QProgressDialog("Evaluating RSSI-driven AP locations…", "Cancel", 0, len(candidate_specs) + settings.maximum_aps, self)
+        progress.setWindowTitle("Predictive AP planner")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
 
-        covered_by_radio = [np.zeros(len(samples), dtype=bool) for _ in requirements]
+        disconnected = float(self.heatmap_settings.disconnected_rssi_dbm)
+        strongest_by_radio = [np.full(len(samples), disconnected, dtype=np.float32) for _ in requirements]
+        second_by_radio = [np.full(len(samples), disconnected, dtype=np.float32) for _ in requirements]
         for ap in existing:
-            masks = self._planner_ap_masks(ap, requirements, samples, wall_tree, walls)
-            covered_by_radio = [current | mask for current, mask in zip(covered_by_radio, masks)]
+            ap_values = self._planner_ap_rssi_values(ap, requirements, samples, wall_tree, walls)
+            updated = [
+                self._planner_insert_rssi(strongest, second, values)
+                for strongest, second, values in zip(strongest_by_radio, second_by_radio, ap_values)
+            ]
+            strongest_by_radio = [pair[0] for pair in updated]
+            second_by_radio = [pair[1] for pair in updated]
 
-        candidate_records = []
+        candidate_records: List[Tuple[AccessPoint, List[np.ndarray]]] = []
         try:
             for idx, (x, y, azimuth) in enumerate(candidate_specs):
                 if progress.wasCanceled():
@@ -4027,13 +4187,28 @@ class MainWindow(QMainWindow):
                     mount_height_m=float(self.mount_height.value()), rx_height_m=float(self.rx_height.value()),
                     max_clients=settings.clients_per_ap, planned=True,
                 )
-                radio_masks = self._planner_ap_masks(temp_ap, requirements, samples, wall_tree, walls)
-                candidate_records.append((temp_ap, radio_masks))
+                # float16 keeps the RSSI candidate cache practical on large
+                # plans while retaining far more precision than RF assumptions.
+                rssi_values = [
+                    values.astype(np.float16)
+                    for values in self._planner_ap_rssi_values(temp_ap, requirements, samples, wall_tree, walls)
+                ]
+                candidate_records.append((temp_ap, rssi_values))
                 progress.setValue(idx + 1)
-                if idx % 5 == 0: QApplication.processEvents()
+                if idx % 5 == 0:
+                    QApplication.processEvents()
 
-            overall = self._combine_frequency_masks(covered_by_radio, settings.coverage_mode, len(samples))
+            coverage_by_radio, secondary_by_radio, overall, handover_overall = self._planner_top_rssi_masks(
+                strongest_by_radio, second_by_radio, requirements, settings, len(samples)
+            )
+            coverage_deficit = self._planner_rssi_deficit(
+                strongest_by_radio, requirements, settings.coverage_mode
+            )
+            handover_deficit = self._planner_rssi_deficit(
+                second_by_radio, requirements, settings.coverage_mode, settings.handover_margin_db
+            )
             target_fraction = settings.target_coverage_percent / 100.0
+            handover_target_fraction = settings.target_handover_percent / 100.0
             average_occupancy = sum(req.spectrum_occupancy_percent for req in requirements) / len(requirements)
             effective_clients = max(1.0, settings.clients_per_ap * max(0.05, 1.0 - average_occupancy / 100.0))
             capacity_ap_count = int(math.ceil(settings.expected_clients / effective_clients)) if settings.expected_clients > 0 else 0
@@ -4043,38 +4218,96 @@ class MainWindow(QMainWindow):
 
             while remaining and len(selected) < settings.maximum_aps:
                 coverage_fraction = float(np.count_nonzero(overall)) / max(1, len(overall))
+                handover_fraction = float(np.count_nonzero(handover_overall)) / max(1, len(handover_overall))
                 total_capacity_aps = len(existing) + len(selected)
-                if coverage_fraction >= target_fraction and total_capacity_aps >= capacity_ap_count:
+                coverage_needed = coverage_fraction + 1e-12 < target_fraction
+                handover_needed = (
+                    settings.handover_enabled
+                    and handover_fraction + 1e-12 < handover_target_fraction
+                )
+                capacity_needed = total_capacity_aps < capacity_ap_count
+                if not coverage_needed and not handover_needed and not capacity_needed:
                     break
-                best_index = None; best_score = -1.0
-                coverage_needed = coverage_fraction < target_fraction
+
+                best_index = None
+                best_score = -float("inf")
+                best_state = None
                 for record_index in remaining:
-                    candidate_ap, radio_masks = candidate_records[record_index]
+                    candidate_ap, candidate_rssi = candidate_records[record_index]
                     if positions:
-                        min_distance = min(math.hypot(candidate_ap.x - px, candidate_ap.y - py) for px, py in positions)
+                        min_distance = min(
+                            math.hypot(candidate_ap.x - px, candidate_ap.y - py)
+                            for px, py in positions
+                        )
                         if min_distance + 1e-9 < settings.minimum_ap_spacing_m:
                             continue
                     else:
                         min_distance = settings.minimum_ap_spacing_m
-                    proposed_by_radio = [current | mask for current, mask in zip(covered_by_radio, radio_masks)]
-                    proposed_overall = self._combine_frequency_masks(proposed_by_radio, settings.coverage_mode, len(samples))
-                    overall_gain = int(np.count_nonzero(proposed_overall & ~overall))
-                    band_gain = sum(int(np.count_nonzero(mask & ~current)) for mask, current in zip(radio_masks, covered_by_radio))
+
+                    inserted = [
+                        self._planner_insert_rssi(strongest, second, values)
+                        for strongest, second, values in zip(strongest_by_radio, second_by_radio, candidate_rssi)
+                    ]
+                    proposed_strongest = [pair[0] for pair in inserted]
+                    proposed_second = [pair[1] for pair in inserted]
+                    proposed_coverage_by_radio, proposed_secondary_by_radio, proposed_overall, proposed_handover = self._planner_top_rssi_masks(
+                        proposed_strongest, proposed_second, requirements, settings, len(samples)
+                    )
+                    proposed_coverage_deficit = self._planner_rssi_deficit(
+                        proposed_strongest, requirements, settings.coverage_mode
+                    )
+                    coverage_db_gain = float(np.sum(coverage_deficit - proposed_coverage_deficit))
+                    newly_covered = int(np.count_nonzero(proposed_overall & ~overall))
+
+                    proposed_handover_deficit = self._planner_rssi_deficit(
+                        proposed_second, requirements, settings.coverage_mode, settings.handover_margin_db
+                    )
+                    handover_db_gain = float(np.sum(handover_deficit - proposed_handover_deficit))
+                    newly_handover = int(np.count_nonzero(proposed_handover & ~handover_overall))
+
+                    if (coverage_needed or handover_needed) and coverage_db_gain <= 1e-6 and handover_db_gain <= 1e-6:
+                        continue
+
+                    # The dominant terms are measured dB-deficit reductions.
+                    # Threshold crossings reward completing usable service and
+                    # dual-AP handover cells, while distance is only a tie-break.
+                    score = 0.0
                     if coverage_needed:
-                        score = overall_gain * 1000.0 + band_gain * 10.0 + min_distance
+                        score += coverage_db_gain * 20.0 + newly_covered * 250.0
                     else:
-                        # Coverage is met but client capacity requires more APs: spread them across covered demand.
-                        score = min_distance * 10.0 + sum(int(np.count_nonzero(mask)) for mask in radio_masks) / max(1, len(samples))
+                        score += coverage_db_gain * 2.0
+                    if handover_needed:
+                        score += handover_db_gain * 12.0 + newly_handover * 160.0
+                    elif settings.handover_enabled:
+                        score += handover_db_gain * 1.0
+                    if capacity_needed and not coverage_needed and not handover_needed:
+                        mean_margin = float(np.mean(np.maximum(0.0, proposed_strongest[0] - strongest_by_radio[0])))
+                        score += min_distance * 10.0 + mean_margin
+                    else:
+                        score += min_distance * 0.01
+
                     if score > best_score:
-                        best_score = score; best_index = record_index
-                if best_index is None:
+                        best_score = score
+                        best_index = record_index
+                        best_state = (
+                            proposed_strongest, proposed_second,
+                            proposed_coverage_by_radio, proposed_secondary_by_radio,
+                            proposed_overall, proposed_handover,
+                            proposed_coverage_deficit, proposed_handover_deficit,
+                        )
+
+                if best_index is None or best_state is None:
                     break
-                candidate_ap, radio_masks = candidate_records[best_index]
-                selected.append((candidate_ap, radio_masks)); positions.append((candidate_ap.x, candidate_ap.y))
-                covered_by_radio = [current | mask for current, mask in zip(covered_by_radio, radio_masks)]
-                overall = self._combine_frequency_masks(covered_by_radio, settings.coverage_mode, len(samples))
+                candidate_ap, candidate_rssi = candidate_records[best_index]
+                selected.append((candidate_ap, candidate_rssi))
+                positions.append((candidate_ap.x, candidate_ap.y))
+                (
+                    strongest_by_radio, second_by_radio, coverage_by_radio, secondary_by_radio,
+                    overall, handover_overall, coverage_deficit, handover_deficit,
+                ) = best_state
                 remaining.remove(best_index)
-                progress.setValue(len(candidate_specs) + len(selected)); QApplication.processEvents()
+                progress.setValue(len(candidate_specs) + len(selected))
+                QApplication.processEvents()
 
             new_aps: List[AccessPoint] = []
             used_names = {ap.name for ap in self.aps}
@@ -4088,8 +4321,11 @@ class MainWindow(QMainWindow):
                 candidate_ap.tx_power_dbm = candidate_ap.radios[0].tx_power_dbm
                 candidate_ap.frequency_mhz = candidate_ap.radios[0].frequency_mhz
                 candidate_ap.antenna_pattern = candidate_ap.radios[0].antenna_pattern
-                self.aps.append(candidate_ap); new_aps.append(candidate_ap)
-            self._assign_planner_channels(new_aps, requirements)
+                self.aps.append(candidate_ap)
+                new_aps.append(candidate_ap)
+            self._assign_planner_channels(
+                new_aps, requirements, samples=samples, wall_tree=wall_tree, walls=walls
+            )
 
         except RuntimeError as exc:
             progress.close()
@@ -4102,27 +4338,43 @@ class MainWindow(QMainWindow):
         finally:
             progress.close()
 
-        self.last_result = None; self.rssi_results_by_frequency = {}
+        self.last_result = None
+        self.rssi_results_by_frequency = {}
         self._refresh_rssi_frequency_dropdown()
-        self.populate_ap_table(); self.draw_floor()
+        self.populate_ap_table()
+        self.draw_floor()
         overall_pct = 100.0 * float(np.count_nonzero(overall)) / max(1, len(overall))
+        handover_pct = 100.0 * float(np.count_nonzero(handover_overall)) / max(1, len(handover_overall))
         band_lines = []
-        for req, mask in zip(requirements, covered_by_radio):
-            pct = 100.0 * float(np.count_nonzero(mask)) / max(1, len(mask))
-            band_lines.append(f"{req.name} ({req.frequency_mhz:g} MHz): {pct:.1f}% at ≥ {req.minimum_rssi_dbm:g} dBm")
+        for req, coverage_mask, handover_mask in zip(requirements, coverage_by_radio, secondary_by_radio):
+            pct = 100.0 * float(np.count_nonzero(coverage_mask)) / max(1, len(coverage_mask))
+            overlap_pct = 100.0 * float(np.count_nonzero(handover_mask & coverage_mask)) / max(1, len(coverage_mask))
+            band_lines.append(
+                f"{req.name} ({req.frequency_mhz:g} MHz): {pct:.1f}% at ≥ {req.minimum_rssi_dbm:g} dBm; "
+                f"{overlap_pct:.1f}% with a second AP at ≥ {req.minimum_rssi_dbm - settings.handover_margin_db:g} dBm"
+            )
         available_capacity = int((len(existing) + len(new_aps)) * effective_clients)
         warnings = []
         if overall_pct + 1e-6 < settings.target_coverage_percent:
-            warnings.append("The coverage target was not fully achievable with the configured AP limit, spacing, radio patterns and wall losses.")
+            warnings.append("The RSSI coverage target was not fully achievable with the configured AP limit, spacing, radio patterns and wall losses.")
+        if settings.handover_enabled and handover_pct + 1e-6 < settings.target_handover_percent:
+            warnings.append("The dual-AP handover overlap target was not fully achievable. Reduce minimum AP spacing, increase the AP limit, or review transmit power and wall attenuation.")
         if available_capacity < settings.expected_clients:
             warnings.append(f"The estimated effective capacity ({available_capacity}) is below the expected {settings.expected_clients} clients.")
         warning = ("\n\n" + "\n".join(warnings)) if warnings else ""
+        handover_summary = (
+            f"Handover overlap (second distinct AP, channel-independent): {handover_pct:.1f}% "
+            f"against a {settings.target_handover_percent:.1f}% target.\n"
+            if settings.handover_enabled else
+            "Handover overlap requirement: disabled.\n"
+        )
         QMessageBox.information(
             self, "Predictive AP plan complete",
-            f"Added {len(new_aps)} predicted AP(s) on {self.floor.name}.\n"
+            f"Added {len(new_aps)} RSSI-predicted AP(s) on {self.floor.name}.\n"
             f"Planning area: {getattr(self, '_planner_area_source_label', 'selected floor geometry')}.\n"
             f"Overall coverage ({'every band' if settings.coverage_mode == 'all' else 'any band'}): {overall_pct:.1f}%\n"
-            f"Effective client capacity after {average_occupancy:.1f}% average spectrum occupancy: approximately {available_capacity} clients.\n\n"
+            + handover_summary
+            + f"Effective client capacity after {average_occupancy:.1f}% average spectrum occupancy: approximately {available_capacity} clients.\n\n"
             + "\n".join(band_lines) + warning,
         )
 

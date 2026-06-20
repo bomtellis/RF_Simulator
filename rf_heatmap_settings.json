@@ -279,7 +279,7 @@
     "exterior",
     "outer",
     "facade",
-    "façade",
+    "fa\u00e7ade",
     "curtain",
     "envelope",
     "perimeter"
@@ -390,7 +390,11 @@
       }
     ],
     "planning_area_mode": "auto",
-    "wall_footprint_margin_m": 0.0
+    "wall_footprint_margin_m": 0.0,
+    "handover_enabled": true,
+    "target_handover_percent": 20.0,
+    "handover_margin_db": 3.0,
+    "prefer_non_overlapping_handover_channels": true
   },
   "user_wall_default_type": "partition",
   "user_wall_default_thickness_m": 0.15
