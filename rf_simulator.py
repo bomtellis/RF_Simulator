@@ -42,6 +42,7 @@ from PySide6.QtCore import QPointF, Qt, Slot, QTimer, QSize
 from PySide6.QtGui import QAction, QColor, QBrush, QFont, QPen, QPolygonF, QPainterPath, QPalette, QTransform, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -542,16 +543,30 @@ class IFCElement2D:
     z_max: float = 0.0
     source_storey: str = ""
     projected_to_floor: bool = False
-    # Doors and windows are imported as context elements, but also act as RF
-    # barriers. The host-wall reference prevents the opening and its wall from
-    # being counted together when the radio path passes through the opening.
-    rf_category: str = ""
+    # Every imported IfcElement can carry an RF attenuation profile. Doors and
+    # windows additionally replace their host wall at the opening, while other
+    # element categories add their own loss when the 3D radio path crosses the
+    # element volume. Zero-loss categories remain visual context only until the
+    # user assigns attenuation through the bulk type manager.
+    ifc_class: str = "IfcElement"
+    rf_category: str = "other"
     host_wall_guid: str = ""
     attenuation_by_band_db: Dict[float, float] = field(default_factory=dict)
+    rf_type_override: str = ""
+    rf_customised: bool = False
 
     @property
     def is_rf_opening(self) -> bool:
-        return self.rf_category in {"door", "window"} and bool(self.attenuation_by_band_db)
+        return self.rf_category in {"door", "window"} and self.is_rf_barrier
+
+    @property
+    def is_rf_barrier(self) -> bool:
+        return any(abs(float(value)) > 1e-9 for value in self.attenuation_by_band_db.values())
+
+    @property
+    def label(self) -> str:
+        key = self.rf_type_override or self.type_name or self.material or self.ifc_class or "IFC element"
+        return f"{key} | {self.name or self.guid[:8]}"
 
     def attenuation_db_for_frequency(self, frequency_mhz: float) -> float:
         if not self.attenuation_by_band_db:
@@ -691,6 +706,34 @@ class HeatmapSettings:
         "low e": {433.0: 3.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 14.0, 6000.0: 18.0},
         "metallised": {433.0: 4.0, 868.0: 6.0, 2400.0: 10.0, 5000.0: 16.0, 6000.0: 20.0},
         "metalized": {433.0: 4.0, 868.0: 6.0, 2400.0: 10.0, 5000.0: 16.0, 6000.0: 20.0},
+    })
+    # Generic IFC elements are available to the RF model by type. Building
+    # fabric and structural categories receive conservative defaults; furniture,
+    # MEP and unclassified items default to zero so a detailed IFC does not
+    # accidentally accumulate unrealistic loss. The bulk attenuation manager can
+    # activate or override any category/type across the complete project.
+    default_ifc_element_attenuation_by_type_db: Dict[str, Dict[float, float]] = field(default_factory=lambda: {
+        "default": {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0},
+        "slab": {433.0: 8.0, 868.0: 10.0, 2400.0: 12.0, 5000.0: 18.0, 6000.0: 22.0},
+        "roof": {433.0: 5.0, 868.0: 7.0, 2400.0: 9.0, 5000.0: 13.0, 6000.0: 16.0},
+        "column": {433.0: 3.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 12.0, 6000.0: 15.0},
+        "beam": {433.0: 2.0, 868.0: 4.0, 2400.0: 6.0, 5000.0: 9.0, 6000.0: 12.0},
+        "curtain_wall": {433.0: 1.0, 868.0: 2.0, 2400.0: 3.0, 5000.0: 5.0, 6000.0: 7.0},
+        "covering": {433.0: 0.5, 868.0: 0.8, 2400.0: 1.0, 5000.0: 1.5, 6000.0: 2.0},
+        "plate": {433.0: 2.0, 868.0: 3.0, 2400.0: 5.0, 5000.0: 8.0, 6000.0: 10.0},
+        "member": {433.0: 1.0, 868.0: 2.0, 2400.0: 3.0, 5000.0: 5.0, 6000.0: 7.0},
+        "concrete": {433.0: 5.0, 868.0: 7.0, 2400.0: 12.0, 5000.0: 16.0, 6000.0: 20.0},
+        "brick": {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 11.0, 6000.0: 14.0},
+        "glass": {433.0: 1.0, 868.0: 2.0, 2400.0: 3.0, 5000.0: 5.0, 6000.0: 7.0},
+        "metal": {433.0: 12.0, 868.0: 16.0, 2400.0: 20.0, 5000.0: 28.0, 6000.0: 35.0},
+        "steel": {433.0: 12.0, 868.0: 16.0, 2400.0: 20.0, 5000.0: 28.0, 6000.0: 35.0},
+        "furniture": {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0},
+        "equipment": {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0},
+        "distribution": {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0},
+        "proxy": {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0},
+        "transport": {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0},
+        "assembly": {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0},
+        "other": {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0},
     })
     default_ap_radios: List[Dict[str, object]] = field(default_factory=lambda: [
         {"name": "2.4 GHz", "frequency_mhz": 2400.0, "tx_power_dbm": 20.0, "antenna_pattern": "Omni ceiling AP", "enabled": True, "cutoff_radius_m": 45.0, "antenna_gain_dbi": 0.0, "channel": "1", "channel_width_mhz": 20.0, "spectrum_occupancy_percent": 35.0},
@@ -899,6 +942,10 @@ class HeatmapSettings:
         settings.default_window_attenuation_by_material_db = _material_profile_dict(
             data.get("default_window_attenuation_by_material_db", data.get("window_attenuation_by_material_db", {})),
             settings.default_window_attenuation_by_material_db,
+        )
+        settings.default_ifc_element_attenuation_by_type_db = _material_profile_dict(
+            data.get("default_ifc_element_attenuation_by_type_db", data.get("ifc_element_attenuation_by_type_db", {})),
+            settings.default_ifc_element_attenuation_by_type_db,
         )
         raw_radios = data.get("default_ap_radios", settings.default_ap_radios)
         if isinstance(raw_radios, list):
@@ -1162,12 +1209,20 @@ class IFCModelLoader:
             if poly is None or poly.area <= 0:
                 continue
             assigned_floor = self._assigned_floor_name(element, floors, z_min, z_max, source_floor)
-            floor_names = [assigned_floor]
             mat = self._material_name(element)
             type_name = self._type_name(element)
-            rf_category = "door" if element.is_a("IfcDoor") else ("window" if element.is_a("IfcWindow") else "")
-            host_wall_guid = self._host_wall_guid_for_filling(element) if rf_category else ""
-            opening_profile = self._default_opening_attenuation_profile(rf_category, mat, type_name) if rf_category else {}
+            ifc_class = str(element.is_a() or "IfcElement")
+            rf_category = self._rf_category_for_element(element)
+            vertical_categories = {"column", "pile", "member", "stair", "ramp", "assembly", "proxy", "distribution", "transport"}
+            if rf_category in vertical_categories and float(z_max) - float(z_min) > 2.8:
+                floor_names = self._floor_names_for_z_span(floors, z_min, z_max, assigned_floor)
+            else:
+                floor_names = [assigned_floor]
+            host_wall_guid = self._host_wall_guid_for_filling(element) if rf_category in {"door", "window"} else ""
+            if rf_category in {"door", "window"}:
+                element_profile = self._default_opening_attenuation_profile(rf_category, mat, type_name)
+            else:
+                element_profile = self._default_ifc_element_attenuation_profile(rf_category, mat, type_name, ifc_class)
             for floor_name in floor_names:
                 floors.setdefault(floor_name, FloorModel(name=floor_name, elevation=0.0)).elements.append(
                     IFCElement2D(
@@ -1181,9 +1236,11 @@ class IFCModelLoader:
                         z_min=z_min,
                         z_max=z_max,
                         source_storey=source_floor or "",
+                        projected_to_floor=(floor_name != assigned_floor),
+                        ifc_class=ifc_class,
                         rf_category=rf_category,
                         host_wall_guid=host_wall_guid,
-                        attenuation_by_band_db=dict(opening_profile),
+                        attenuation_by_band_db=dict(element_profile),
                     )
                 )
 
@@ -1522,6 +1579,56 @@ class IFCModelLoader:
         except Exception:
             pass
         return ""
+
+    @staticmethod
+    def _rf_category_for_element(element) -> str:
+        """Return a stable RF category for any imported IfcElement."""
+        checks = (
+            ("IfcDoor", "door"), ("IfcWindow", "window"), ("IfcSlab", "slab"),
+            ("IfcRoof", "roof"), ("IfcColumn", "column"), ("IfcBeam", "beam"),
+            ("IfcCurtainWall", "curtain_wall"), ("IfcCovering", "covering"),
+            ("IfcPlate", "plate"), ("IfcMember", "member"), ("IfcPile", "pile"),
+            ("IfcFooting", "footing"), ("IfcStair", "stair"), ("IfcRamp", "ramp"),
+            ("IfcRailing", "railing"), ("IfcFurnishingElement", "furniture"),
+            ("IfcBuildingElementProxy", "proxy"), ("IfcDistributionElement", "distribution"),
+            ("IfcTransportElement", "transport"), ("IfcElementAssembly", "assembly"),
+        )
+        for ifc_name, category in checks:
+            try:
+                if element.is_a(ifc_name):
+                    return category
+            except Exception:
+                continue
+        class_name = str(getattr(element, "is_a", lambda: "IfcElement")() or "IfcElement")
+        lowered = class_name.lower()
+        if "equipment" in lowered or "terminal" in lowered or "device" in lowered:
+            return "equipment"
+        return "other"
+
+    @staticmethod
+    def _default_ifc_element_attenuation_profile(category: str, material: str, type_name: str, ifc_class: str = "") -> Dict[float, float]:
+        """Conservative defaults for non-wall IFC element categories."""
+        text = f"{category} {material} {type_name} {ifc_class}".lower()
+        if category in {"distribution", "equipment", "furniture", "proxy", "transport", "assembly", "other"}:
+            return {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0}
+        if "metal" in text or "steel" in text:
+            return {433.0: 12.0, 868.0: 16.0, 2400.0: 20.0, 5000.0: 28.0, 6000.0: 35.0}
+        if "concrete" in text or "block" in text:
+            return {433.0: 5.0, 868.0: 7.0, 2400.0: 12.0, 5000.0: 16.0, 6000.0: 20.0}
+        if "brick" in text or "masonry" in text:
+            return {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 11.0, 6000.0: 14.0}
+        if "glass" in text or category == "curtain_wall":
+            return {433.0: 1.0, 868.0: 2.0, 2400.0: 3.0, 5000.0: 5.0, 6000.0: 7.0}
+        category_profiles = {
+            "slab": {433.0: 8.0, 868.0: 10.0, 2400.0: 12.0, 5000.0: 18.0, 6000.0: 22.0},
+            "roof": {433.0: 5.0, 868.0: 7.0, 2400.0: 9.0, 5000.0: 13.0, 6000.0: 16.0},
+            "column": {433.0: 3.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 12.0, 6000.0: 15.0},
+            "beam": {433.0: 2.0, 868.0: 4.0, 2400.0: 6.0, 5000.0: 9.0, 6000.0: 12.0},
+            "covering": {433.0: 0.5, 868.0: 0.8, 2400.0: 1.0, 5000.0: 1.5, 6000.0: 2.0},
+            "plate": {433.0: 2.0, 868.0: 3.0, 2400.0: 5.0, 5000.0: 8.0, 6000.0: 10.0},
+            "member": {433.0: 1.0, 868.0: 2.0, 2400.0: 3.0, 5000.0: 5.0, 6000.0: 7.0},
+        }
+        return dict(category_profiles.get(category, {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0}))
 
     @staticmethod
     def _default_opening_attenuation_profile(category: str, material: str, type_name: str) -> Dict[float, float]:
@@ -1896,26 +2003,31 @@ class RFEngine:
 
         line = LineString([(ap.x, ap.y), (x, y)])
         wall_loss = 0.0
-        opening_loss = 0.0
+        element_loss = 0.0
         checked_wall_guids = set()
-        checked_opening_guids = set()
-        # Include walls and RF-active openings on every floor crossed by the 3D
-        # path. A door/window replaces its host wall at that crossing rather
-        # than adding both losses together. The vertical opening extent is also
-        # checked so a ray above a door or below/above a window still sees wall.
+        checked_element_guids = set()
+        crossed_slabs: List[IFCElement2D] = []
+        # Include walls and every active IFC barrier on each floor crossed by the
+        # 3D path. Doors/windows replace their host wall. Other elements add loss
+        # only when the path height intersects their actual vertical extent.
         for path_floor in RFEngine.floors_between_inclusive(receiver_floor, ap_floor, floors):
             active_openings: List[IFCElement2D] = []
-            for opening in RFEngine._openings_intersecting_line(path_floor, line, opening_indexes):
-                opening_key = opening.guid or f"{opening.source_file}:{opening.name}:{opening.z_min:.3f}:{opening.z_max:.3f}"
-                if opening_key in checked_opening_guids:
+            for element in RFEngine._openings_intersecting_line(path_floor, line, opening_indexes):
+                element_key = element.guid or f"{element.source_file}:{element.name}:{element.z_min:.3f}:{element.z_max:.3f}"
+                if element_key in checked_element_guids:
                     continue
-                if not opening.polygon.intersects(line):
+                if not element.polygon.intersects(line):
                     continue
-                if not RFEngine._opening_intersects_3d_path(opening, line, ap_z, rx_z):
+                if not RFEngine._element_intersects_3d_path(element, line, ap_z, rx_z):
                     continue
-                opening_loss += opening.attenuation_db_for_frequency(radio.frequency_mhz)
-                checked_opening_guids.add(opening_key)
-                active_openings.append(opening)
+                checked_element_guids.add(element_key)
+                if element.rf_category in {"door", "window"}:
+                    active_openings.append(element)
+                    element_loss += element.attenuation_db_for_frequency(radio.frequency_mhz)
+                elif element.rf_category in {"slab", "roof"}:
+                    crossed_slabs.append(element)
+                else:
+                    element_loss += element.attenuation_db_for_frequency(radio.frequency_mhz)
 
             for wall in RFEngine._walls_intersecting_line(path_floor, line, wall_indexes):
                 wall_key = wall.guid or f"{wall.source_file}:{wall.name}:{wall.z_min:.3f}:{wall.z_max:.3f}"
@@ -1926,8 +2038,10 @@ class RFEngine:
                 wall_loss += wall.attenuation_db_for_frequency(radio.frequency_mhz)
                 checked_wall_guids.add(wall_key)
 
-        floor_loss = RFEngine.floor_penetration_loss_db(receiver_floor, ap_floor, floors, radio.frequency_mhz)
-        return radio.tx_power_dbm + pattern_gain + float(getattr(radio, "antenna_gain_dbi", 0.0) or 0.0) - path_loss - wall_loss - opening_loss - floor_loss
+        floor_loss = RFEngine.floor_penetration_loss_db(
+            receiver_floor, ap_floor, floors, radio.frequency_mhz, crossed_slabs
+        )
+        return radio.tx_power_dbm + pattern_gain + float(getattr(radio, "antenna_gain_dbi", 0.0) or 0.0) - path_loss - wall_loss - element_loss - floor_loss
 
     @staticmethod
     def floors_between_inclusive(receiver_floor: FloorModel, ap_floor: FloorModel, floors: Dict[str, FloorModel]) -> List[FloorModel]:
@@ -1943,7 +2057,13 @@ class RFEngine:
         return ordered[lo:hi + 1]
 
     @staticmethod
-    def floor_penetration_loss_db(receiver_floor: FloorModel, ap_floor: FloorModel, floors: Dict[str, FloorModel], frequency_mhz: float) -> float:
+    def floor_penetration_loss_db(
+        receiver_floor: FloorModel,
+        ap_floor: FloorModel,
+        floors: Dict[str, FloorModel],
+        frequency_mhz: float,
+        slab_elements: Optional[List[IFCElement2D]] = None,
+    ) -> float:
         if receiver_floor.name == ap_floor.name:
             return 0.0
         ordered = sorted(floors.values(), key=lambda f: (f.elevation, f.name))
@@ -1951,15 +2071,33 @@ class RFEngine:
             rx_i = next(i for i, f in enumerate(ordered) if f.name == receiver_floor.name)
             ap_i = next(i for i, f in enumerate(ordered) if f.name == ap_floor.name)
         except StopIteration:
-            # Fallback when floor references are incomplete: one slab loss per
-            # approximate 3.5 m of vertical separation, minimum one slab.
             crossed = max(1, int(round(abs(receiver_floor.elevation - ap_floor.elevation) / 3.5)))
             return crossed * receiver_floor.slab_attenuation_db_for_frequency(frequency_mhz)
         lo, hi = sorted((rx_i, ap_i))
-        crossed_boundaries = ordered[lo + 1:hi + 1]
-        if not crossed_boundaries:
-            crossed_boundaries = [receiver_floor]
-        return sum(f.slab_attenuation_db_for_frequency(frequency_mhz) for f in crossed_boundaries)
+        crossed_boundaries = ordered[lo + 1:hi + 1] or [receiver_floor]
+        candidates = list(slab_elements or [])
+        total = 0.0
+        used = set()
+        for boundary in crossed_boundaries:
+            boundary_z = float(boundary.elevation)
+            matches = []
+            for element in candidates:
+                identity = (element.source_file, element.guid, element.floor)
+                if identity in used:
+                    continue
+                z_min = min(float(element.z_min), float(element.z_max))
+                z_max = max(float(element.z_min), float(element.z_max))
+                centre = (z_min + z_max) / 2.0
+                distance = 0.0 if z_min - 0.35 <= boundary_z <= z_max + 0.35 else abs(centre - boundary_z)
+                if distance <= 1.25:
+                    matches.append((distance, -element.attenuation_db_for_frequency(frequency_mhz), identity, element))
+            if matches:
+                _, _, identity, element = min(matches)
+                used.add(identity)
+                total += element.attenuation_db_for_frequency(frequency_mhz)
+            else:
+                total += boundary.slab_attenuation_db_for_frequency(frequency_mhz)
+        return total
 
     @staticmethod
     def _active_radio_links(
@@ -2033,7 +2171,7 @@ class RFEngine:
         for floor in floors.values():
             openings = [
                 element for element in (getattr(floor, "elements", []) or [])
-                if getattr(element, "is_rf_opening", False)
+                if getattr(element, "is_rf_barrier", False)
                 and element.polygon is not None
                 and not element.polygon.is_empty
             ]
@@ -2074,25 +2212,50 @@ class RFEngine:
                     pass
         return [
             element for element in (getattr(floor, "elements", []) or [])
-            if getattr(element, "is_rf_opening", False)
+            if getattr(element, "is_rf_barrier", False)
         ]
 
     @staticmethod
-    def _opening_intersects_3d_path(opening: IFCElement2D, line: LineString, ap_z: float, rx_z: float) -> bool:
+    def _element_intersects_3d_path(element: IFCElement2D, line: LineString, ap_z: float, rx_z: float) -> bool:
+        """Return True when the link crosses the element footprint and z-span."""
         try:
-            intersection = opening.polygon.intersection(line)
+            intersection = element.polygon.intersection(line)
             if intersection.is_empty:
                 return False
-            point = intersection.centroid
             horizontal_length = float(line.length)
-            fraction = 0.0 if horizontal_length <= 1e-9 else max(0.0, min(1.0, float(line.project(point)) / horizontal_length))
-            path_z = float(ap_z) + fraction * (float(rx_z) - float(ap_z))
+            if horizontal_length <= 1e-9:
+                fractions = [0.0]
+            else:
+                points = []
+                geom_type = getattr(intersection, "geom_type", "")
+                if geom_type == "Point":
+                    points = [intersection]
+                elif geom_type in {"MultiPoint", "GeometryCollection"}:
+                    points = [value for value in getattr(intersection, "geoms", []) if getattr(value, "geom_type", "") == "Point"]
+                elif geom_type in {"LineString", "LinearRing"}:
+                    coords = list(intersection.coords)
+                    points = [Point(coords[0]), Point(coords[-1]), intersection.centroid] if coords else [intersection.centroid]
+                elif geom_type == "MultiLineString":
+                    for part in getattr(intersection, "geoms", []):
+                        coords = list(part.coords)
+                        if coords:
+                            points.extend([Point(coords[0]), Point(coords[-1]), part.centroid])
+                if not points:
+                    points = [intersection.centroid]
+                fractions = [max(0.0, min(1.0, float(line.project(point)) / horizontal_length)) for point in points]
+            z_values = [float(ap_z) + fraction * (float(rx_z) - float(ap_z)) for fraction in fractions]
+            path_min = min(z_values); path_max = max(z_values)
+            element_min = min(float(element.z_min), float(element.z_max))
+            element_max = max(float(element.z_min), float(element.z_max))
             tolerance = 0.12
-            return float(opening.z_min) - tolerance <= path_z <= float(opening.z_max) + tolerance
+            return path_max >= element_min - tolerance and path_min <= element_max + tolerance
         except Exception:
-            # If an IFC exporter gives unusable vertical metadata, retaining the
-            # 2D opening is preferable to silently ignoring all door/window loss.
+            # Retain 2D attenuation for exporters with unusable vertical metadata.
             return True
+
+    @staticmethod
+    def _opening_intersects_3d_path(opening: IFCElement2D, line: LineString, ap_z: float, rx_z: float) -> bool:
+        return RFEngine._element_intersects_3d_path(opening, line, ap_z, rx_z)
 
     @staticmethod
     def _opening_replaces_wall(opening: IFCElement2D, wall: Wall2D) -> bool:
@@ -2120,7 +2283,7 @@ class RFEngine:
         heatmap_settings: Optional[HeatmapSettings] = None,
         progress_callback=None,
     ) -> Optional[SimulationResult]:
-        if not floor.walls and not floor.spaces:
+        if not floor.walls and not floor.spaces and not getattr(floor, "elements", []):
             return None
         if not aps:
             return None
@@ -2187,6 +2350,10 @@ class RFEngine:
     @staticmethod
     def _floor_bounds(floor: FloorModel, aps: List[AccessPoint]) -> Tuple[float, float, float, float]:
         bounds = [w.polygon.bounds for w in floor.walls] + [s.polygon.bounds for s in floor.spaces]
+        bounds += [
+            element.polygon.bounds for element in getattr(floor, "elements", [])
+            if getattr(element, "polygon", None) is not None and not element.polygon.is_empty
+        ]
         if not bounds:
             bounds = [(0.0, 0.0, 1.0, 1.0)]
         for ap in aps:
@@ -2922,6 +3089,434 @@ class WallAttenuationDialog(QDialog):
         return self.type_combo.currentText().strip(), attenuation
 
 
+class IFCElementAttenuationDialog(WallAttenuationDialog):
+    """Individual RF editor for any imported non-wall IFC element."""
+
+    def __init__(self, parent, element: IFCElement2D, bands: List[float], profiles: Dict[str, Dict[float, float]]):
+        super().__init__(parent, element, bands, profiles)
+        self.setWindowTitle("IFC element RF type and attenuation")
+
+
+class BulkIFCAttenuationDialog(QDialog):
+    """Edit one RF profile per unique IFC category/type/material group."""
+
+    def __init__(
+        self,
+        parent,
+        groups: List[Dict[str, object]],
+        bands: List[float],
+        profiles: Dict[str, Dict[float, float]],
+        current_floor_name: str = "",
+    ):
+        super().__init__(parent)
+        self.groups = list(groups)
+        self.bands = [float(value) for value in bands]
+        self.profiles = dict(profiles)
+        self.setWindowTitle("Bulk IFC attenuation by type")
+        self.resize(1180, 680)
+
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "Each row represents one unique IFC element type rather than every instance. "
+            "Use Ctrl-click or Shift-click to highlight multiple rows, then apply one preset "
+            "or a shared set of frequency attenuation values to the complete selection. "
+            "The Apply checkbox is set automatically for edited rows. Walls, doors, windows, "
+            "slabs, roofs, structural objects and all other imported IFC elements are available. "
+            "Zero dB leaves an element as visual context only."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        controls = QHBoxLayout()
+        self.current_floor_only = QCheckBox(
+            f"Apply only to matching instances on {current_floor_name}" if current_floor_name else "Apply only to current floor"
+        )
+        controls.addWidget(self.current_floor_only)
+        controls.addStretch(1)
+        controls.addWidget(QLabel("Selection category"))
+        self.category_combo = QComboBox()
+        categories = sorted({str(group.get("category", "Other")) for group in self.groups})
+        self.category_combo.addItem("All categories")
+        self.category_combo.addItems(categories)
+        controls.addWidget(self.category_combo)
+        select_category = QPushButton("Select category")
+        select_category.clicked.connect(self._select_category)
+        controls.addWidget(select_category)
+        select_all = QPushButton("Select all")
+        select_all.clicked.connect(lambda: self._set_all_checked(True))
+        controls.addWidget(select_all)
+        clear_all = QPushButton("Clear selection")
+        clear_all.clicked.connect(lambda: self._set_all_checked(False))
+        controls.addWidget(clear_all)
+        layout.addLayout(controls)
+
+        preset_controls = QHBoxLayout()
+        preset_controls.addWidget(QLabel("Attenuation preset"))
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItems(sorted(self.profiles.keys()))
+        preset_controls.addWidget(self.preset_combo, 1)
+        preset_button = QPushButton("Apply preset to highlighted / checked rows")
+        preset_button.clicked.connect(self._apply_preset_to_checked)
+        preset_controls.addWidget(preset_button)
+        zero_button = QPushButton("Set highlighted / checked rows to 0 dB")
+        zero_button.clicked.connect(self._zero_checked)
+        preset_controls.addWidget(zero_button)
+        layout.addLayout(preset_controls)
+
+        multi_frame = QFrame()
+        multi_frame.setFrameShape(QFrame.StyledPanel)
+        multi_layout = QVBoxLayout(multi_frame)
+        multi_layout.setContentsMargins(8, 6, 8, 6)
+        multi_header = QHBoxLayout()
+        multi_title = QLabel("<b>Shared values for highlighted rows</b>")
+        multi_header.addWidget(multi_title)
+        multi_header.addStretch(1)
+        self.multi_selection_label = QLabel("0 rows highlighted")
+        multi_header.addWidget(self.multi_selection_label)
+        multi_layout.addLayout(multi_header)
+
+        type_layout = QHBoxLayout()
+        self.multi_type_enabled = QCheckBox("Set RF type")
+        type_layout.addWidget(self.multi_type_enabled)
+        self.multi_type_combo = QComboBox()
+        self.multi_type_combo.setEditable(True)
+        known_types = sorted(
+            {str(group.get("display_type", "")).strip() for group in self.groups if str(group.get("display_type", "")).strip()}
+            | {str(name).split(" / ", 1)[-1] for name in self.profiles.keys()}
+        )
+        self.multi_type_combo.addItems(known_types)
+        type_layout.addWidget(self.multi_type_combo, 1)
+        multi_layout.addLayout(type_layout)
+
+        band_grid = QGridLayout()
+        self.multi_band_enabled: Dict[float, QCheckBox] = {}
+        self.multi_band_values: Dict[float, QDoubleSpinBox] = {}
+        for column, band in enumerate(self.bands):
+            enabled = QCheckBox(self._frequency_label(band))
+            enabled.setChecked(True)
+            value = QDoubleSpinBox()
+            value.setRange(-200.0, 500.0)
+            value.setDecimals(3)
+            value.setSingleStep(0.5)
+            value.setSuffix(" dB")
+            self.multi_band_enabled[float(band)] = enabled
+            self.multi_band_values[float(band)] = value
+            band_grid.addWidget(enabled, 0, column)
+            band_grid.addWidget(value, 1, column)
+        multi_layout.addLayout(band_grid)
+
+        multi_buttons = QHBoxLayout()
+        load_current = QPushButton("Load values from current row")
+        load_current.clicked.connect(self._load_multi_values_from_current_row)
+        multi_buttons.addWidget(load_current)
+        multi_buttons.addStretch(1)
+        apply_multi = QPushButton("Apply shared values to highlighted rows")
+        apply_multi.clicked.connect(self._apply_multi_values_to_highlighted)
+        multi_buttons.addWidget(apply_multi)
+        multi_layout.addLayout(multi_buttons)
+        layout.addWidget(multi_frame)
+
+        headers = ["Apply", "Category", "IFC / RF type", "Material", "Instances", "Current floor"]
+        headers += [self._frequency_label(value) for value in self.bands]
+        headers += ["Source IFC files"]
+        self.table = QTableWidget(len(self.groups), len(headers))
+        self.table.setHorizontalHeaderLabels(headers)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.verticalHeader().setVisible(False)
+        for row, group in enumerate(self.groups):
+            apply_item = QTableWidgetItem("")
+            apply_item.setFlags((apply_item.flags() | Qt.ItemIsUserCheckable) & ~Qt.ItemIsEditable)
+            apply_item.setCheckState(Qt.Unchecked)
+            apply_item.setData(Qt.UserRole, json.dumps(list(group.get("key", ())), separators=(",", ":")))
+            self.table.setItem(row, 0, apply_item)
+            values = [
+                str(group.get("category", "Other")),
+                str(group.get("display_type", "Unknown")),
+                str(group.get("material", "")),
+                str(group.get("count", 0)),
+                str(group.get("current_floor_count", 0)),
+            ]
+            for column, value in enumerate(values, start=1):
+                item = QTableWidgetItem(value)
+                if column != 2:
+                    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                self.table.setItem(row, column, item)
+            profile = dict(group.get("attenuation", {}) or {})
+            for offset, band in enumerate(self.bands):
+                value = float(profile.get(float(band), 0.0))
+                self.table.setItem(row, 6 + offset, QTableWidgetItem(f"{value:.3f}"))
+            source_item = QTableWidgetItem(str(group.get("sources", "")))
+            source_item.setFlags(source_item.flags() & ~Qt.ItemIsEditable)
+            self.table.setItem(row, 6 + len(self.bands), source_item)
+        self.table.resizeColumnsToContents()
+        self.table.itemSelectionChanged.connect(self._update_multi_selection_label)
+        layout.addWidget(self.table, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    @staticmethod
+    def _frequency_label(mhz: float) -> str:
+        return f"{mhz / 1000:g} GHz dB" if mhz >= 1000.0 else f"{mhz:g} MHz dB"
+
+    def _set_all_checked(self, checked: bool):
+        state = Qt.Checked if checked else Qt.Unchecked
+        for row in range(self.table.rowCount()):
+            self.table.item(row, 0).setCheckState(state)
+
+    def _select_category(self):
+        category = self.category_combo.currentText()
+        for row in range(self.table.rowCount()):
+            matches = category == "All categories" or self.table.item(row, 1).text() == category
+            if matches:
+                self.table.item(row, 0).setCheckState(Qt.Checked)
+
+    def _profile_value(self, profile: Dict[float, float], band: float) -> float:
+        if not profile:
+            return 0.0
+        if float(band) in profile:
+            return float(profile[float(band)])
+        keys = sorted(float(value) for value in profile)
+        nearest = min(keys, key=lambda value: abs(value - float(band)))
+        return float(profile[nearest])
+
+    def _highlighted_rows(self) -> List[int]:
+        selection_model = self.table.selectionModel()
+        if selection_model is None:
+            return []
+        return sorted({index.row() for index in selection_model.selectedRows()})
+
+    def _checked_rows(self) -> List[int]:
+        return [
+            row for row in range(self.table.rowCount())
+            if self.table.item(row, 0).checkState() == Qt.Checked
+        ]
+
+    def _target_rows(self) -> List[int]:
+        highlighted = self._highlighted_rows()
+        return highlighted if highlighted else self._checked_rows()
+
+    def _mark_rows_for_apply(self, rows: Iterable[int]):
+        for row in rows:
+            item = self.table.item(int(row), 0)
+            if item is not None:
+                item.setCheckState(Qt.Checked)
+
+    def _update_multi_selection_label(self):
+        count = len(self._highlighted_rows())
+        self.multi_selection_label.setText(f"{count} row{'s' if count != 1 else ''} highlighted")
+
+    def _load_multi_values_from_current_row(self):
+        row = self.table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "No IFC type selected", "Highlight a row before loading its values.")
+            return
+        type_item = self.table.item(row, 2)
+        if type_item is not None:
+            self.multi_type_combo.setCurrentText(type_item.text())
+            self.multi_type_enabled.setChecked(True)
+        for offset, band in enumerate(self.bands):
+            item = self.table.item(row, 6 + offset)
+            try:
+                value = float(item.text()) if item is not None else 0.0
+            except Exception:
+                value = 0.0
+            self.multi_band_values[float(band)].setValue(value)
+            self.multi_band_enabled[float(band)].setChecked(True)
+
+    def _apply_multi_values_to_highlighted(self):
+        rows = self._highlighted_rows()
+        if not rows:
+            QMessageBox.information(
+                self,
+                "No IFC types highlighted",
+                "Use Ctrl-click or Shift-click to highlight two or more IFC type rows first.",
+            )
+            return
+        set_type = self.multi_type_enabled.isChecked()
+        rf_type = self.multi_type_combo.currentText().strip()
+        active_bands = [
+            float(band) for band in self.bands
+            if self.multi_band_enabled[float(band)].isChecked()
+        ]
+        if not set_type and not active_bands:
+            QMessageBox.information(self, "No values enabled", "Enable RF type or at least one frequency value to apply.")
+            return
+        for row in rows:
+            if set_type:
+                self.table.item(row, 2).setText(rf_type)
+            for offset, band in enumerate(self.bands):
+                if float(band) not in active_bands:
+                    continue
+                self.table.item(row, 6 + offset).setText(
+                    f"{self.multi_band_values[float(band)].value():.3f}"
+                )
+        self._mark_rows_for_apply(rows)
+        self.multi_selection_label.setText(
+            f"Applied shared values to {len(rows)} highlighted row{'s' if len(rows) != 1 else ''}"
+        )
+
+    def _apply_preset_to_checked(self):
+        rows = self._target_rows()
+        if not rows:
+            QMessageBox.information(self, "No IFC types selected", "Highlight rows or tick their Apply boxes first.")
+            return
+        profile = self.profiles.get(self.preset_combo.currentText(), self.profiles.get("default", {}))
+        preset_name = self.preset_combo.currentText()
+        for row in rows:
+            self.table.item(row, 2).setText(preset_name.split(" / ", 1)[-1])
+            for offset, band in enumerate(self.bands):
+                self.table.item(row, 6 + offset).setText(f"{self._profile_value(profile, band):.3f}")
+        self._mark_rows_for_apply(rows)
+
+    def _zero_checked(self):
+        rows = self._target_rows()
+        if not rows:
+            QMessageBox.information(self, "No IFC types selected", "Highlight rows or tick their Apply boxes first.")
+            return
+        for row in rows:
+            for offset in range(len(self.bands)):
+                self.table.item(row, 6 + offset).setText("0.000")
+        self._mark_rows_for_apply(rows)
+
+    def values(self) -> Tuple[bool, List[Dict[str, object]]]:
+        changes = []
+        for row in range(self.table.rowCount()):
+            apply_item = self.table.item(row, 0)
+            if apply_item.checkState() != Qt.Checked:
+                continue
+            try:
+                key = tuple(json.loads(str(apply_item.data(Qt.UserRole))))
+            except Exception:
+                continue
+            attenuation = {}
+            for offset, band in enumerate(self.bands):
+                try:
+                    attenuation[float(band)] = float(self.table.item(row, 6 + offset).text())
+                except Exception:
+                    attenuation[float(band)] = 0.0
+            changes.append({
+                "key": key,
+                "rf_type": self.table.item(row, 2).text().strip(),
+                "attenuation": attenuation,
+            })
+        return bool(self.current_floor_only.isChecked()), changes
+
+
+class BulkAccessPointDialog(QDialog):
+    """Apply selected physical and radio parameters to many APs at once."""
+
+    def __init__(self, parent, selected_count: int, current_floor_count: int, total_count: int, pattern_names: List[str]):
+        super().__init__(parent)
+        self.setWindowTitle("Bulk access point parameters")
+        self.resize(720, 720)
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "Choose the AP scope, tick only the parameters to change, then apply. "
+            "Unticked values remain unchanged. Radio values can target every radio, "
+            "enabled radios, the first radio, or the radio closest to a chosen frequency."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        scope_form = QFormLayout()
+        self.scope_combo = QComboBox()
+        self.scope_combo.addItem(f"Selected access points ({selected_count})", "selected")
+        self.scope_combo.addItem(f"Current floor ({current_floor_count})", "floor")
+        self.scope_combo.addItem(f"All floors ({total_count})", "all")
+        self.scope_combo.setCurrentIndex(0 if selected_count else 1)
+        scope_form.addRow("Apply to", self.scope_combo)
+        self.radio_target_combo = QComboBox()
+        self.radio_target_combo.addItem("All radios", "all")
+        self.radio_target_combo.addItem("Enabled radios", "enabled")
+        self.radio_target_combo.addItem("First radio only", "first")
+        self.radio_target_combo.addItem("Radio nearest frequency", "frequency")
+        scope_form.addRow("Radio target", self.radio_target_combo)
+        self.target_frequency = QDoubleSpinBox()
+        self.target_frequency.setRange(1.0, 100000.0)
+        self.target_frequency.setValue(5000.0)
+        self.target_frequency.setSuffix(" MHz")
+        scope_form.addRow("Target frequency", self.target_frequency)
+        layout.addLayout(scope_form)
+
+        self.fields: Dict[str, Tuple[QCheckBox, QWidget]] = {}
+        form = QFormLayout()
+
+        def add_field(key: str, label: str, widget: QWidget):
+            check = QCheckBox(label)
+            check.setToolTip("Tick to overwrite this parameter on every AP in the selected scope.")
+            self.fields[key] = (check, widget)
+            form.addRow(check, widget)
+
+        ap_type = QComboBox(); ap_type.addItems(list(AP_TYPE_PRESETS.keys()))
+        add_field("ap_type", "AP type / symbol", ap_type)
+        radio_profile = QComboBox(); radio_profile.addItem("Project default radios"); radio_profile.addItems(list(RADIO_PROFILE_PRESETS.keys()))
+        add_field("radio_profile", "Replace radio profile", radio_profile)
+        mount = QDoubleSpinBox(); mount.setRange(0.1, 50.0); mount.setValue(2.7); mount.setSuffix(" m")
+        add_field("mount_height_m", "Mount height", mount)
+        rx = QDoubleSpinBox(); rx.setRange(0.1, 10.0); rx.setValue(1.2); rx.setSuffix(" m")
+        add_field("rx_height_m", "Receiver height", rx)
+        azimuth = QDoubleSpinBox(); azimuth.setRange(-360.0, 360.0); azimuth.setSuffix("°")
+        add_field("azimuth_deg", "Azimuth", azimuth)
+        downtilt = QDoubleSpinBox(); downtilt.setRange(-90.0, 90.0); downtilt.setSuffix("°")
+        add_field("downtilt_deg", "Downtilt", downtilt)
+        ple = QDoubleSpinBox(); ple.setRange(1.0, 8.0); ple.setValue(2.2); ple.setDecimals(3)
+        add_field("path_loss_exponent", "Path-loss exponent", ple)
+        clients = QSpinBox(); clients.setRange(1, 100000); clients.setValue(50)
+        add_field("max_clients", "Clients per AP", clients)
+        enabled = QComboBox(); enabled.addItem("Enabled", True); enabled.addItem("Disabled", False)
+        add_field("radio_enabled", "Radio enabled state", enabled)
+        tx = QDoubleSpinBox(); tx.setRange(-50.0, 100.0); tx.setValue(20.0); tx.setSuffix(" dBm")
+        add_field("tx_power_dbm", "Radio transmit power", tx)
+        gain = QDoubleSpinBox(); gain.setRange(-50.0, 100.0); gain.setSuffix(" dBi")
+        add_field("antenna_gain_dbi", "Additional antenna gain", gain)
+        frequency = QDoubleSpinBox(); frequency.setRange(1.0, 100000.0); frequency.setValue(5000.0); frequency.setSuffix(" MHz")
+        add_field("frequency_mhz", "Radio frequency", frequency)
+        pattern = QComboBox(); pattern.addItems(pattern_names)
+        add_field("antenna_pattern", "Antenna pattern", pattern)
+        channel = QComboBox(); channel.setEditable(True); channel.addItems(["1", "6", "11", "36", "40", "44", "48", "5", "21", "37"])
+        add_field("channel", "Channel", channel)
+        width = QDoubleSpinBox(); width.setRange(0.01, 1000.0); width.setValue(40.0); width.setSuffix(" MHz")
+        add_field("channel_width_mhz", "Channel width", width)
+        occupancy = QDoubleSpinBox(); occupancy.setRange(0.0, 100.0); occupancy.setValue(20.0); occupancy.setSuffix(" %")
+        add_field("spectrum_occupancy_percent", "Spectrum occupancy", occupancy)
+        cutoff = QDoubleSpinBox(); cutoff.setRange(0.0, 10000.0); cutoff.setValue(0.0); cutoff.setSuffix(" m")
+        add_field("cutoff_radius_m", "Radio cut-off radius", cutoff)
+
+        field_widget = QWidget(); field_widget.setLayout(form)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(field_widget)
+        layout.addWidget(scroll, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self) -> Dict[str, object]:
+        result: Dict[str, object] = {
+            "scope": self.scope_combo.currentData(),
+            "radio_target": self.radio_target_combo.currentData(),
+            "target_frequency_mhz": float(self.target_frequency.value()),
+            "changes": {},
+        }
+        for key, (check, widget) in self.fields.items():
+            if not check.isChecked():
+                continue
+            if isinstance(widget, QDoubleSpinBox):
+                value = float(widget.value())
+            elif isinstance(widget, QSpinBox):
+                value = int(widget.value())
+            elif isinstance(widget, QComboBox):
+                value = widget.currentData() if key == "radio_enabled" else widget.currentText()
+            else:
+                continue
+            result["changes"][key] = value
+        return result
+
+
 class AutoPlannerSettingsDialog(QDialog):
     """Configure predictive AP coverage, capacity, channel and radio requirements."""
 
@@ -3168,6 +3763,7 @@ class WallGraphicsItem(QGraphicsPolygonItem):
                 "Rotate IFC about insertion point so this wall is 0° to X-axis"
             )
         reset_action = menu.addAction("Reset RF attenuation from IFC type/material")
+        bulk_action = menu.addAction("Bulk attenuation by IFC type…")
         delete_action = None
         if self.wall.is_user_created:
             menu.addSeparator()
@@ -3182,6 +3778,8 @@ class WallGraphicsItem(QGraphicsPolygonItem):
             self.main.rotate_ifc_to_align_wall_with_x_axis(self.wall)
         elif chosen == reset_action:
             self.main.reset_wall_rf_properties(self.wall)
+        elif chosen == bulk_action:
+            self.main.show_bulk_ifc_attenuation()
         elif delete_action is not None and chosen == delete_action:
             if self.wall.is_user_created:
                 self.main.delete_user_wall(self.wall)
@@ -3290,21 +3888,21 @@ class IFCElementGraphicsItem(QGraphicsPolygonItem):
         self.setZValue(Z_IFC_WALL + 1 if element.is_rf_opening else Z_IFC_SPACE_OUTLINE)
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         self.setAcceptedMouseButtons(Qt.LeftButton | Qt.RightButton)
-        material = f"\n{element.material}" if element.material else ""
+        material = f"\nMaterial: {element.material}" if element.material else ""
+        losses = ", ".join(
+            f"{frequency:g} MHz: {loss:g} dB"
+            for frequency, loss in sorted(element.attenuation_by_band_db.items())
+        )
         if element.is_rf_opening:
-            losses = ", ".join(
-                f"{frequency:g} MHz: {loss:g} dB"
-                for frequency, loss in sorted(element.attenuation_by_band_db.items())
-            )
-            rf_note = (
-                f"\nRF {element.rf_category} barrier: {losses}\n"
-                "When crossed, this opening loss replaces its host wall loss."
-            )
+            behaviour = "When crossed, this opening loss replaces its host wall loss."
+        elif element.is_rf_barrier:
+            behaviour = "When the 3D radio path crosses this element, its loss is added."
         else:
-            rf_note = ""
+            behaviour = "This type currently has 0 dB loss and is visual context only."
+        rf_note = f"\nRF category: {element.rf_category}\nAttenuation: {losses or '0 dB'}\n{behaviour}"
         self.setToolTip(
-            f"{element.name or element.guid}\n{element.type_name}{material}{rf_note}\n"
-            "Right-click to remove this imported IFC element from the RF model."
+            f"{element.name or element.guid}\n{element.ifc_class} | {element.rf_type_override or element.type_name}{material}{rf_note}\n"
+            "Right-click to edit attenuation, open the bulk type manager, or remove this IFC element."
         )
 
     def contextMenuEvent(self, event):
@@ -3316,6 +3914,10 @@ class IFCElementGraphicsItem(QGraphicsPolygonItem):
             inferred_space_actions.append((menu.addAction(label), space))
         if inferred_space_actions:
             menu.addSeparator()
+        edit_action = menu.addAction("Edit IFC type attenuation…")
+        reset_action = menu.addAction("Reset attenuation from IFC type/material")
+        bulk_action = menu.addAction("Bulk attenuation by IFC type…")
+        menu.addSeparator()
         delete_action = menu.addAction("Remove imported IFC element from this RF model")
         chosen = menu.exec(event.screenPos())
         for action, space in inferred_space_actions:
@@ -3323,7 +3925,13 @@ class IFCElementGraphicsItem(QGraphicsPolygonItem):
                 self.main.delete_inferred_space(space)
                 event.accept()
                 return
-        if chosen == delete_action:
+        if chosen == edit_action:
+            self.main.edit_ifc_element_rf_properties(self.element)
+        elif chosen == reset_action:
+            self.main.reset_ifc_element_rf_properties(self.element)
+        elif chosen == bulk_action:
+            self.main.show_bulk_ifc_attenuation()
+        elif chosen == delete_action:
             self.main.delete_imported_element(self.element)
         event.accept()
 
@@ -4135,7 +4743,7 @@ class MainWindow(QMainWindow):
         wall_panel = QWidget()
         wall_panel_layout = QVBoxLayout(wall_panel)
         wall_panel_layout.setContentsMargins(4, 4, 4, 4)
-        wall_help = QLabel("Review and edit RF attenuation values for IFC and user-created walls.")
+        wall_help = QLabel("One row is shown per unique IFC attenuation type. Repeated wall and element instances are condensed and edits apply to every matching instance.")
         wall_help.setWordWrap(True)
         wall_panel_layout.addWidget(wall_help)
         wall_panel_layout.addWidget(self.wall_table, 1)
@@ -4144,7 +4752,7 @@ class MainWindow(QMainWindow):
         self.inspector_tabs.setDocumentMode(True)
         self.inspector_tabs.addTab(settings_scroll, "Settings")
         self.inspector_tabs.addTab(ap_panel, "Access points")
-        self.inspector_tabs.addTab(wall_panel, "Walls")
+        self.inspector_tabs.addTab(wall_panel, "Attenuation types")
 
         side = QWidget()
         side.setMinimumWidth(390)
@@ -4206,6 +4814,8 @@ class MainWindow(QMainWindow):
         self.array_ap_action.triggered.connect(self.start_ap_array_placement)
         self.space_ap_action = QAction("Place APs from spaces", self)
         self.space_ap_action.triggered.connect(self.show_space_ap_placement_dialog)
+        self.bulk_ap_action = QAction("Bulk AP parameters", self)
+        self.bulk_ap_action.triggered.connect(self.show_bulk_ap_parameters)
         self.cancel_ap_tool_action = QAction("Cancel AP tool", self)
         self.cancel_ap_tool_action.triggered.connect(self.cancel_ap_placement)
         self.copy_ap_action = QAction("Copy access points", self)
@@ -4223,6 +4833,8 @@ class MainWindow(QMainWindow):
         self.draw_wall_action = QAction("Draw RF wall", self)
         self.draw_wall_action.setCheckable(True)
         self.draw_wall_action.toggled.connect(self.toggle_wall_draw_mode)
+        self.bulk_attenuation_action = QAction("Bulk IFC attenuation", self)
+        self.bulk_attenuation_action.triggered.connect(self.show_bulk_ifc_attenuation)
         self.draw_boundary_action = QAction("Draw rectangular boundary", self)
         self.draw_boundary_action.setCheckable(True)
         self.draw_boundary_action.toggled.connect(
@@ -4543,6 +5155,10 @@ class MainWindow(QMainWindow):
                 "Place from spaces", "Automatically place one or more APs inside IFC, inferred or manually drawn spaces while remaining in the manual workflow.",
                 "SP_DialogApplyButton", ""
             ),
+            "bulk_ap_action": (
+                "Bulk AP parameters", "Apply selected physical and radio parameters to selected APs, the current floor, or the complete project.",
+                "SP_FileDialogDetailedView", "Ctrl+Alt+B"
+            ),
             "cancel_ap_tool_action": (
                 "Cancel AP tool", "Exit the active access point placement tool without deleting placed APs.",
                 "SP_DialogCancelButton", "Escape"
@@ -4574,6 +5190,10 @@ class MainWindow(QMainWindow):
             "draw_wall_action": (
                 "Draw RF wall", "Draw a connected RF-blocking wall where the IFC model has missing geometry. Hold Shift to constrain it horizontal or vertical.",
                 "SP_FileDialogContentsView", ""
+            ),
+            "bulk_attenuation_action": (
+                "Bulk IFC attenuation", "Edit attenuation once per unique IFC wall/element type and apply it to every matching instance.",
+                "SP_FileDialogDetailedView", "Ctrl+Alt+T"
             ),
             "draw_boundary_action": (
                 "Rectangle boundary", "Draw a rectangular hard boundary shared by all IFC floors.",
@@ -4716,7 +5336,7 @@ class MainWindow(QMainWindow):
             ("Results and cleanup", ["export_action", "clear_ap_action"]),
         ]), "Home")
         ribbon.addTab(self._make_ribbon_page([
-            ("Interaction", ["ap_interaction_action", "ap_ruler_action", "copy_ap_action", "paste_ap_action", "cancel_ap_tool_action"]),
+            ("Interaction", ["ap_interaction_action", "ap_ruler_action", "copy_ap_action", "paste_ap_action", "bulk_ap_action", "cancel_ap_tool_action"]),
             ("Manual placement", ["place_ap_action", "array_ap_action"]),
             ("Space-assisted placement", ["space_ap_action", "select_ap_spaces_action"]),
         ]), "Access points")
@@ -4726,7 +5346,7 @@ class MainWindow(QMainWindow):
             ("View orientation", ["rotate_left_action", "rotate_right_action", "reset_rotation_action"]),
         ]), "Model and view")
         ribbon.addTab(self._make_ribbon_page([
-            ("RF obstructions", ["draw_wall_action"]),
+            ("RF obstructions", ["draw_wall_action", "bulk_attenuation_action"]),
             ("Space creation", ["draw_space_action", "create_spaces_action", "select_ap_spaces_action", "clear_inferred_spaces_action"]),
             ("Permitted planning area", ["draw_boundary_action", "draw_polygon_boundary_action", "suggest_external_boundary_action", "clear_boundaries_action"]),
         ]), "Walls and boundaries")
@@ -6850,6 +7470,260 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Updated RF attenuation for {wall.name or wall.guid}")
 
     @staticmethod
+    def _normalise_attenuation_type(value: object) -> str:
+        return " ".join(str(value or "").strip().casefold().split()) or "unknown"
+
+    def _attenuation_group_key(self, obj) -> Tuple[str, str, str, str]:
+        """Stable key that condenses repeated IFC instances into one type row."""
+        if isinstance(obj, Wall2D):
+            category = "wall"
+            ifc_class = "IfcWall"
+            if obj.is_user_created:
+                type_name = obj.rf_type_override or obj.type_name or obj.material or "User RF wall"
+            else:
+                # Keep grouping stable after an RF override by using the authored
+                # IFC type/material rather than the editable RF type text.
+                type_name = obj.type_name or obj.material or obj.name or "Wall"
+            material = obj.material or ""
+        else:
+            category = str(getattr(obj, "rf_category", "other") or "other")
+            ifc_class = str(getattr(obj, "ifc_class", "IfcElement") or "IfcElement")
+            type_name = getattr(obj, "type_name", "") or getattr(obj, "material", "") or getattr(obj, "name", "") or ifc_class
+            material = getattr(obj, "material", "") or ""
+        return (
+            self._normalise_attenuation_type(category),
+            self._normalise_attenuation_type(ifc_class),
+            self._normalise_attenuation_type(type_name),
+            self._normalise_attenuation_type(material),
+        )
+
+    def _all_attenuation_objects(self, current_floor_only: bool = False):
+        floors = [self.floor] if current_floor_only and self.floor is not None else list(self.floors.values())
+        for floor in floors:
+            if floor is None:
+                continue
+            for wall in floor.walls:
+                yield wall
+            for element in getattr(floor, "elements", []):
+                yield element
+
+    def _objects_for_attenuation_group(self, key: Tuple[str, ...], current_floor_only: bool = False) -> List[object]:
+        wanted = tuple(str(value) for value in key)
+        return [
+            obj for obj in self._all_attenuation_objects(current_floor_only=current_floor_only)
+            if self._attenuation_group_key(obj) == wanted
+        ]
+
+    @staticmethod
+    def _attenuation_object_identity(obj) -> Tuple[str, str]:
+        return (str(getattr(obj, "source_file", "")), str(getattr(obj, "guid", "")))
+
+    def _attenuation_groups(self) -> List[Dict[str, object]]:
+        grouped: Dict[Tuple[str, str, str, str], List[object]] = {}
+        for obj in self._all_attenuation_objects(current_floor_only=False):
+            grouped.setdefault(self._attenuation_group_key(obj), []).append(obj)
+        current_name = self.floor.name if self.floor else ""
+        result: List[Dict[str, object]] = []
+        for key, objects in grouped.items():
+            representative = objects[0]
+            physical_ids = {self._attenuation_object_identity(value) for value in objects}
+            current_ids = {
+                self._attenuation_object_identity(value)
+                for value in objects if str(getattr(value, "floor", "")) == current_name
+            }
+            if isinstance(representative, Wall2D):
+                category = "Wall"
+                display_type = representative.rf_type_override or representative.type_name or representative.material or "Wall"
+                material = representative.material or ""
+            else:
+                category = str(representative.rf_category or representative.ifc_class or "Other").replace("_", " ").title()
+                display_type = representative.rf_type_override or representative.type_name or representative.material or representative.ifc_class
+                material = representative.material or ""
+            result.append({
+                "key": key,
+                "category": category,
+                "display_type": display_type,
+                "material": material,
+                "count": len(physical_ids),
+                "current_floor_count": len(current_ids),
+                "attenuation": {float(band): representative.attenuation_db_for_frequency(float(band)) for band in self._frequency_bands()},
+                "sources": ", ".join(sorted({str(getattr(value, "source_file", "")) for value in objects if getattr(value, "source_file", "")})),
+            })
+        return sorted(result, key=lambda value: (
+            str(value.get("category", "")), str(value.get("display_type", "")), str(value.get("material", ""))
+        ))
+
+    def _combined_attenuation_presets(self) -> Dict[str, Dict[float, float]]:
+        presets: Dict[str, Dict[float, float]] = {}
+        sources = (
+            ("wall", self.heatmap_settings.default_wall_attenuation_by_material_db),
+            ("door", self.heatmap_settings.default_door_attenuation_by_material_db),
+            ("window", self.heatmap_settings.default_window_attenuation_by_material_db),
+            ("ifc", self.heatmap_settings.default_ifc_element_attenuation_by_type_db),
+        )
+        for prefix, profiles in sources:
+            for name, profile in profiles.items():
+                label = name if name == "default" and "default" not in presets else f"{prefix} / {name}"
+                presets[label] = {float(key): float(value) for key, value in profile.items()}
+        return presets
+
+    def show_bulk_ifc_attenuation(self):
+        groups = self._attenuation_groups()
+        if not groups:
+            QMessageBox.information(self, "No IFC attenuation types", "Load an IFC model before editing attenuation types.")
+            return
+        dialog = BulkIFCAttenuationDialog(
+            self, groups, self._frequency_bands(), self._combined_attenuation_presets(),
+            self.floor.name if self.floor else "",
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        current_floor_only, changes = dialog.values()
+        changed_objects = 0
+        changed_types = 0
+        for change in changes:
+            objects = self._objects_for_attenuation_group(tuple(change.get("key", ())), current_floor_only)
+            if not objects:
+                continue
+            rf_type = str(change.get("rf_type", "")).strip()
+            attenuation = {float(key): float(value) for key, value in dict(change.get("attenuation", {})).items()}
+            for obj in objects:
+                obj.rf_type_override = rf_type
+                obj.attenuation_by_band_db.update(attenuation)
+                obj.rf_customised = True
+                changed_objects += 1
+            changed_types += 1
+        if not changed_types:
+            self.statusBar().showMessage("No IFC attenuation type rows were selected")
+            return
+        self.last_result = None
+        self.rssi_results_by_frequency = {}
+        self.populate_wall_table()
+        self.draw_floor()
+        scope = self.floor.name if current_floor_only and self.floor else "all floors"
+        self.statusBar().showMessage(
+            f"Updated {changed_types} IFC attenuation type(s), affecting {changed_objects} visible/project instances on {scope}"
+        )
+
+    def edit_ifc_element_rf_properties(self, element: IFCElement2D):
+        if element.rf_category == "door":
+            profiles = self.heatmap_settings.default_door_attenuation_by_material_db
+        elif element.rf_category == "window":
+            profiles = self.heatmap_settings.default_window_attenuation_by_material_db
+        else:
+            profiles = self.heatmap_settings.default_ifc_element_attenuation_by_type_db
+        dialog = IFCElementAttenuationDialog(self, element, self._frequency_bands(), profiles)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        rf_type, attenuation = dialog.values()
+        for instance in [
+            candidate for floor in self.floors.values() for candidate in getattr(floor, "elements", [])
+            if candidate.guid == element.guid and candidate.source_file == element.source_file
+        ] or [element]:
+            instance.rf_type_override = rf_type
+            instance.attenuation_by_band_db.update({float(key): float(value) for key, value in attenuation.items()})
+            instance.rf_customised = True
+        self.last_result = None
+        self.rssi_results_by_frequency = {}
+        self.populate_wall_table()
+        self.draw_floor()
+        self.statusBar().showMessage(f"Updated RF attenuation for {element.name or element.guid}")
+
+    def reset_ifc_element_rf_properties(self, element: IFCElement2D):
+        for instance in [
+            candidate for floor in self.floors.values() for candidate in getattr(floor, "elements", [])
+            if candidate.guid == element.guid and candidate.source_file == element.source_file
+        ] or [element]:
+            instance.rf_customised = False
+            instance.rf_type_override = ""
+            instance.attenuation_by_band_db = self._profile_for_ifc_element_from_settings(instance)
+        self.last_result = None
+        self.rssi_results_by_frequency = {}
+        self.populate_wall_table()
+        self.draw_floor()
+        self.statusBar().showMessage(f"Reset RF attenuation for {element.name or element.guid}")
+
+    @staticmethod
+    def _ensure_ap_radio_list(ap: AccessPoint):
+        if not ap.radios:
+            ap.radios = [APRadio(
+                name="Radio-1", frequency_mhz=float(ap.frequency_mhz), tx_power_dbm=float(ap.tx_power_dbm),
+                antenna_pattern=ap.antenna_pattern, enabled=True,
+            )]
+
+    def _bulk_target_radios(self, ap: AccessPoint, mode: str, target_frequency_mhz: float) -> List[APRadio]:
+        self._ensure_ap_radio_list(ap)
+        if mode == "first":
+            return ap.radios[:1]
+        if mode == "enabled":
+            return [radio for radio in ap.radios if radio.enabled]
+        if mode == "frequency":
+            return [min(ap.radios, key=lambda radio: abs(float(radio.frequency_mhz) - float(target_frequency_mhz)))]
+        return list(ap.radios)
+
+    def show_bulk_ap_parameters(self):
+        selected = self.selected_access_points()
+        current_floor_aps = [ap for ap in self.aps if self.floor is not None and ap.floor == self.floor.name]
+        dialog = BulkAccessPointDialog(
+            self, len(selected), len(current_floor_aps), len(self.aps), sorted(self.antenna_patterns.keys())
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        values = dialog.values()
+        changes = dict(values.get("changes", {}))
+        if not changes:
+            self.statusBar().showMessage("No AP parameter fields were selected")
+            return
+        scope = values.get("scope")
+        if scope == "selected":
+            targets = selected
+        elif scope == "all":
+            targets = list(self.aps)
+        else:
+            targets = current_floor_aps
+        if not targets:
+            QMessageBox.information(self, "No access points", "The selected bulk-edit scope contains no access points.")
+            return
+
+        physical_keys = {"ap_type", "mount_height_m", "rx_height_m", "azimuth_deg", "downtilt_deg", "path_loss_exponent", "max_clients"}
+        radio_keys = {
+            "radio_enabled", "tx_power_dbm", "antenna_gain_dbi", "frequency_mhz", "antenna_pattern",
+            "channel", "channel_width_mhz", "spectrum_occupancy_percent", "cutoff_radius_m",
+        }
+        radio_mode = str(values.get("radio_target", "all"))
+        target_frequency = float(values.get("target_frequency_mhz", 5000.0))
+        for ap in targets:
+            if "ap_type" in changes:
+                ap.ap_type = str(changes["ap_type"])
+            if "radio_profile" in changes:
+                ap.radio_profile = str(changes["radio_profile"])
+                ap.radios = self._radios_for_profile(ap.radio_profile, ap.ap_type)
+            for key in physical_keys:
+                if key in changes:
+                    setattr(ap, key, changes[key])
+            selected_radios = self._bulk_target_radios(ap, radio_mode, target_frequency)
+            for radio in selected_radios:
+                if "radio_enabled" in changes:
+                    radio.enabled = bool(changes["radio_enabled"])
+                for key in radio_keys - {"radio_enabled"}:
+                    if key in changes:
+                        setattr(radio, key, changes[key])
+            if any(key in changes for key in radio_keys) and "radio_profile" not in changes:
+                ap.radio_profile = "Custom"
+            if ap.radios:
+                ap.tx_power_dbm = float(ap.radios[0].tx_power_dbm)
+                ap.frequency_mhz = float(ap.radios[0].frequency_mhz)
+                ap.antenna_pattern = ap.radios[0].antenna_pattern
+
+        self.last_result = None
+        self.rssi_results_by_frequency = {}
+        self._refresh_rssi_frequency_dropdown()
+        self._pending_ap_selection_ids = {id(ap) for ap in targets if ap.floor == (self.floor.name if self.floor else "")}
+        self.populate_ap_table()
+        self.draw_floor()
+        self.statusBar().showMessage(f"Applied {len(changes)} parameter field(s) to {len(targets)} access point(s)")
+
+    @staticmethod
     def _wall_major_axis_angle_deg(polygon: Polygon) -> float:
         """Return the dominant, unoriented plan angle of a wall polygon."""
         if polygon is None or polygon.is_empty:
@@ -8155,6 +9029,7 @@ class MainWindow(QMainWindow):
             })
         user_walls = []
         overrides = []
+        element_overrides = []
         for floor in self.floors.values():
             for wall in floor.walls:
                 if wall.is_user_created:
@@ -8175,6 +9050,20 @@ class MainWindow(QMainWindow):
                     if wall.rf_geometry_customised:
                         override["polygon"] = [[float(x), float(y)] for x, y in wall.polygon.exterior.coords]
                     overrides.append(override)
+            for element in getattr(floor, "elements", []):
+                if element.rf_customised:
+                    element_overrides.append({
+                        "guid": element.guid,
+                        "source_file": element.source_file,
+                        "floor": element.floor,
+                        "ifc_class": element.ifc_class,
+                        "rf_category": element.rf_category,
+                        "rf_type_override": element.rf_type_override,
+                        "rf_customised": True,
+                        "attenuation_by_band_db": {
+                            str(key): float(value) for key, value in element.attenuation_by_band_db.items()
+                        },
+                    })
         planner_boundaries = [
             {
                 "guid": boundary.guid,
@@ -8216,7 +9105,7 @@ class MainWindow(QMainWindow):
                 else:
                     inferred_spaces.append(item)
         return {
-            "format": "rf-attenuation-plan", "version": 5,
+            "format": "rf-attenuation-plan", "version": 6,
             "ifc_paths": [str(path) for path in self.loaded_ifc_paths],
             "selected_floor": self.floor.name if self.floor else "", "view_rotation_deg": self.view_rotation_deg,
             "ifc_alignment": {"dx": self.ifc_alignment.dx, "dy": self.ifc_alignment.dy, "rotation_deg": self.ifc_alignment.rotation_deg, "scale": self.ifc_alignment.scale},
@@ -8233,6 +9122,7 @@ class MainWindow(QMainWindow):
             "user_spaces": user_spaces,
             "inferred_spaces": inferred_spaces,
             "access_points": aps, "user_walls": user_walls, "wall_overrides": overrides,
+            "element_overrides": element_overrides,
         }
 
     def save_rf_plan(self):
@@ -8285,6 +9175,10 @@ class MainWindow(QMainWindow):
                 wall.rf_geometry_customised = False
                 wall.rf_customised = False; wall.rf_type_override = ""
                 wall.attenuation_by_band_db = self._profile_for_wall_from_settings(wall)
+            for element in getattr(floor, "elements", []):
+                element.rf_customised = False
+                element.rf_type_override = ""
+                element.attenuation_by_band_db = self._profile_for_ifc_element_from_settings(element)
         self.excluded_ifc_elements = [
             self._ifc_exclusion_record(
                 item.get("kind", ""), item.get("source_file", ""), item.get("guid", ""), item.get("floor", "")
@@ -8319,6 +9213,28 @@ class MainWindow(QMainWindow):
                             wall.rf_original_polygon = wall.polygon
                             wall.polygon = polygon
                             wall.rf_geometry_customised = True
+        element_override_exact = {
+            (str(item.get("source_file", "")), str(item.get("guid", "")), str(item.get("floor", ""))): item
+            for item in data.get("element_overrides", []) if isinstance(item, dict) and str(item.get("floor", ""))
+        }
+        element_override_legacy = {
+            (str(item.get("source_file", "")), str(item.get("guid", ""))): item
+            for item in data.get("element_overrides", []) if isinstance(item, dict)
+        }
+        for floor in self.floors.values():
+            for element in getattr(floor, "elements", []):
+                item = element_override_exact.get((element.source_file, element.guid, element.floor))
+                if item is None:
+                    item = element_override_legacy.get((element.source_file, element.guid))
+                if not item:
+                    continue
+                element.rf_type_override = str(item.get("rf_type_override", ""))
+                element.rf_customised = bool(item.get("rf_customised", True))
+                element.attenuation_by_band_db.update({
+                    float(key): float(value)
+                    for key, value in dict(item.get("attenuation_by_band_db", {})).items()
+                })
+
         for item in data.get("user_walls", []):
             if not isinstance(item, dict): continue
             floor = self.floors.get(str(item.get("floor", "")))
@@ -8550,6 +9466,27 @@ class MainWindow(QMainWindow):
         bottom = float(values[0]) * (1.0 - tx) + float(values[1]) * tx
         upper = float(values[2]) * (1.0 - tx) + float(values[3]) * tx
         return bottom * (1.0 - ty) + upper * ty
+
+    @staticmethod
+    def _interpolated_heatmap_grid(result: SimulationResult, factor: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        xs = np.asarray(result.xs, dtype=float)
+        ys = np.asarray(result.ys, dtype=float)
+        grid = np.asarray(result.rssi, dtype=float)
+        if factor <= 1 or xs.size < 2 or ys.size < 2:
+            return xs, ys, grid
+
+        fine_xs = np.linspace(float(xs[0]), float(xs[-1]), (len(xs) - 1) * int(factor) + 1)
+        fine_ys = np.linspace(float(ys[0]), float(ys[-1]), (len(ys) - 1) * int(factor) + 1)
+        # Use the same coordinate-aware bilinear surface as the hover readout.
+        # Pixel-centred image zoom shifts/crops the RSSI surface against the
+        # model coordinates, which makes isolines and colour bands disagree
+        # with the value shown under the cursor.
+        x_interpolated = np.vstack([np.interp(fine_xs, xs, row) for row in grid])
+        z = np.vstack([
+            np.interp(fine_ys, ys, x_interpolated[:, ix])
+            for ix in range(x_interpolated.shape[1])
+        ]).T
+        return fine_xs, fine_ys, z
 
     def update_rssi_hover_readout(self, scene_pos: QPointF, viewport_pos):
         result = getattr(self, "last_result", None)
@@ -9576,7 +10513,7 @@ class MainWindow(QMainWindow):
         self.clear_ap_action.setEnabled(not loading)
         self.load_pattern_action.setEnabled(not loading)
         for action_name in (
-            "planner_settings_action", "predict_aps_action", "draw_wall_action", "draw_space_action", "select_ap_spaces_action",
+            "planner_settings_action", "predict_aps_action", "bulk_ap_action", "draw_wall_action", "bulk_attenuation_action", "draw_space_action", "select_ap_spaces_action",
             "draw_boundary_action", "draw_polygon_boundary_action", "suggest_external_boundary_action",
             "create_spaces_action", "clear_inferred_spaces_action", "clear_boundaries_action", "ifc_origin_action",
             "rotate_left_action", "rotate_right_action", "reset_rotation_action", "save_plan_action", "load_plan_action",
@@ -9779,10 +10716,14 @@ class MainWindow(QMainWindow):
                 element_pen_colour = QColor("#007EA8") if not getattr(self, "dark_theme", False) else QColor("#65D5FF")
                 element_fill_colour = QColor("#72C7E7")
                 element_fill_colour.setAlpha(165)
+            elif element.is_rf_barrier:
+                element_pen_colour = QColor("#7C3AED") if not getattr(self, "dark_theme", False) else QColor("#C4B5FD")
+                element_fill_colour = QColor("#A78BFA")
+                element_fill_colour.setAlpha(105)
             else:
                 element_pen_colour = QColor(generic_element_pen_colour)
                 element_fill_colour = QColor(generic_element_fill_colour)
-            element_pen = QPen(element_pen_colour, 0.11 if element.is_rf_opening else 0.08)
+            element_pen = QPen(element_pen_colour, 0.11 if element.is_rf_barrier else 0.08)
             element_pen.setCosmetic(True)
             poly = QPolygonF([QPointF(float(x), float(y)) for x, y in coords])
             item = IFCElementGraphicsItem(self, element, poly, element_pen, QBrush(element_fill_colour))
@@ -9902,9 +10843,9 @@ class MainWindow(QMainWindow):
     def _draw_heatmap(self, result: SimulationResult):
         """Draw smooth filled RSSI contours, isolines and sampled RSSI points.
 
-        The filled colour now follows interpolated contour polygons rather than
-        square grid cells. scipy is used, when available, to upsample the RSSI
-        grid before contourpy generates the filled bands and contour lines.
+        The filled colour follows coordinate-aware interpolated contour
+        polygons rather than square grid cells. The interpolation intentionally
+        matches the hover readout so colours, isolines and cursor RSSI agree.
         Text is drawn as screen-sized upright text so it does not become huge or
         upside down when the IFC view is zoomed/flipped.
         """
@@ -9922,23 +10863,7 @@ class MainWindow(QMainWindow):
             return
 
         factor = max(1, int(getattr(self.heatmap_settings, "contour_interpolation_factor", 4)))
-        xs = np.asarray(result.xs, dtype=float)
-        ys = np.asarray(result.ys, dtype=float)
-        z = grid
-        if factor > 1:
-            fine_xs = np.linspace(float(xs[0]), float(xs[-1]), (len(xs) - 1) * factor + 1)
-            fine_ys = np.linspace(float(ys[0]), float(ys[-1]), (len(ys) - 1) * factor + 1)
-            if scipy_zoom is not None:
-                z = scipy_zoom(grid, (factor, factor), order=3)
-                # scipy_zoom can produce one or two extra samples depending on shape.
-                z = z[:len(fine_ys), :len(fine_xs)]
-                if z.shape != (len(fine_ys), len(fine_xs)):
-                    z = np.resize(z, (len(fine_ys), len(fine_xs)))
-            else:
-                # Fallback: two-pass linear interpolation using numpy only.
-                temp = np.vstack([np.interp(fine_xs, xs, row) for row in grid])
-                z = np.vstack([np.interp(fine_ys, ys, temp[:, ix]) for ix in range(temp.shape[1])]).T
-            xs, ys = fine_xs, fine_ys
+        xs, ys, z = self._interpolated_heatmap_grid(result, factor)
 
         levels = sorted({float(v) for v in self.heatmap_settings.isoline_bands_dbm}, reverse=True)
         if not levels:
@@ -10192,7 +11117,9 @@ class MainWindow(QMainWindow):
 
     def _configure_wall_table_headers(self):
         bands = self._frequency_bands() if hasattr(self, "heatmap_settings") else [2400.0, 5000.0, 6000.0]
-        headers = ["Wall/material/type"] + [self._frequency_label(b) for b in bands] + ["Name", "Source IFC", "GUID"]
+        headers = ["Category", "IFC / RF type", "Material", "Instances floor/project"]
+        headers += [self._frequency_label(band) for band in bands]
+        headers += ["Source IFC files"]
         self.wall_table.setColumnCount(len(headers))
         self.wall_table.setHorizontalHeaderLabels(headers)
 
@@ -10207,18 +11134,27 @@ class MainWindow(QMainWindow):
                 return dict(profile)
         return dict(profiles.get("default", {}))
 
-    def _profile_for_opening_from_settings(self, element: IFCElement2D) -> Dict[float, float]:
-        profiles = (
-            self.heatmap_settings.default_door_attenuation_by_material_db
-            if element.rf_category == "door"
-            else self.heatmap_settings.default_window_attenuation_by_material_db
-        )
-        text = f"{element.material} {element.type_name} {element.name}".lower()
-        # Prefer the longest matching key so 'low-e' wins over a generic token.
+    def _profile_for_ifc_element_from_settings(self, element: IFCElement2D) -> Dict[float, float]:
+        if element.rf_category == "door":
+            profiles = self.heatmap_settings.default_door_attenuation_by_material_db
+        elif element.rf_category == "window":
+            profiles = self.heatmap_settings.default_window_attenuation_by_material_db
+        else:
+            profiles = self.heatmap_settings.default_ifc_element_attenuation_by_type_db
+            if not element.rf_customised and element.rf_category in profiles:
+                return dict(profiles[element.rf_category])
+        override = element.rf_type_override if element.rf_customised else ""
+        text = f"{override} {element.rf_category} {element.ifc_class} {element.material} {element.type_name} {element.name}".lower()
+        # Prefer the longest matching key so a precise type/material wins over a
+        # broad category such as 'metal' or 'default'.
         for key in sorted((k for k in profiles if k != "default"), key=len, reverse=True):
             if key.lower() in text:
                 return dict(profiles[key])
         return dict(profiles.get("default", {}))
+
+    # Backwards-compatible name retained for older call sites/extensions.
+    def _profile_for_opening_from_settings(self, element: IFCElement2D) -> Dict[float, float]:
+        return self._profile_for_ifc_element_from_settings(element)
 
     def _apply_frequency_settings_to_model(self, replace_existing: bool = False):
         """Ensure loaded floors/walls contain attenuation values for all configured frequencies."""
@@ -10234,14 +11170,11 @@ class MainWindow(QMainWindow):
                     if replace_existing or band not in wall.attenuation_by_band_db:
                         wall.attenuation_by_band_db[band] = float(profile.get(band, wall.attenuation_db_for_frequency(band)))
             for element in getattr(floor, "elements", []):
-                if not element.is_rf_opening:
-                    continue
-                profile = self._profile_for_opening_from_settings(element)
-                # Doors/windows do not yet have per-object edits, so the active
-                # heatmap settings are always authoritative for their defaults.
+                profile = self._profile_for_ifc_element_from_settings(element)
                 for band in bands:
-                    fallback = element.attenuation_db_for_frequency(band)
-                    element.attenuation_by_band_db[band] = float(profile.get(band, fallback))
+                    if replace_existing or not element.rf_customised or band not in element.attenuation_by_band_db:
+                        fallback = element.attenuation_db_for_frequency(band)
+                        element.attenuation_by_band_db[band] = float(profile.get(band, fallback))
         self._configure_wall_table_headers()
 
     def populate_ap_table(self):
@@ -10371,41 +11304,73 @@ class MainWindow(QMainWindow):
             self.wall_table.blockSignals(False)
             return
         bands = self._frequency_bands()
-        meta_start = 1 + len(bands)
-        for wall in self.floor.walls:
+        for group in self._attenuation_groups():
+            if int(group.get("current_floor_count", 0)) <= 0:
+                continue
             row = self.wall_table.rowCount()
             self.wall_table.insertRow(row)
-            label_item = QTableWidgetItem(("[User] " if wall.is_user_created else "") + wall.label)
-            label_item.setData(Qt.UserRole, wall.guid)
-            label_item.setData(Qt.UserRole + 2, wall.source_file)
-            self.wall_table.setItem(row, 0, label_item)
-            for idx, band in enumerate(bands, start=1):
-                att = QTableWidgetItem(str(round(float(wall.attenuation_by_band_db.get(band, wall.attenuation_db_for_frequency(band))), 3)))
-                att.setData(Qt.UserRole, wall.guid)
-                att.setData(Qt.UserRole + 1, band)
-                self.wall_table.setItem(row, idx, att)
-            self.wall_table.setItem(row, meta_start, QTableWidgetItem(wall.name))
-            self.wall_table.setItem(row, meta_start + 1, QTableWidgetItem(wall.source_file))
-            self.wall_table.setItem(row, meta_start + 2, QTableWidgetItem(wall.guid))
+            key_text = json.dumps(list(group.get("key", ())), separators=(",", ":"))
+            category_item = QTableWidgetItem(str(group.get("category", "Other")))
+            category_item.setData(Qt.UserRole, key_text)
+            category_item.setFlags(category_item.flags() & ~Qt.ItemIsEditable)
+            self.wall_table.setItem(row, 0, category_item)
+            type_item = QTableWidgetItem(str(group.get("display_type", "Unknown")))
+            type_item.setData(Qt.UserRole, key_text)
+            self.wall_table.setItem(row, 1, type_item)
+            material_item = QTableWidgetItem(str(group.get("material", "")))
+            material_item.setData(Qt.UserRole, key_text)
+            material_item.setFlags(material_item.flags() & ~Qt.ItemIsEditable)
+            self.wall_table.setItem(row, 2, material_item)
+            count_item = QTableWidgetItem(f"{group.get('current_floor_count', 0)}/{group.get('count', 0)}")
+            count_item.setData(Qt.UserRole, key_text)
+            count_item.setFlags(count_item.flags() & ~Qt.ItemIsEditable)
+            self.wall_table.setItem(row, 3, count_item)
+            attenuation = dict(group.get("attenuation", {}) or {})
+            for offset, band in enumerate(bands):
+                item = QTableWidgetItem(f"{float(attenuation.get(float(band), 0.0)):.3f}")
+                item.setData(Qt.UserRole, key_text)
+                item.setData(Qt.UserRole + 1, float(band))
+                self.wall_table.setItem(row, 4 + offset, item)
+            source_item = QTableWidgetItem(str(group.get("sources", "")))
+            source_item.setData(Qt.UserRole, key_text)
+            source_item.setFlags(source_item.flags() & ~Qt.ItemIsEditable)
+            self.wall_table.setItem(row, 4 + len(bands), source_item)
         self.wall_table.resizeColumnsToContents()
         self.wall_table.blockSignals(False)
 
     def _wall_table_changed(self, item: QTableWidgetItem):
-        if not self.floor or item.column() < 1 or item.column() > len(self._frequency_bands()):
+        if not self.floor:
             return
-        guid = item.data(Qt.UserRole)
-        band = item.data(Qt.UserRole + 1)
         try:
-            val = float(item.text())
-        except ValueError:
+            key = tuple(json.loads(str(item.data(Qt.UserRole))))
+        except Exception:
             return
-        wall = next((candidate for candidate in self.floor.walls if candidate.guid == guid), None)
-        if wall is None:
+        objects = self._objects_for_attenuation_group(key, current_floor_only=False)
+        if not objects:
             return
-        for instance in self._wall_instances(wall):
-            instance.attenuation_by_band_db[float(band)] = val
-            instance.rf_customised = True
+        bands = self._frequency_bands()
+        if item.column() == 1:
+            rf_type = item.text().strip()
+            if not rf_type:
+                return
+            for obj in objects:
+                obj.rf_type_override = rf_type
+                obj.rf_customised = True
+        elif 4 <= item.column() < 4 + len(bands):
+            try:
+                value = float(item.text())
+                band = float(item.data(Qt.UserRole + 1))
+            except Exception:
+                return
+            for obj in objects:
+                obj.attenuation_by_band_db[band] = value
+                obj.rf_customised = True
+        else:
+            return
         self.last_result = None
+        self.rssi_results_by_frequency = {}
+        self.draw_floor()
+        self.statusBar().showMessage(f"Updated {len(objects)} matching IFC attenuation instance(s) across the project")
 
     def _sync_slab_attenuation_from_ui(self):
         if not self.floor:
