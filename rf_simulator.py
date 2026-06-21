@@ -98,7 +98,7 @@ except Exception:  # pragma: no cover
 try:
     from shapely.geometry import LineString, Point, Polygon, box
     from shapely.ops import nearest_points, unary_union
-    from shapely.affinity import affine_transform
+    from shapely.affinity import affine_transform, rotate as shapely_rotate
     try:
         from shapely import concave_hull as shapely_concave_hull
     except Exception:  # Shapely < 2.0
@@ -236,6 +236,70 @@ def built_in_antenna_patterns() -> Dict[str, AntennaPattern]:
     }
 
 
+AP_TYPE_PRESETS: Dict[str, Dict[str, str]] = {
+    "Ceiling AP": {
+        "symbol": "circle_cross", "short": "C", "pattern": "Omni ceiling AP",
+        "description": "Ceiling-mounted omnidirectional wireless access point.",
+    },
+    "Wall AP": {
+        "symbol": "square", "short": "W", "pattern": "Wall patch 60 degree",
+        "description": "Wall-mounted access point with a forward-facing coverage pattern.",
+    },
+    "Directional AP": {
+        "symbol": "triangle", "short": "D", "pattern": "Directional sector 90 degree",
+        "description": "Directional access point or sector antenna.",
+    },
+    "Outdoor AP": {
+        "symbol": "hexagon", "short": "O", "pattern": "Omni ceiling AP",
+        "description": "Weather-resistant outdoor access point.",
+    },
+    "Industrial AP": {
+        "symbol": "octagon", "short": "I", "pattern": "Omni ceiling AP",
+        "description": "Rugged or industrial wireless access point.",
+    },
+    "IoT Gateway": {
+        "symbol": "diamond", "short": "G", "pattern": "Omni ceiling AP",
+        "description": "Low-power or sub-GHz IoT/BLE/Zigbee gateway.",
+    },
+    "Cellular Small Cell": {
+        "symbol": "double_circle", "short": "S", "pattern": "Omni ceiling AP",
+        "description": "Indoor private-LTE/5G small cell.",
+    },
+}
+
+
+RADIO_PROFILE_PRESETS: Dict[str, List[Dict[str, object]]] = {
+    "Wi-Fi 5 dual-band": [
+        {"name": "2.4 GHz", "frequency_mhz": 2400.0, "tx_power_dbm": 20.0, "channel": "1", "channel_width_mhz": 20.0, "cutoff_radius_m": 45.0, "spectrum_occupancy_percent": 35.0},
+        {"name": "5 GHz", "frequency_mhz": 5000.0, "tx_power_dbm": 20.0, "channel": "36", "channel_width_mhz": 40.0, "cutoff_radius_m": 35.0, "spectrum_occupancy_percent": 20.0},
+    ],
+    "Wi-Fi 6 dual-band": [
+        {"name": "2.4 GHz", "frequency_mhz": 2400.0, "tx_power_dbm": 20.0, "channel": "1", "channel_width_mhz": 20.0, "cutoff_radius_m": 45.0, "spectrum_occupancy_percent": 30.0},
+        {"name": "5 GHz", "frequency_mhz": 5000.0, "tx_power_dbm": 20.0, "channel": "36", "channel_width_mhz": 80.0, "cutoff_radius_m": 35.0, "spectrum_occupancy_percent": 18.0},
+    ],
+    "Wi-Fi 6E tri-band": [
+        {"name": "2.4 GHz", "frequency_mhz": 2400.0, "tx_power_dbm": 20.0, "channel": "1", "channel_width_mhz": 20.0, "cutoff_radius_m": 45.0, "spectrum_occupancy_percent": 30.0},
+        {"name": "5 GHz", "frequency_mhz": 5000.0, "tx_power_dbm": 20.0, "channel": "36", "channel_width_mhz": 80.0, "cutoff_radius_m": 35.0, "spectrum_occupancy_percent": 18.0},
+        {"name": "6 GHz", "frequency_mhz": 6000.0, "tx_power_dbm": 20.0, "channel": "5", "channel_width_mhz": 80.0, "cutoff_radius_m": 30.0, "spectrum_occupancy_percent": 10.0},
+    ],
+    "Wi-Fi 7 tri-band": [
+        {"name": "2.4 GHz", "frequency_mhz": 2400.0, "tx_power_dbm": 20.0, "channel": "1", "channel_width_mhz": 20.0, "cutoff_radius_m": 45.0, "spectrum_occupancy_percent": 25.0},
+        {"name": "5 GHz", "frequency_mhz": 5000.0, "tx_power_dbm": 20.0, "channel": "36", "channel_width_mhz": 160.0, "cutoff_radius_m": 35.0, "spectrum_occupancy_percent": 15.0},
+        {"name": "6 GHz", "frequency_mhz": 6000.0, "tx_power_dbm": 20.0, "channel": "5", "channel_width_mhz": 320.0, "cutoff_radius_m": 30.0, "spectrum_occupancy_percent": 8.0},
+    ],
+    "2.4 GHz IoT / BLE": [
+        {"name": "2.4 GHz IoT", "frequency_mhz": 2400.0, "tx_power_dbm": 10.0, "channel": "", "channel_width_mhz": 2.0, "cutoff_radius_m": 55.0, "spectrum_occupancy_percent": 10.0},
+    ],
+    "EU sub-GHz IoT": [
+        {"name": "433 MHz", "frequency_mhz": 433.0, "tx_power_dbm": 10.0, "channel": "", "channel_width_mhz": 0.2, "cutoff_radius_m": 120.0, "spectrum_occupancy_percent": 5.0},
+        {"name": "868 MHz", "frequency_mhz": 868.0, "tx_power_dbm": 14.0, "channel": "", "channel_width_mhz": 0.2, "cutoff_radius_m": 90.0, "spectrum_occupancy_percent": 8.0},
+    ],
+    "Private 5G indoor": [
+        {"name": "3.5 GHz", "frequency_mhz": 3500.0, "tx_power_dbm": 24.0, "channel": "n78", "channel_width_mhz": 100.0, "cutoff_radius_m": 40.0, "spectrum_occupancy_percent": 20.0},
+    ],
+}
+
+
 @dataclass
 class APRadio:
     """One RF radio fitted to an AP.
@@ -274,6 +338,8 @@ class AccessPoint:
     downtilt_deg: float = 0.0
     mount_height_m: float = 2.7
     rx_height_m: float = 1.2
+    ap_type: str = "Ceiling AP"
+    radio_profile: str = "Project default radios"
     radios: List[APRadio] = field(default_factory=list)
     max_clients: int = 50
     planned: bool = False
@@ -3065,47 +3131,259 @@ class PlannerBoundaryGraphicsItem(QGraphicsPolygonItem):
         event.accept()
 
 
-class AccessPointGraphicsItem(QGraphicsEllipseItem):
+class APArrayPlacementDialog(QDialog):
+    """Configure a rectangular AP array before the user clicks its origin."""
+
+    def __init__(self, parent=None, initial: Optional[Dict[str, object]] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Access point array placement")
+        initial = dict(initial or {})
+        form = QFormLayout(self)
+
+        self.axial_count = QSpinBox()
+        self.axial_count.setRange(1, 100)
+        self.axial_count.setValue(int(initial.get("axial_count", 3)))
+        self.transverse_count = QSpinBox()
+        self.transverse_count.setRange(1, 100)
+        self.transverse_count.setValue(int(initial.get("transverse_count", 2)))
+        self.axial_spacing = QDoubleSpinBox()
+        self.axial_spacing.setRange(0.1, 1000.0)
+        self.axial_spacing.setDecimals(2)
+        self.axial_spacing.setValue(float(initial.get("axial_spacing_m", 8.0)))
+        self.axial_spacing.setSuffix(" m")
+        self.transverse_spacing = QDoubleSpinBox()
+        self.transverse_spacing.setRange(0.1, 1000.0)
+        self.transverse_spacing.setDecimals(2)
+        self.transverse_spacing.setValue(float(initial.get("transverse_spacing_m", 8.0)))
+        self.transverse_spacing.setSuffix(" m")
+        self.angle = QDoubleSpinBox()
+        self.angle.setRange(-180.0, 180.0)
+        self.angle.setDecimals(1)
+        self.angle.setValue(float(initial.get("angle_deg", 0.0)))
+        self.angle.setSuffix("°")
+        self.centered = QCheckBox("Treat the clicked point as the centre of the array")
+        self.centered.setChecked(bool(initial.get("centered", False)))
+        self.stagger = QCheckBox("Stagger alternate transverse rows by half the axial distance")
+        self.stagger.setChecked(bool(initial.get("stagger", False)))
+
+        form.addRow("APs along axial direction", self.axial_count)
+        form.addRow("APs along transverse direction", self.transverse_count)
+        form.addRow("Axial distance", self.axial_spacing)
+        form.addRow("Transverse distance", self.transverse_spacing)
+        form.addRow("Axial angle", self.angle)
+        form.addRow(self.centered)
+        form.addRow(self.stagger)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def values(self) -> Dict[str, object]:
+        return {
+            "axial_count": int(self.axial_count.value()),
+            "transverse_count": int(self.transverse_count.value()),
+            "axial_spacing_m": float(self.axial_spacing.value()),
+            "transverse_spacing_m": float(self.transverse_spacing.value()),
+            "angle_deg": float(self.angle.value()),
+            "centered": bool(self.centered.isChecked()),
+            "stagger": bool(self.stagger.isChecked()),
+        }
+
+
+class APSpacePlacementDialog(QDialog):
+    """Configure automatic AP placement inside IFC, inferred or user spaces."""
+
+    def __init__(self, parent=None, has_selected_spaces: bool = False):
+        super().__init__(parent)
+        self.setWindowTitle("Place access points from spaces")
+        form = QFormLayout(self)
+        self.scope = QComboBox()
+        if has_selected_spaces:
+            self.scope.addItem("Only spaces selected for AP planning", "selected")
+        self.scope.addItem("All spaces on the current floor", "all")
+        self.strategy = QComboBox()
+        self.strategy.addItem("One AP at a safe point inside each space", "one")
+        self.strategy.addItem("Fill each space using an axial/transverse grid", "grid")
+        self.axial_spacing = QDoubleSpinBox()
+        self.axial_spacing.setRange(0.5, 500.0)
+        self.axial_spacing.setValue(8.0)
+        self.axial_spacing.setSuffix(" m")
+        self.transverse_spacing = QDoubleSpinBox()
+        self.transverse_spacing.setRange(0.5, 500.0)
+        self.transverse_spacing.setValue(8.0)
+        self.transverse_spacing.setSuffix(" m")
+        self.angle = QDoubleSpinBox()
+        self.angle.setRange(-180.0, 180.0)
+        self.angle.setValue(0.0)
+        self.angle.setSuffix("°")
+        self.inset = QDoubleSpinBox()
+        self.inset.setRange(0.0, 50.0)
+        self.inset.setValue(0.5)
+        self.inset.setSuffix(" m")
+        self.minimum_spacing = QDoubleSpinBox()
+        self.minimum_spacing.setRange(0.0, 100.0)
+        self.minimum_spacing.setValue(1.0)
+        self.minimum_spacing.setSuffix(" m")
+        form.addRow("Spaces", self.scope)
+        form.addRow("Placement method", self.strategy)
+        form.addRow("Axial distance", self.axial_spacing)
+        form.addRow("Transverse distance", self.transverse_spacing)
+        form.addRow("Grid angle", self.angle)
+        form.addRow("Keep away from space edge", self.inset)
+        form.addRow("Minimum distance from another AP", self.minimum_spacing)
+        hint = QLabel("Grid controls are ignored when one AP per space is selected. Points are always checked against the usable space polygon.")
+        hint.setWordWrap(True)
+        form.addRow(hint)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def values(self) -> Dict[str, object]:
+        return {
+            "scope": str(self.scope.currentData()),
+            "strategy": str(self.strategy.currentData()),
+            "axial_spacing_m": float(self.axial_spacing.value()),
+            "transverse_spacing_m": float(self.transverse_spacing.value()),
+            "angle_deg": float(self.angle.value()),
+            "inset_m": float(self.inset.value()),
+            "minimum_spacing_m": float(self.minimum_spacing.value()),
+        }
+
+
+def _access_point_symbol_path(ap_type: str, radius: float) -> QPainterPath:
+    definition = AP_TYPE_PRESETS.get(ap_type, AP_TYPE_PRESETS["Ceiling AP"])
+    symbol = definition.get("symbol", "circle_cross")
+    r = float(radius)
+    path = QPainterPath()
+    if symbol == "square":
+        path.addRect(-r, -r, 2.0 * r, 2.0 * r)
+        path.moveTo(-r, 0.0); path.lineTo(r, 0.0)
+    elif symbol == "triangle":
+        path.moveTo(r, 0.0); path.lineTo(-0.75 * r, 0.85 * r); path.lineTo(-0.75 * r, -0.85 * r); path.closeSubpath()
+    elif symbol == "hexagon":
+        points = [QPointF(r * math.cos(math.radians(a)), r * math.sin(math.radians(a))) for a in range(0, 360, 60)]
+        path.moveTo(points[0])
+        for point in points[1:]: path.lineTo(point)
+        path.closeSubpath()
+    elif symbol == "octagon":
+        points = [QPointF(r * math.cos(math.radians(22.5 + a)), r * math.sin(math.radians(22.5 + a))) for a in range(0, 360, 45)]
+        path.moveTo(points[0])
+        for point in points[1:]: path.lineTo(point)
+        path.closeSubpath()
+        path.moveTo(-0.45 * r, 0.0); path.lineTo(0.45 * r, 0.0)
+    elif symbol == "diamond":
+        path.moveTo(0.0, r); path.lineTo(r, 0.0); path.lineTo(0.0, -r); path.lineTo(-r, 0.0); path.closeSubpath()
+        path.addEllipse(-0.18 * r, -0.18 * r, 0.36 * r, 0.36 * r)
+    elif symbol == "double_circle":
+        path.addEllipse(-r, -r, 2.0 * r, 2.0 * r)
+        path.addEllipse(-0.5 * r, -0.5 * r, r, r)
+    else:
+        path.addEllipse(-r, -r, 2.0 * r, 2.0 * r)
+        path.moveTo(-0.65 * r, 0.0); path.lineTo(0.65 * r, 0.0)
+        path.moveTo(0.0, -0.65 * r); path.lineTo(0.0, 0.65 * r)
+    return path
+
+
+class AccessPointGraphicsItem(QGraphicsPathItem):
     def __init__(self, main, ap: AccessPoint, radius: float, colour: QColor):
-        super().__init__(ap.x - radius, ap.y - radius, radius * 2.0, radius * 2.0)
+        super().__init__(_access_point_symbol_path(ap.ap_type, radius))
         self.main = main
         self.ap = ap
         self.radius = radius
-
+        self._drag_origin: Optional[QPointF] = None
+        self._dragged = False
+        self.setPos(float(ap.x), float(ap.y))
         self.setBrush(QBrush(colour))
-        self.setPen(QPen(main._theme_colours()["ap_outline"], 0.2))
+        pen = QPen(main._theme_colours()["ap_outline"], 0.2)
+        pen.setCosmetic(True)
+        self.setPen(pen)
         self.setZValue(Z_AP)
         self.setFlags(
             QGraphicsItem.ItemIsMovable |
             QGraphicsItem.ItemIsSelectable |
             QGraphicsItem.ItemSendsGeometryChanges
         )
+        self.setAcceptedMouseButtons(Qt.LeftButton | Qt.RightButton)
         self.setCursor(Qt.OpenHandCursor)
+        self._refresh_tooltip()
+
+    def _refresh_tooltip(self):
         radio_summary = ", ".join(
             f"{r.frequency_mhz:g} MHz ch {r.channel or 'auto'} / {r.channel_width_mhz:g} MHz"
-            for r in ap.active_radios()
+            for r in self.ap.active_radios()
         )
-        self.setToolTip(f"{ap.name}{' (predicted)' if ap.planned else ''}\n{radio_summary}\nClients/AP: {ap.max_clients}")
+        self.setToolTip(
+            f"{self.ap.name}{' (predicted)' if self.ap.planned else ''}\n"
+            f"Type: {self.ap.ap_type}\nRadio profile: {self.ap.radio_profile}\n"
+            f"{radio_summary}\nClients/AP: {self.ap.max_clients}\n"
+            "Drag to move; hold Shift to constrain movement; right-click for actions."
+        )
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
+            self._drag_origin = QPointF(self.pos())
+            self._dragged = False
             self.setCursor(Qt.ClosedHandCursor)
         super().mousePressEvent(event)
 
+    def mouseMoveEvent(self, event):
+        before = QPointF(self.pos())
+        super().mouseMoveEvent(event)
+        if self._drag_origin is not None and bool(event.modifiers() & Qt.ShiftModifier):
+            delta = self.pos() - self._drag_origin
+            if abs(delta.x()) >= abs(delta.y()):
+                self.setPos(self._drag_origin.x() + delta.x(), self._drag_origin.y())
+            else:
+                self.setPos(self._drag_origin.x(), self._drag_origin.y() + delta.y())
+        if (self.pos() - before).manhattanLength() > 1e-6:
+            self._dragged = True
+
     def mouseReleaseEvent(self, event):
         self.setCursor(Qt.OpenHandCursor)
-        scene_pos = self.sceneBoundingRect().center()
+        scene_pos = self.scenePos()
+        changed = abs(float(scene_pos.x()) - self.ap.x) > 1e-9 or abs(float(scene_pos.y()) - self.ap.y) > 1e-9
         self.ap.x = float(scene_pos.x())
         self.ap.y = float(scene_pos.y())
-        self.main.last_result = None
-        self.main.populate_ap_table()
+        self._drag_origin = None
+        if changed:
+            self.main.last_result = None
+            self.main.rssi_results_by_frequency = {}
+            self.main.populate_ap_table()
+            self.main._preserve_view_on_redraw = True
+            QTimer.singleShot(0, self.main.draw_floor)
+            self.main.statusBar().showMessage(f"Moved {self.ap.name} to ({self.ap.x:.2f}, {self.ap.y:.2f})")
         super().mouseReleaseEvent(event)
 
+    def mouseDoubleClickEvent(self, event):
+        self.main.focus_ap_in_table(self.ap)
+        event.accept()
+
     def contextMenuEvent(self, event):
-        self.main.aps = [a for a in self.main.aps if a is not self.ap]
-        self.main.last_result = None
-        self.main.draw_floor()
-        self.main.populate_ap_table()
+        menu = QMenu()
+        focus_action = menu.addAction("Edit in access point table")
+        duplicate_action = menu.addAction("Duplicate access point")
+        type_menu = menu.addMenu("Change access point type")
+        type_actions = {type_menu.addAction(name): name for name in AP_TYPE_PRESETS}
+        profile_menu = menu.addMenu("Apply radio profile")
+        profile_names = ["Project default radios"] + list(RADIO_PROFILE_PRESETS.keys())
+        profile_actions = {profile_menu.addAction(name): name for name in profile_names}
+        menu.addSeparator()
+        delete_action = menu.addAction("Delete access point")
+        chosen = menu.exec(event.screenPos())
+        if chosen == focus_action:
+            self.main.focus_ap_in_table(self.ap)
+        elif chosen == duplicate_action:
+            self.main.duplicate_access_point(self.ap)
+        elif chosen == delete_action:
+            self.main.delete_access_point(self.ap)
+        elif chosen in type_actions:
+            self.ap.ap_type = type_actions[chosen]
+            self.main.last_result = None
+            self.main.draw_floor()
+            self.main.populate_ap_table()
+        elif chosen in profile_actions:
+            self.main.apply_radio_profile_to_ap(self.ap, profile_actions[chosen])
         event.accept()
 
 # ----------------------------- GUI -----------------------------
@@ -3233,6 +3511,17 @@ class PlanView(QGraphicsView):
                 event.accept()
                 return
 
+        if getattr(self.main, "ap_placement_mode", ""):
+            if event.button() == Qt.RightButton:
+                self.main.cancel_ap_placement()
+                event.accept()
+                return
+            if event.button() == Qt.LeftButton:
+                pos = self.mapToScene(event.position().toPoint())
+                self.main.handle_ap_placement_click(pos)
+                event.accept()
+                return
+
         if event.button() == Qt.LeftButton:
             selectable_items = self.main.selectable_scene_items_at_view_pos(self, event.position().toPoint())
             if len(selectable_items) > 1 and not (event.modifiers() & Qt.ShiftModifier):
@@ -3255,6 +3544,10 @@ class PlanView(QGraphicsView):
         super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape and getattr(self.main, "ap_placement_mode", ""):
+            self.main.cancel_ap_placement()
+            event.accept()
+            return
         if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
             if self.main.delete_selected_scene_items():
                 event.accept()
@@ -3269,6 +3562,8 @@ class PlanView(QGraphicsView):
             or getattr(self.main, "wall_draw_mode", False)
             or getattr(self.main, "space_draw_mode", False)
             or getattr(self.main, "boundary_draw_mode", False)
+            or getattr(self.main, "ap_interaction_mode", False)
+            or getattr(self.main, "ap_placement_mode", "")
         ):
             return
         pos = self.mapToScene(event.position().toPoint())
@@ -3317,6 +3612,13 @@ class MainWindow(QMainWindow):
         self.heatmap_settings_path: Optional[Path] = None
         self.ifc_origin_info: Dict[str, Dict[str, object]] = {}
         self.view_rotation_deg: float = 0.0
+        self.ap_interaction_mode: bool = False
+        self.ap_placement_mode: str = ""
+        self._array_placement_settings: Dict[str, object] = {
+            "axial_count": 3, "transverse_count": 2,
+            "axial_spacing_m": 8.0, "transverse_spacing_m": 8.0,
+            "angle_deg": 0.0, "centered": False, "stagger": False,
+        }
         self.wall_draw_mode: bool = False
         self._wall_draw_start: Optional[QPointF] = None
         self._wall_preview_items: List[QGraphicsItem] = []
@@ -3357,9 +3659,9 @@ class MainWindow(QMainWindow):
         self._configure_wall_table_headers()
         self.wall_table.itemChanged.connect(self._wall_table_changed)
 
-        self.ap_table = QTableWidget(0, 16)
+        self.ap_table = QTableWidget(0, 17)
         self.ap_table.setHorizontalHeaderLabels([
-            "AP", "Radio", "Enabled", "Floor", "X", "Y", "Pattern", "Azimuth", "Downtilt",
+            "AP", "Type", "Radio", "Enabled", "Floor", "X", "Y", "Pattern", "Azimuth", "Downtilt",
             "TX dBm", "Gain dBi", "Freq MHz", "Channel", "Width MHz", "Occupancy %", "Clients/AP"
         ])
         self.ap_table.itemChanged.connect(self._ap_table_changed)
@@ -3386,6 +3688,14 @@ class MainWindow(QMainWindow):
 
         self.pattern_combo = QComboBox()
         self.pattern_combo.addItems(list(self.antenna_patterns.keys()))
+        self.ap_type_combo = QComboBox()
+        for ap_type, definition in AP_TYPE_PRESETS.items():
+            self.ap_type_combo.addItem(ap_type)
+            self.ap_type_combo.setItemData(self.ap_type_combo.count() - 1, definition.get("description", ""), Qt.ToolTipRole)
+        self.ap_type_combo.currentTextChanged.connect(self._new_ap_type_changed)
+        self.radio_profile_combo = QComboBox()
+        self.radio_profile_combo.addItem("Project default radios")
+        self.radio_profile_combo.addItems(list(RADIO_PROFILE_PRESETS.keys()))
         self.azimuth = QDoubleSpinBox()
         self.azimuth.setRange(-180.0, 180.0)
         self.azimuth.setValue(0.0)
@@ -3436,6 +3746,8 @@ class MainWindow(QMainWindow):
         form.addRow("Grid resolution", self.resolution)
         form.addRow("AP TX power", self.tx_power)
         form.addRow("Frequency / Wi-Fi band", self.freq)
+        form.addRow("New AP type", self.ap_type_combo)
+        form.addRow("New AP radio profile", self.radio_profile_combo)
         form.addRow("AP antenna pattern", self.pattern_combo)
         form.addRow("AP azimuth", self.azimuth)
         form.addRow("AP downtilt", self.downtilt)
@@ -3447,12 +3759,12 @@ class MainWindow(QMainWindow):
         form.addRow("Slab loss 2.4 GHz", self.slab_att_24)
         form.addRow("Slab loss 5 GHz", self.slab_att_5)
         form.addRow("Slab loss 6 GHz", self.slab_att_6)
-        instruction = QLabel("Double-click the model to place an AP using the selected pattern and orientation.")
+        instruction = QLabel("Use the Access point tools ribbon to enter AP-only interaction, single placement, array placement or automatic space placement. Legacy double-click placement remains available outside AP-only mode.")
         instruction.setWordWrap(True)
         form.addRow(instruction)
 
         for field in (
-            self.floor_combo, self.rssi_view_frequency, self.pattern_combo,
+            self.floor_combo, self.rssi_view_frequency, self.ap_type_combo, self.radio_profile_combo, self.pattern_combo,
             self.resolution, self.tx_power, self.freq, self.azimuth,
             self.downtilt, self.mount_height, self.rx_height, self.ple,
             self.min_client_rssi, self.slab_att_24, self.slab_att_5, self.slab_att_6,
@@ -3533,6 +3845,18 @@ class MainWindow(QMainWindow):
         self.export_action.triggered.connect(self.export_csv)
         self.clear_ap_action = QAction("Clear APs", self)
         self.clear_ap_action.triggered.connect(self.clear_aps)
+        self.ap_interaction_action = QAction("AP interaction mode", self)
+        self.ap_interaction_action.setCheckable(True)
+        self.ap_interaction_action.toggled.connect(self.toggle_ap_interaction_mode)
+        self.place_ap_action = QAction("Place access points", self)
+        self.place_ap_action.setCheckable(True)
+        self.place_ap_action.toggled.connect(self.toggle_single_ap_placement)
+        self.array_ap_action = QAction("Place AP array", self)
+        self.array_ap_action.triggered.connect(self.start_ap_array_placement)
+        self.space_ap_action = QAction("Place APs from spaces", self)
+        self.space_ap_action.triggered.connect(self.show_space_ap_placement_dialog)
+        self.cancel_ap_tool_action = QAction("Cancel AP tool", self)
+        self.cancel_ap_tool_action.triggered.connect(self.cancel_ap_placement)
         self.load_pattern_action = QAction("Load pattern CSV", self)
         self.load_pattern_action.triggered.connect(self.load_pattern_csv)
         self.load_heatmap_settings_action = QAction("Load heatmap settings", self)
@@ -3606,6 +3930,8 @@ class MainWindow(QMainWindow):
         seen = set()
         selectable: List[QGraphicsItem] = []
         for item in view.items(view_pos):
+            if self.ap_interaction_mode and not isinstance(item, AccessPointGraphicsItem):
+                continue
             if not isinstance(item, selectable_types):
                 continue
             if not (item.flags() & QGraphicsItem.ItemIsSelectable):
@@ -3836,8 +4162,28 @@ class MainWindow(QMainWindow):
                 "SP_DialogSaveButton", "Ctrl+E"
             ),
             "clear_ap_action": (
-                "Clear access points", "Remove every access point from the project after confirmation.",
+                "Clear access points", "Remove every access point from the current floor.",
                 "SP_TrashIcon", ""
+            ),
+            "ap_interaction_action": (
+                "AP interaction", "Make access points the only selectable/movable plan objects. Drag to move and hold Shift to constrain movement.",
+                "SP_ArrowCursor", "Ctrl+Alt+A"
+            ),
+            "place_ap_action": (
+                "Single placement", "Enter continuous single-click access point placement mode. Right-click or press the cancel tool to finish.",
+                "SP_FileDialogNewFolder", "Ctrl+Alt+P"
+            ),
+            "array_ap_action": (
+                "Array placement", "Place a configurable AP array using independent axial and transverse distances.",
+                "SP_FileDialogListView", ""
+            ),
+            "space_ap_action": (
+                "Place from spaces", "Automatically place one or more APs inside IFC, inferred or manually drawn spaces while remaining in the manual workflow.",
+                "SP_DialogApplyButton", ""
+            ),
+            "cancel_ap_tool_action": (
+                "Cancel AP tool", "Exit the active access point placement tool without deleting placed APs.",
+                "SP_DialogCancelButton", "Escape"
             ),
             "load_pattern_action": (
                 "Load antenna pattern", "Import a directional antenna pattern from a CSV file.",
@@ -4000,6 +4346,11 @@ class MainWindow(QMainWindow):
             ("Results and cleanup", ["export_action", "clear_ap_action"]),
         ]), "Home")
         ribbon.addTab(self._make_ribbon_page([
+            ("Interaction", ["ap_interaction_action", "cancel_ap_tool_action"]),
+            ("Manual placement", ["place_ap_action", "array_ap_action"]),
+            ("Space-assisted placement", ["space_ap_action", "select_ap_spaces_action"]),
+        ]), "Access points")
+        ribbon.addTab(self._make_ribbon_page([
             ("IFC information", ["ifc_origin_action"]),
             ("DXF and alignment", ["open_dxf_action", "align_ifc_action", "two_point_align_action", "clear_dxf_action"]),
             ("View orientation", ["rotate_left_action", "rotate_right_action", "reset_rotation_action"]),
@@ -4015,6 +4366,346 @@ class MainWindow(QMainWindow):
             ("Analysis", ["sim_action", "export_action"]),
         ]), "Radio and analysis")
         return ribbon
+
+    # ----------------------------- Access point interaction and placement -----------------------------
+
+    def _new_ap_type_changed(self, ap_type: str):
+        definition = AP_TYPE_PRESETS.get(str(ap_type), {})
+        pattern = str(definition.get("pattern", ""))
+        if pattern and pattern in self.antenna_patterns:
+            self.pattern_combo.setCurrentText(pattern)
+
+    def _cancel_other_drawing_tools_for_ap(self):
+        if getattr(self, "wall_draw_mode", False):
+            self.cancel_user_wall_drawing()
+        if getattr(self, "space_draw_mode", False):
+            self.cancel_space_drawing(show_status=False)
+        if getattr(self, "boundary_draw_mode", False):
+            self.cancel_planner_boundary_drawing(show_status=False)
+
+    def _disable_ap_tools_for_geometry_mode(self):
+        if self.ap_placement_mode:
+            self.cancel_ap_placement(show_status=False)
+        if not self.ap_interaction_mode:
+            return
+        self.ap_interaction_mode = False
+        action = getattr(self, "ap_interaction_action", None)
+        if action is not None:
+            action.blockSignals(True)
+            action.setChecked(False)
+            action.blockSignals(False)
+        self._preserve_view_on_redraw = True
+        self.draw_floor()
+
+    def toggle_ap_interaction_mode(self, enabled: bool):
+        self.ap_interaction_mode = bool(enabled)
+        if enabled:
+            self._cancel_other_drawing_tools_for_ap()
+            self.statusBar().showMessage(
+                "AP interaction mode: only access points can be selected. Drag to move; hold Shift for axial movement; right-click for AP actions."
+            )
+        else:
+            if self.ap_placement_mode:
+                self.cancel_ap_placement(show_status=False)
+            self.statusBar().showMessage("Normal plan interaction restored")
+        self._preserve_view_on_redraw = True
+        self.draw_floor()
+
+    def _ensure_ap_interaction_enabled(self):
+        if self.ap_interaction_mode:
+            return
+        self.ap_interaction_mode = True
+        action = getattr(self, "ap_interaction_action", None)
+        if action is not None:
+            action.blockSignals(True)
+            action.setChecked(True)
+            action.blockSignals(False)
+        self._cancel_other_drawing_tools_for_ap()
+        self._preserve_view_on_redraw = True
+        self.draw_floor()
+
+    def toggle_single_ap_placement(self, enabled: bool):
+        if enabled:
+            if not self.floor:
+                QMessageBox.information(self, "No floor selected", "Load a model and select a floor before placing access points.")
+                self.place_ap_action.blockSignals(True)
+                self.place_ap_action.setChecked(False)
+                self.place_ap_action.blockSignals(False)
+                return
+            self._ensure_ap_interaction_enabled()
+            self.ap_placement_mode = "single"
+            self.view.setCursor(Qt.CrossCursor)
+            self.statusBar().showMessage("Single AP placement: left-click to place repeatedly; right-click or Cancel AP tool to finish.")
+        elif self.ap_placement_mode == "single":
+            self.cancel_ap_placement(show_status=False)
+
+    def cancel_ap_placement(self, show_status: bool = True):
+        self.ap_placement_mode = ""
+        action = getattr(self, "place_ap_action", None)
+        if action is not None:
+            action.blockSignals(True)
+            action.setChecked(False)
+            action.blockSignals(False)
+        self.view.setCursor(Qt.ArrowCursor)
+        if show_status:
+            self.statusBar().showMessage("Access point placement tool cancelled")
+
+    def start_ap_array_placement(self):
+        if not self.floor:
+            QMessageBox.information(self, "No floor selected", "Load a model and select a floor before placing an AP array.")
+            return
+        dialog = APArrayPlacementDialog(self, self._array_placement_settings)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        self._array_placement_settings = dialog.values()
+        self.cancel_ap_placement(show_status=False)
+        self._ensure_ap_interaction_enabled()
+        self.ap_placement_mode = "array"
+        self.view.setCursor(Qt.CrossCursor)
+        values = self._array_placement_settings
+        self.statusBar().showMessage(
+            f"AP array ready: {values['axial_count']} × {values['transverse_count']}, "
+            f"{values['axial_spacing_m']:g} m axial / {values['transverse_spacing_m']:g} m transverse. Click the origin; right-click to cancel."
+        )
+
+    def handle_ap_placement_click(self, pos: QPointF):
+        if self.ap_placement_mode == "single":
+            ap = self.add_ap(float(pos.x()), float(pos.y()))
+            if ap is not None:
+                self.statusBar().showMessage(
+                    f"Placed {ap.name} at ({ap.x:.2f}, {ap.y:.2f}). Continue clicking or right-click to finish."
+                )
+            return
+        if self.ap_placement_mode == "array":
+            self.place_ap_array(float(pos.x()), float(pos.y()), self._array_placement_settings)
+            self.cancel_ap_placement(show_status=False)
+
+    def place_ap_array(self, origin_x: float, origin_y: float, settings: Dict[str, object]):
+        axial_count = max(1, int(settings.get("axial_count", 1)))
+        transverse_count = max(1, int(settings.get("transverse_count", 1)))
+        axial_spacing = max(0.01, float(settings.get("axial_spacing_m", 8.0)))
+        transverse_spacing = max(0.01, float(settings.get("transverse_spacing_m", 8.0)))
+        angle = math.radians(float(settings.get("angle_deg", 0.0)))
+        axial = (math.cos(angle), math.sin(angle))
+        transverse = (-math.sin(angle), math.cos(angle))
+        centered = bool(settings.get("centered", False))
+        stagger = bool(settings.get("stagger", False))
+        axial_origin = -0.5 * (axial_count - 1) * axial_spacing if centered else 0.0
+        transverse_origin = -0.5 * (transverse_count - 1) * transverse_spacing if centered else 0.0
+        total = axial_count * transverse_count
+        if total > 10_000:
+            QMessageBox.warning(self, "AP array too large", "An AP array is limited to 10,000 access points per operation.")
+            return
+        created: List[AccessPoint] = []
+        for transverse_index in range(transverse_count):
+            stagger_offset = 0.5 * axial_spacing if stagger and transverse_index % 2 else 0.0
+            for axial_index in range(axial_count):
+                along = axial_origin + axial_index * axial_spacing + stagger_offset
+                across = transverse_origin + transverse_index * transverse_spacing
+                x = origin_x + axial[0] * along + transverse[0] * across
+                y = origin_y + axial[1] * along + transverse[1] * across
+                ap = self.add_ap(x, y, redraw=False)
+                if ap is not None:
+                    created.append(ap)
+        self.last_result = None
+        self.rssi_results_by_frequency = {}
+        self.draw_floor()
+        self.populate_ap_table()
+        self.statusBar().showMessage(f"Placed {len(created)} access points in an axial/transverse array")
+
+    def show_space_ap_placement_dialog(self):
+        if not self.floor:
+            QMessageBox.information(self, "No floor selected", "Load a model and select a floor before placing access points from spaces.")
+            return
+        if not self.floor.spaces:
+            QMessageBox.information(
+                self, "No spaces available",
+                "This floor has no IFC, inferred or manually drawn spaces. Create or draw spaces first."
+            )
+            return
+        selected = [space for space in self.floor.spaces if space.ap_planning_selected]
+        self.cancel_ap_placement(show_status=False)
+        dialog = APSpacePlacementDialog(self, bool(selected))
+        if dialog.exec() != QDialog.Accepted:
+            return
+        self.place_aps_from_spaces(dialog.values())
+
+    @staticmethod
+    def _point_far_enough(x: float, y: float, points: List[Tuple[float, float]], minimum_spacing: float) -> bool:
+        if minimum_spacing <= 0.0:
+            return True
+        minimum_sq = minimum_spacing * minimum_spacing
+        return all((x - px) ** 2 + (y - py) ** 2 >= minimum_sq for px, py in points)
+
+    def _grid_points_inside_space(
+        self, polygon: Polygon, axial_spacing: float, transverse_spacing: float, angle_deg: float
+    ) -> List[Tuple[float, float]]:
+        centre = polygon.representative_point()
+        rotated = shapely_rotate(polygon, -float(angle_deg), origin=(float(centre.x), float(centre.y)))
+        minx, miny, maxx, maxy = rotated.bounds
+        points: List[Tuple[float, float]] = []
+        maximum_points = 10_000
+        x = minx + 0.5 * axial_spacing
+        while x <= maxx + 1e-9:
+            y = miny + 0.5 * transverse_spacing
+            while y <= maxy + 1e-9:
+                candidate = Point(float(x), float(y))
+                if rotated.covers(candidate):
+                    restored = shapely_rotate(candidate, float(angle_deg), origin=(float(centre.x), float(centre.y)))
+                    points.append((float(restored.x), float(restored.y)))
+                    if len(points) >= maximum_points:
+                        return points
+                y += transverse_spacing
+            x += axial_spacing
+        return points
+
+    def place_aps_from_spaces(self, settings: Dict[str, object]):
+        if not self.floor:
+            return
+        scope = str(settings.get("scope", "all"))
+        spaces = [space for space in self.floor.spaces if scope != "selected" or space.ap_planning_selected]
+        if not spaces and scope == "selected":
+            QMessageBox.information(self, "No selected spaces", "No spaces are selected for AP planning on this floor.")
+            return
+        strategy = str(settings.get("strategy", "one"))
+        axial_spacing = max(0.1, float(settings.get("axial_spacing_m", 8.0)))
+        transverse_spacing = max(0.1, float(settings.get("transverse_spacing_m", 8.0)))
+        angle_deg = float(settings.get("angle_deg", 0.0))
+        inset = max(0.0, float(settings.get("inset_m", 0.0)))
+        minimum_spacing = max(0.0, float(settings.get("minimum_spacing_m", 0.0)))
+        occupied = [(float(ap.x), float(ap.y)) for ap in self.aps if ap.floor == self.floor.name]
+        spacing_grid: Dict[Tuple[int, int], List[Tuple[float, float]]] = {}
+        spacing_cell = max(minimum_spacing, 0.001)
+        if minimum_spacing > 0.0:
+            for px, py in occupied:
+                spacing_grid.setdefault((math.floor(px / spacing_cell), math.floor(py / spacing_cell)), []).append((px, py))
+
+        def point_available(x: float, y: float) -> bool:
+            if minimum_spacing <= 0.0:
+                return True
+            cell_x = math.floor(x / spacing_cell)
+            cell_y = math.floor(y / spacing_cell)
+            minimum_sq = minimum_spacing * minimum_spacing
+            for offset_x in (-1, 0, 1):
+                for offset_y in (-1, 0, 1):
+                    for px, py in spacing_grid.get((cell_x + offset_x, cell_y + offset_y), []):
+                        if (x - px) ** 2 + (y - py) ** 2 < minimum_sq:
+                            return False
+            return True
+
+        def remember_point(x: float, y: float):
+            occupied.append((x, y))
+            if minimum_spacing > 0.0:
+                spacing_grid.setdefault((math.floor(x / spacing_cell), math.floor(y / spacing_cell)), []).append((x, y))
+
+        created: List[AccessPoint] = []
+        placement_limit = 10_000
+        skipped_spaces = 0
+        successful_spaces = 0
+        processed_spaces = 0
+        limit_reached = False
+        for space in spaces:
+            processed_spaces += 1
+            polygon = space.polygon
+            if inset > 0.0:
+                inset_polygon = polygon.buffer(-inset)
+                if not inset_polygon.is_empty:
+                    if inset_polygon.geom_type == "Polygon":
+                        polygon = inset_polygon
+                    else:
+                        parts = [part for part in getattr(inset_polygon, "geoms", []) if part.geom_type == "Polygon"]
+                        if parts:
+                            polygon = max(parts, key=lambda part: float(part.area))
+            if polygon.is_empty:
+                skipped_spaces += 1
+                continue
+            if strategy == "grid":
+                candidates = self._grid_points_inside_space(polygon, axial_spacing, transverse_spacing, angle_deg)
+                if not candidates:
+                    representative = polygon.representative_point()
+                    candidates = [(float(representative.x), float(representative.y))]
+            else:
+                representative = polygon.representative_point()
+                candidates = [(float(representative.x), float(representative.y))]
+            accepted_in_space = 0
+            for x, y in candidates:
+                if not polygon.covers(Point(x, y)):
+                    continue
+                if not point_available(x, y):
+                    continue
+                ap = self.add_ap(x, y, redraw=False)
+                if ap is not None:
+                    created.append(ap)
+                    remember_point(x, y)
+                    accepted_in_space += 1
+                    if len(created) >= placement_limit:
+                        limit_reached = True
+                        break
+            if accepted_in_space == 0:
+                skipped_spaces += 1
+            else:
+                successful_spaces += 1
+            if limit_reached:
+                break
+        self.last_result = None
+        self.rssi_results_by_frequency = {}
+        self._ensure_ap_interaction_enabled()
+        self.draw_floor()
+        self.populate_ap_table()
+        QMessageBox.information(
+            self, "Space-assisted AP placement",
+            f"Placed {len(created)} access point(s) inside {successful_spaces} space(s)."
+            + (f"\n{skipped_spaces} processed space(s) produced no new point because of geometry or minimum-spacing constraints." if skipped_spaces else "")
+            + (f"\nPlacement stopped at the safety limit of {placement_limit:,} APs after processing {processed_spaces} of {len(spaces)} spaces." if limit_reached else "")
+        )
+
+    def focus_ap_in_table(self, ap: AccessPoint):
+        self.inspector_tabs.setCurrentIndex(1)
+        for row in range(self.ap_table.rowCount()):
+            item = self.ap_table.item(row, 0)
+            if item is not None and item.data(Qt.UserRole) == ap.name:
+                self.ap_table.selectRow(row)
+                self.ap_table.scrollToItem(item)
+                self.ap_table.setCurrentItem(item)
+                return
+
+    def duplicate_access_point(self, ap: AccessPoint):
+        duplicate = replace(
+            ap,
+            name=self._next_ap_name(),
+            x=float(ap.x) + 1.0,
+            y=float(ap.y) + 1.0,
+            planned=False,
+            radios=[replace(radio) for radio in ap.radios],
+        )
+        self.aps.append(duplicate)
+        self.last_result = None
+        self.rssi_results_by_frequency = {}
+        self.draw_floor()
+        self.populate_ap_table()
+        self.statusBar().showMessage(f"Duplicated {ap.name} as {duplicate.name}")
+
+    def delete_access_point(self, ap: AccessPoint):
+        self.aps = [candidate for candidate in self.aps if candidate is not ap]
+        self.last_result = None
+        self.rssi_results_by_frequency = {}
+        self.draw_floor()
+        self.populate_ap_table()
+        self.statusBar().showMessage(f"Deleted {ap.name}")
+
+    def apply_radio_profile_to_ap(self, ap: AccessPoint, profile_name: str):
+        ap.radios = self._radios_for_profile(profile_name, ap.ap_type)
+        ap.radio_profile = str(profile_name)
+        if ap.radios:
+            ap.tx_power_dbm = float(ap.radios[0].tx_power_dbm)
+            ap.frequency_mhz = float(ap.radios[0].frequency_mhz)
+            ap.antenna_pattern = ap.radios[0].antenna_pattern
+        self.last_result = None
+        self.rssi_results_by_frequency = {}
+        self._refresh_rssi_frequency_dropdown()
+        self.draw_floor()
+        self.populate_ap_table()
+        self.statusBar().showMessage(f"Applied {profile_name} to {ap.name}")
 
     # ----------------------------- View/origin tools -----------------------------
 
@@ -4065,6 +4756,8 @@ class MainWindow(QMainWindow):
         self._wall_preview_items = []
 
     def toggle_wall_draw_mode(self, enabled: bool):
+        if enabled:
+            self._disable_ap_tools_for_geometry_mode()
         if enabled and getattr(self, "boundary_draw_mode", False):
             self.cancel_planner_boundary_drawing()
         if enabled and getattr(self, "space_draw_mode", False):
@@ -4104,6 +4797,8 @@ class MainWindow(QMainWindow):
         self._space_preview_items = []
 
     def toggle_space_draw_mode(self, enabled: bool):
+        if enabled:
+            self._disable_ap_tools_for_geometry_mode()
         if enabled and getattr(self, "wall_draw_mode", False):
             self.cancel_user_wall_drawing()
         if enabled and getattr(self, "boundary_draw_mode", False):
@@ -4157,6 +4852,8 @@ class MainWindow(QMainWindow):
         self._boundary_preview_items = []
 
     def toggle_planner_boundary_draw_mode(self, enabled: bool, shape: str = "rectangle"):
+        if enabled:
+            self._disable_ap_tools_for_geometry_mode()
         shape = "polygon" if str(shape).lower() == "polygon" else "rectangle"
         if not enabled and (
             not self.boundary_draw_mode or self.boundary_draw_shape != shape
@@ -6393,6 +7090,7 @@ class MainWindow(QMainWindow):
                 ) for req in requirements]
                 return AccessPoint(
                     name="candidate", x=x, y=y, floor=self.floor.name, radios=radios,
+                    ap_type="Directional AP" if directional else "Ceiling AP", radio_profile="Predictive planner",
                     path_loss_exponent=float(self.ple.value()), azimuth_deg=azimuth,
                     mount_height_m=float(self.mount_height.value()), rx_height_m=float(self.rx_height.value()),
                     max_clients=settings.clients_per_ap, planned=True,
@@ -6736,6 +7434,7 @@ class MainWindow(QMainWindow):
                 "reference_loss_db_at_1m": ap.reference_loss_db_at_1m, "path_loss_exponent": ap.path_loss_exponent,
                 "antenna_pattern": ap.antenna_pattern, "azimuth_deg": ap.azimuth_deg, "downtilt_deg": ap.downtilt_deg,
                 "mount_height_m": ap.mount_height_m, "rx_height_m": ap.rx_height_m,
+                "ap_type": ap.ap_type, "radio_profile": ap.radio_profile,
                 "max_clients": ap.max_clients, "planned": ap.planned,
                 "radios": [self._radio_to_dict(radio) for radio in ap.radios],
             })
@@ -7045,8 +7744,9 @@ class MainWindow(QMainWindow):
                 reference_loss_db_at_1m=float(item.get("reference_loss_db_at_1m", 40.0)), path_loss_exponent=float(item.get("path_loss_exponent", 2.2)),
                 antenna_pattern=str(item.get("antenna_pattern", "Omni ceiling AP")), azimuth_deg=float(item.get("azimuth_deg", 0.0)),
                 downtilt_deg=float(item.get("downtilt_deg", 0.0)), mount_height_m=float(item.get("mount_height_m", 2.7)),
-                rx_height_m=float(item.get("rx_height_m", 1.2)), radios=radios,
-                max_clients=int(item.get("max_clients", 50)), planned=bool(item.get("planned", False)),
+                rx_height_m=float(item.get("rx_height_m", 1.2)),
+                ap_type=str(item.get("ap_type", "Ceiling AP")), radio_profile=str(item.get("radio_profile", "Project default radios")),
+                radios=radios, max_clients=int(item.get("max_clients", 50)), planned=bool(item.get("planned", False)),
             ))
         self.auto_planner_settings = AutoPlannerSettings.from_dict(data.get("auto_planner_settings", {}))
         selected_floor = str(data.get("selected_floor", ""))
@@ -7057,6 +7757,7 @@ class MainWindow(QMainWindow):
         if abs(saved_rotation) > 1e-9:
             self.rotate_view(saved_rotation)
         self.last_result = None; self.rssi_results_by_frequency = {}
+        self._refresh_rssi_frequency_dropdown()
         self.populate_ap_table(); self.populate_wall_table(); self.draw_floor()
         self.statusBar().showMessage("Loaded RF plan")
 
@@ -8147,64 +8848,75 @@ class MainWindow(QMainWindow):
         self.populate_ap_table()
         self.populate_wall_table()
 
-    def add_ap(self, x: float, y: float):
-        if not self.floor:
-            return
-        default_radios = []
-        for idx, radio_def in enumerate(self.heatmap_settings.default_ap_radios or []):
-            # Settings should provide each radio as a dict. If an older/edited
-            # settings file has a bare number or other value, skip it instead of
-            # trying to call ``radio_def.get(...)`` on a float.
+    def _radios_for_profile(self, profile_name: str, ap_type: str) -> List[APRadio]:
+        profile_name = str(profile_name or "Project default radios")
+        if profile_name == "Project default radios":
+            definitions = list(self.heatmap_settings.default_ap_radios or [])
+        else:
+            definitions = list(RADIO_PROFILE_PRESETS.get(profile_name, []))
+        type_pattern = str(AP_TYPE_PRESETS.get(ap_type, AP_TYPE_PRESETS["Ceiling AP"]).get("pattern", self.pattern_combo.currentText()))
+        radios: List[APRadio] = []
+        for index, radio_def in enumerate(definitions):
             if not isinstance(radio_def, dict):
                 continue
-            get_value = dict.get
-            pattern = str(get_value(radio_def, "antenna_pattern", self.pattern_combo.currentText()))
+            pattern = str(radio_def.get("antenna_pattern", type_pattern))
             if pattern not in self.antenna_patterns:
-                pattern = self.pattern_combo.currentText()
-            default_radios.append(APRadio(
-                name=str(get_value(radio_def, "name", f"Radio-{idx + 1}")),
-                frequency_mhz=float(get_value(radio_def, "frequency_mhz", self.freq.value())),
-                tx_power_dbm=float(get_value(radio_def, "tx_power_dbm", self.tx_power.value())),
+                pattern = type_pattern if type_pattern in self.antenna_patterns else self.pattern_combo.currentText()
+            radios.append(APRadio(
+                name=str(radio_def.get("name", f"Radio-{index + 1}")),
+                frequency_mhz=float(radio_def.get("frequency_mhz", self.freq.value())),
+                tx_power_dbm=float(radio_def.get("tx_power_dbm", self.tx_power.value())),
                 antenna_pattern=pattern,
-                enabled=bool(get_value(radio_def, "enabled", True)),
-                cutoff_radius_m=float(get_value(radio_def, "cutoff_radius_m", 0.0)),
-                antenna_gain_dbi=float(get_value(radio_def, "antenna_gain_dbi", 0.0)),
-                channel=str(get_value(radio_def, "channel", "")),
-                channel_width_mhz=float(get_value(radio_def, "channel_width_mhz", 20.0)),
-                spectrum_occupancy_percent=float(get_value(radio_def, "spectrum_occupancy_percent", 0.0)),
+                enabled=bool(radio_def.get("enabled", True)),
+                cutoff_radius_m=float(radio_def.get("cutoff_radius_m", 0.0)),
+                antenna_gain_dbi=float(radio_def.get("antenna_gain_dbi", 0.0)),
+                channel=str(radio_def.get("channel", "")),
+                channel_width_mhz=float(radio_def.get("channel_width_mhz", 20.0)),
+                spectrum_occupancy_percent=float(radio_def.get("spectrum_occupancy_percent", 0.0)),
             ))
-        if not default_radios:
-            default_radios = [APRadio(
-                name="Radio-1",
-                frequency_mhz=float(self.freq.value()),
-                tx_power_dbm=float(self.tx_power.value()),
-                antenna_pattern=self.pattern_combo.currentText(),
-                enabled=True,
+        if not radios:
+            radios = [APRadio(
+                name="Radio-1", frequency_mhz=float(self.freq.value()), tx_power_dbm=float(self.tx_power.value()),
+                antenna_pattern=type_pattern if type_pattern in self.antenna_patterns else self.pattern_combo.currentText(), enabled=True,
             )]
+        return radios
+
+    def add_ap(
+        self, x: float, y: float, *, redraw: bool = True,
+        ap_type: Optional[str] = None, radio_profile: Optional[str] = None,
+        planned: bool = False,
+    ) -> Optional[AccessPoint]:
+        if not self.floor:
+            return None
+        selected_type = str(ap_type or self.ap_type_combo.currentText() or "Ceiling AP")
+        if selected_type not in AP_TYPE_PRESETS:
+            selected_type = "Ceiling AP"
+        selected_profile = str(radio_profile or self.radio_profile_combo.currentText() or "Project default radios")
+        default_radios = self._radios_for_profile(selected_profile, selected_type)
         first_radio = default_radios[0]
         ap = AccessPoint(
-            name=self._next_ap_name(),
-            x=x,
-            y=y,
-            floor=self.floor.name,
-            tx_power_dbm=float(first_radio.tx_power_dbm),
-            frequency_mhz=float(first_radio.frequency_mhz),
-            path_loss_exponent=float(self.ple.value()),
-            antenna_pattern=first_radio.antenna_pattern,
-            azimuth_deg=float(self.azimuth.value()),
-            downtilt_deg=float(self.downtilt.value()),
-            mount_height_m=float(self.mount_height.value()),
-            rx_height_m=float(self.rx_height.value()),
-            radios=default_radios,
-            max_clients=int(self.auto_planner_settings.clients_per_ap),
-            planned=False,
+            name=self._next_ap_name(), x=float(x), y=float(y), floor=self.floor.name,
+            tx_power_dbm=float(first_radio.tx_power_dbm), frequency_mhz=float(first_radio.frequency_mhz),
+            path_loss_exponent=float(self.ple.value()), antenna_pattern=first_radio.antenna_pattern,
+            azimuth_deg=float(self.azimuth.value()), downtilt_deg=float(self.downtilt.value()),
+            mount_height_m=float(self.mount_height.value()), rx_height_m=float(self.rx_height.value()),
+            ap_type=selected_type, radio_profile=selected_profile,
+            radios=default_radios, max_clients=int(self.auto_planner_settings.clients_per_ap), planned=bool(planned),
         )
         self.aps.append(ap)
-        self.draw_floor()
-        self.populate_ap_table()
+        self.last_result = None
+        self.rssi_results_by_frequency = {}
+        self._refresh_rssi_frequency_dropdown()
+        if redraw:
+            self.draw_floor()
+            self.populate_ap_table()
+        return ap
 
     def clear_aps(self):
         self.aps = [a for a in self.aps if not self.floor or a.floor != self.floor.name]
+        self.last_result = None
+        self.rssi_results_by_frequency = {}
+        self._refresh_rssi_frequency_dropdown()
         self.draw_floor()
         self.populate_ap_table()
 
@@ -8345,21 +9057,42 @@ class MainWindow(QMainWindow):
                 dot = AccessPointGraphicsItem(self, ap, radius, colour)
                 scene.addItem(dot)
             else:
-                dot = QGraphicsEllipseItem(ap.x - radius, ap.y - radius, radius * 2.0, radius * 2.0)
+                dot = QGraphicsPathItem(_access_point_symbol_path(ap.ap_type, radius))
+                dot.setPos(float(ap.x), float(ap.y))
                 dot.setBrush(QBrush(colour))
-                dot.setPen(QPen(colours["ap_outline"], 0.2))
+                other_pen = QPen(colours["ap_outline"], 0.2)
+                other_pen.setCosmetic(True)
+                dot.setPen(other_pen)
+                dot.setAcceptedMouseButtons(Qt.NoButton)
                 dot.setZValue(Z_AP - 5)
                 scene.addItem(dot)
 
-            # Draw a short boresight arrow so directional antenna orientation can be checked.
+            # Keep the boresight arrow parented to the AP symbol so it follows live drag movement.
             length = 5.0 if same_floor else 3.0
             ang = math.radians(ap.azimuth_deg)
-            x2 = ap.x + length * math.cos(ang)
-            y2 = ap.y + length * math.sin(ang)
-            arrow = scene.addLine(ap.x, ap.y, x2, y2, QPen(colour, 0.25))
-            arrow.setZValue(Z_AP)
-            if not same_floor:
-                self._add_upright_text(scene, ap.floor, ap.x + 0.8, ap.y + 0.8, colour, self.heatmap_settings.ap_label_font_size, Z_AP_LABEL)
+            arrow_path = QPainterPath(QPointF(0.0, 0.0))
+            arrow_path.lineTo(length * math.cos(ang), length * math.sin(ang))
+            arrow = QGraphicsPathItem(arrow_path, dot)
+            arrow_pen = QPen(colour, 0.25)
+            arrow_pen.setCosmetic(True)
+            arrow.setPen(arrow_pen)
+            arrow.setBrush(QBrush(Qt.NoBrush))
+            arrow.setAcceptedMouseButtons(Qt.NoButton)
+            arrow.setZValue(1.0)
+            type_short = AP_TYPE_PRESETS.get(ap.ap_type, AP_TYPE_PRESETS["Ceiling AP"]).get("short", "AP")
+            label = f"{ap.name} [{type_short}]" if same_floor else f"{ap.floor}: {ap.name} [{type_short}]"
+            self._add_upright_text(
+                scene, label, ap.x + radius + 0.25, ap.y + radius + 0.25,
+                colour, self.heatmap_settings.ap_label_font_size, Z_AP_LABEL, bold=same_floor,
+            )
+
+        if self.ap_interaction_mode:
+            for item in scene.items():
+                if isinstance(item, AccessPointGraphicsItem):
+                    continue
+                item.setAcceptedMouseButtons(Qt.NoButton)
+                if item.flags() & QGraphicsItem.ItemIsSelectable:
+                    item.setFlag(QGraphicsItem.ItemIsSelectable, False)
 
         old_transform = self.view.transform()
         old_h = self.view.horizontalScrollBar().value()
@@ -8719,6 +9452,7 @@ class MainWindow(QMainWindow):
                 self.ap_table.insertRow(row)
                 values = [
                     ap.name,
+                    ap.ap_type,
                     radio.name,
                     "Yes" if radio.enabled else "No",
                     ap.floor,
@@ -8762,32 +9496,48 @@ class MainWindow(QMainWindow):
         try:
             radio_index = int(radio_index or 0)
             radio = ap.radios[radio_index]
-            if item.column() == 1:
-                radio.name = item.text().strip() or radio.name
+            if item.column() == 0:
+                new_name = item.text().strip()
+                if new_name and not any(candidate is not ap and candidate.name == new_name for candidate in self.aps):
+                    ap.name = new_name
+            elif item.column() == 1:
+                if item.text() in AP_TYPE_PRESETS:
+                    ap.ap_type = item.text()
             elif item.column() == 2:
+                radio.name = item.text().strip() or radio.name
+            elif item.column() == 3:
                 radio.enabled = item.text().strip().lower() in {"yes", "y", "true", "1", "on", "enabled"}
+            elif item.column() == 4:
+                if item.text() in self.floors:
+                    ap.floor = item.text()
+            elif item.column() == 5:
+                ap.x = float(item.text())
             elif item.column() == 6:
+                ap.y = float(item.text())
+            elif item.column() == 7:
                 if item.text() in self.antenna_patterns:
                     radio.antenna_pattern = item.text()
-            elif item.column() == 7:
-                ap.azimuth_deg = float(item.text())
             elif item.column() == 8:
-                ap.downtilt_deg = float(item.text())
+                ap.azimuth_deg = float(item.text())
             elif item.column() == 9:
-                radio.tx_power_dbm = float(item.text())
+                ap.downtilt_deg = float(item.text())
             elif item.column() == 10:
-                radio.antenna_gain_dbi = float(item.text())
+                radio.tx_power_dbm = float(item.text())
             elif item.column() == 11:
+                radio.antenna_gain_dbi = float(item.text())
+            elif item.column() == 12:
                 radio.frequency_mhz = float(item.text())
                 self._refresh_rssi_frequency_dropdown()
-            elif item.column() == 12:
-                radio.channel = item.text().strip()
             elif item.column() == 13:
-                radio.channel_width_mhz = max(1.0, float(item.text()))
+                radio.channel = item.text().strip()
             elif item.column() == 14:
-                radio.spectrum_occupancy_percent = max(0.0, min(100.0, float(item.text())))
+                radio.channel_width_mhz = max(0.01, float(item.text()))
             elif item.column() == 15:
+                radio.spectrum_occupancy_percent = max(0.0, min(100.0, float(item.text())))
+            elif item.column() == 16:
                 ap.max_clients = max(1, int(float(item.text())))
+            if item.column() in {2, 3, 7, 10, 11, 12, 13, 14, 15}:
+                ap.radio_profile = "Custom"
             # Keep legacy AP fields in sync with the first radio for older code/export.
             if ap.radios:
                 ap.tx_power_dbm = float(ap.radios[0].tx_power_dbm)
@@ -8796,7 +9546,9 @@ class MainWindow(QMainWindow):
         except (ValueError, IndexError):
             return
         self.last_result = None
+        self.rssi_results_by_frequency = {}
         self.draw_floor()
+        self.populate_ap_table()
 
     def populate_wall_table(self):
         self.wall_table.blockSignals(True)
