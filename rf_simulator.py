@@ -3116,13 +3116,18 @@ class PlanView(QGraphicsView):
         self.main = main
         self.setScene(QGraphicsScene(self))
         self.setRenderHints(self.renderHints())
-        self.setDragMode(QGraphicsView.ScrollHandDrag)
+        # Left-drag is reserved for rubber-band selection so overlapping/stacked
+        # inferred spaces and IFC items can be selected and removed with Delete.
+        # Middle mouse still provides pan/hand dragging.
+        self.setDragMode(QGraphicsView.RubberBandDrag)
+        self.setRubberBandSelectionMode(Qt.IntersectsItemShape)
         # Keep cosmetic pens and device-independent text crisp on high-DPI screens.
         self.setOptimizationFlag(QGraphicsView.DontAdjustForAntialiasing, False)
         self.setMouseTracking(True)
         self.scale(1, -1)  # IFC Y-up style plan view
         self._middle_panning = False
         self._last_pan_pos = None
+        self._press_pos = None
 
     def wheelEvent(self, event):
         factor = 1.2 if event.angleDelta().y() > 0 else 1 / 1.2
@@ -3167,6 +3172,7 @@ class PlanView(QGraphicsView):
         super().mouseMoveEvent(event)
 
     def mousePressEvent(self, event):
+        self._press_pos = event.position().toPoint()
         if getattr(self.main, "space_draw_mode", False):
             if event.button() == Qt.RightButton:
                 if len(getattr(self.main, "_space_polygon_points", [])) >= 3:
@@ -3229,10 +3235,10 @@ class PlanView(QGraphicsView):
 
         if event.button() == Qt.LeftButton:
             selectable_items = self.main.selectable_scene_items_at_view_pos(self, event.position().toPoint())
-            if len(selectable_items) > 1:
+            if len(selectable_items) > 1 and not (event.modifiers() & Qt.ShiftModifier):
                 chosen = self.main.choose_scene_item_from_overlap(selectable_items, event.globalPosition().toPoint())
                 if chosen is not None:
-                    self.main.activate_scene_item_selection(chosen)
+                    self.main.activate_scene_item_selection(chosen, toggle_ap_space=False)
                 event.accept()
                 return
 
@@ -3659,13 +3665,17 @@ class MainWindow(QMainWindow):
             return None
         return items[row]
 
-    def activate_scene_item_selection(self, item: QGraphicsItem):
+    def activate_scene_item_selection(self, item: QGraphicsItem, toggle_ap_space: bool = False):
         scene = self.view.scene() if getattr(self, "view", None) else None
         if scene is not None:
             scene.clearSelection()
         item.setSelected(True)
         if isinstance(item, (InferredSpaceGraphicsItem, SpaceGraphicsItem)):
-            self.toggle_space_ap_planning_selection(item.space)
+            if toggle_ap_space:
+                self.toggle_space_ap_planning_selection(item.space)
+            else:
+                source = "Inferred space" if isinstance(item, InferredSpaceGraphicsItem) else ("User space" if item.space.is_user_created else "IFC space")
+                self.statusBar().showMessage(f"Selected {source.lower()} '{item.space.name or item.space.guid}'. Press Delete to remove it, or right-click for AP placement options.")
             return
         if isinstance(item, AccessPointGraphicsItem):
             self.statusBar().showMessage(f"Selected access point '{item.ap.name}'")
@@ -3699,36 +3709,89 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Select an AP, wall, space, IFC element or boundary before pressing Delete")
             return False
 
-        item = max(selected_items, key=lambda candidate: candidate.zValue())
-        if isinstance(item, AccessPointGraphicsItem):
-            self.aps = [ap for ap in self.aps if ap is not item.ap]
-            self.last_result = None
-            self.draw_floor()
-            self.populate_ap_table()
-            self.statusBar().showMessage(f"Deleted access point '{item.ap.name}'")
-            return True
-        if isinstance(item, PlannerBoundaryGraphicsItem):
-            self.delete_planner_boundary(item.boundary)
-            return True
-        if isinstance(item, InferredSpaceGraphicsItem):
-            self.delete_inferred_space(item.space)
-            return True
-        if isinstance(item, SpaceGraphicsItem):
-            if item.space.is_user_created:
-                self.delete_user_space(item.space)
-            else:
-                self.delete_imported_space(item.space)
-            return True
-        if isinstance(item, WallGraphicsItem):
-            if item.wall.is_user_created:
-                self.delete_user_wall(item.wall)
-            else:
-                self.delete_imported_wall(item.wall)
-            return True
-        if isinstance(item, IFCElementGraphicsItem):
-            self.delete_imported_element(item.element)
-            return True
-        return False
+        # A rubber-band/selection-window can select several overlapping graphics
+        # items. Delete all unique underlying model objects in a stable order,
+        # rather than just the topmost item, so inferred spaces can be removed
+        # even when IFC elements are drawn above them.
+        deleted_labels: List[str] = []
+        seen = set()
+        for item in sorted(selected_items, key=lambda candidate: candidate.zValue(), reverse=True):
+            if isinstance(item, AccessPointGraphicsItem):
+                key = ("ap", id(item.ap))
+                if key in seen:
+                    continue
+                seen.add(key)
+                self.aps = [ap for ap in self.aps if ap is not item.ap]
+                deleted_labels.append(f"access point '{item.ap.name}'")
+                continue
+            if isinstance(item, PlannerBoundaryGraphicsItem):
+                key = ("boundary", id(item.boundary))
+                if key in seen:
+                    continue
+                seen.add(key)
+                self.planner_boundaries = [candidate for candidate in self.planner_boundaries if candidate is not item.boundary]
+                deleted_labels.append(f"planner boundary '{item.boundary.name}'")
+                continue
+            if isinstance(item, InferredSpaceGraphicsItem):
+                key = ("inferred_space", id(item.space))
+                if key in seen:
+                    continue
+                seen.add(key)
+                floor = self.floors.get(item.space.floor)
+                if floor is not None and item.space.is_inferred:
+                    floor.spaces = [candidate for candidate in floor.spaces if candidate is not item.space]
+                    deleted_labels.append(f"inferred space '{item.space.name}'")
+                continue
+            if isinstance(item, SpaceGraphicsItem):
+                key = ("space", id(item.space))
+                if key in seen:
+                    continue
+                seen.add(key)
+                floor = self.floors.get(item.space.floor)
+                if floor is not None:
+                    floor.spaces = [candidate for candidate in floor.spaces if candidate is not item.space]
+                    if item.space.is_user_created:
+                        deleted_labels.append(f"user space '{item.space.name}'")
+                    else:
+                        self._remember_ifc_exclusion("space", item.space.source_file, item.space.guid)
+                        deleted_labels.append(f"IFC space '{item.space.name or item.space.guid}'")
+                continue
+            if isinstance(item, WallGraphicsItem):
+                key = ("wall", id(item.wall))
+                if key in seen:
+                    continue
+                seen.add(key)
+                floor = self.floors.get(item.wall.floor)
+                if floor is not None:
+                    floor.walls = [candidate for candidate in floor.walls if candidate is not item.wall]
+                    if item.wall.is_user_created:
+                        deleted_labels.append(f"user wall '{item.wall.label}'")
+                    else:
+                        self._remember_ifc_exclusion("wall", item.wall.source_file, item.wall.guid)
+                        deleted_labels.append(f"IFC wall '{item.wall.label}'")
+                continue
+            if isinstance(item, IFCElementGraphicsItem):
+                key = ("element", id(item.element))
+                if key in seen:
+                    continue
+                seen.add(key)
+                floor = self.floors.get(item.element.floor)
+                if floor is not None:
+                    floor.elements = [candidate for candidate in floor.elements if candidate is not item.element]
+                    self._remember_ifc_exclusion("element", item.element.source_file, item.element.guid)
+                    deleted_labels.append(f"IFC element '{item.element.name or item.element.guid}'")
+
+        if not deleted_labels:
+            return False
+        self.last_result = None
+        self.draw_floor()
+        self.populate_ap_table()
+        self.populate_wall_table()
+        if len(deleted_labels) == 1:
+            self.statusBar().showMessage(f"Deleted {deleted_labels[0]}")
+        else:
+            self.statusBar().showMessage(f"Deleted {len(deleted_labels)} selected items")
+        return True
 
     # ----------------------------- Ribbon interface -----------------------------
 
