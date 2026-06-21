@@ -39,7 +39,7 @@ except Exception:
     contourpy = None
 
 from PySide6.QtCore import QPointF, Qt, Slot, QTimer, QSize
-from PySide6.QtGui import QAction, QColor, QBrush, QFont, QPen, QPolygonF, QPainterPath, QPalette, QTransform, QIcon
+from PySide6.QtGui import QAction, QColor, QBrush, QFont, QPen, QPolygonF, QPainterPath, QPalette, QTransform, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -542,6 +542,32 @@ class IFCElement2D:
     z_max: float = 0.0
     source_storey: str = ""
     projected_to_floor: bool = False
+    # Doors and windows are imported as context elements, but also act as RF
+    # barriers. The host-wall reference prevents the opening and its wall from
+    # being counted together when the radio path passes through the opening.
+    rf_category: str = ""
+    host_wall_guid: str = ""
+    attenuation_by_band_db: Dict[float, float] = field(default_factory=dict)
+
+    @property
+    def is_rf_opening(self) -> bool:
+        return self.rf_category in {"door", "window"} and bool(self.attenuation_by_band_db)
+
+    def attenuation_db_for_frequency(self, frequency_mhz: float) -> float:
+        if not self.attenuation_by_band_db:
+            return 0.0
+        bands = sorted(float(k) for k in self.attenuation_by_band_db.keys())
+        if frequency_mhz <= bands[0]:
+            return float(self.attenuation_by_band_db[bands[0]])
+        if frequency_mhz >= bands[-1]:
+            return float(self.attenuation_by_band_db[bands[-1]])
+        for lo, hi in zip(bands, bands[1:]):
+            if lo <= frequency_mhz <= hi:
+                lo_v = float(self.attenuation_by_band_db[lo])
+                hi_v = float(self.attenuation_by_band_db[hi])
+                t = (frequency_mhz - lo) / (hi - lo)
+                return lo_v + (hi_v - lo_v) * t
+        return float(self.attenuation_by_band_db[bands[-1]])
 
 
 @dataclass
@@ -646,6 +672,25 @@ class HeatmapSettings:
         "partition": {433.0: 1.0, 868.0: 1.5, 2400.0: 3.0, 5000.0: 4.0, 6000.0: 5.0},
         "metal": {433.0: 12.0, 868.0: 16.0, 2400.0: 20.0, 5000.0: 28.0, 6000.0: 35.0},
         "steel": {433.0: 12.0, 868.0: 16.0, 2400.0: 20.0, 5000.0: 28.0, 6000.0: 35.0}
+    })
+    default_door_attenuation_by_material_db: Dict[str, Dict[float, float]] = field(default_factory=lambda: {
+        "default": {433.0: 2.0, 868.0: 3.0, 2400.0: 4.0, 5000.0: 6.0, 6000.0: 8.0},
+        "timber": {433.0: 1.5, 868.0: 2.0, 2400.0: 3.0, 5000.0: 4.0, 6000.0: 5.0},
+        "wood": {433.0: 1.5, 868.0: 2.0, 2400.0: 3.0, 5000.0: 4.0, 6000.0: 5.0},
+        "glass": {433.0: 0.8, 868.0: 1.2, 2400.0: 2.0, 5000.0: 3.0, 6000.0: 4.0},
+        "metal": {433.0: 8.0, 868.0: 10.0, 2400.0: 12.0, 5000.0: 18.0, 6000.0: 22.0},
+        "steel": {433.0: 8.0, 868.0: 10.0, 2400.0: 12.0, 5000.0: 18.0, 6000.0: 22.0},
+        "fire": {433.0: 7.0, 868.0: 9.0, 2400.0: 11.0, 5000.0: 16.0, 6000.0: 20.0},
+    })
+    default_window_attenuation_by_material_db: Dict[str, Dict[float, float]] = field(default_factory=lambda: {
+        "default": {433.0: 0.8, 868.0: 1.2, 2400.0: 2.0, 5000.0: 3.0, 6000.0: 4.0},
+        "glass": {433.0: 0.8, 868.0: 1.2, 2400.0: 2.0, 5000.0: 3.0, 6000.0: 4.0},
+        "double": {433.0: 1.0, 868.0: 1.5, 2400.0: 2.5, 5000.0: 4.0, 6000.0: 5.0},
+        "triple": {433.0: 1.2, 868.0: 1.8, 2400.0: 3.0, 5000.0: 5.0, 6000.0: 6.0},
+        "low-e": {433.0: 3.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 14.0, 6000.0: 18.0},
+        "low e": {433.0: 3.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 14.0, 6000.0: 18.0},
+        "metallised": {433.0: 4.0, 868.0: 6.0, 2400.0: 10.0, 5000.0: 16.0, 6000.0: 20.0},
+        "metalized": {433.0: 4.0, 868.0: 6.0, 2400.0: 10.0, 5000.0: 16.0, 6000.0: 20.0},
     })
     default_ap_radios: List[Dict[str, object]] = field(default_factory=lambda: [
         {"name": "2.4 GHz", "frequency_mhz": 2400.0, "tx_power_dbm": 20.0, "antenna_pattern": "Omni ceiling AP", "enabled": True, "cutoff_radius_m": 45.0, "antenna_gain_dbi": 0.0, "channel": "1", "channel_width_mhz": 20.0, "spectrum_occupancy_percent": 35.0},
@@ -838,6 +883,23 @@ class HeatmapSettings:
                     parsed[str(mat).lower()] = {float(k): float(v) for k, v in profile.items()}
             if parsed:
                 settings.default_wall_attenuation_by_material_db = parsed
+        def _material_profile_dict(raw, fallback):
+            if not isinstance(raw, dict):
+                return fallback
+            parsed_profiles = {}
+            for material_name, profile in raw.items():
+                if isinstance(profile, dict):
+                    parsed_profiles[str(material_name).lower()] = {float(k): float(v) for k, v in profile.items()}
+            return parsed_profiles or fallback
+
+        settings.default_door_attenuation_by_material_db = _material_profile_dict(
+            data.get("default_door_attenuation_by_material_db", data.get("door_attenuation_by_material_db", {})),
+            settings.default_door_attenuation_by_material_db,
+        )
+        settings.default_window_attenuation_by_material_db = _material_profile_dict(
+            data.get("default_window_attenuation_by_material_db", data.get("window_attenuation_by_material_db", {})),
+            settings.default_window_attenuation_by_material_db,
+        )
         raw_radios = data.get("default_ap_radios", settings.default_ap_radios)
         if isinstance(raw_radios, list):
             settings.default_ap_radios = [dict(r) for r in raw_radios if isinstance(r, dict)]
@@ -1103,6 +1165,9 @@ class IFCModelLoader:
             floor_names = [assigned_floor]
             mat = self._material_name(element)
             type_name = self._type_name(element)
+            rf_category = "door" if element.is_a("IfcDoor") else ("window" if element.is_a("IfcWindow") else "")
+            host_wall_guid = self._host_wall_guid_for_filling(element) if rf_category else ""
+            opening_profile = self._default_opening_attenuation_profile(rf_category, mat, type_name) if rf_category else {}
             for floor_name in floor_names:
                 floors.setdefault(floor_name, FloorModel(name=floor_name, elevation=0.0)).elements.append(
                     IFCElement2D(
@@ -1116,6 +1181,9 @@ class IFCModelLoader:
                         z_min=z_min,
                         z_max=z_max,
                         source_storey=source_floor or "",
+                        rf_category=rf_category,
+                        host_wall_guid=host_wall_guid,
+                        attenuation_by_band_db=dict(opening_profile),
                     )
                 )
 
@@ -1438,6 +1506,46 @@ class IFCModelLoader:
         return ", ".join(dict.fromkeys([n for n in names if n]))
 
     @staticmethod
+    def _host_wall_guid_for_filling(product) -> str:
+        """Return the wall GUID filled by an IfcDoor/IfcWindow when available."""
+        try:
+            for fill_relation in (getattr(product, "FillsVoids", None) or []):
+                opening = getattr(fill_relation, "RelatingOpeningElement", None)
+                if opening is None:
+                    continue
+                for void_relation in (getattr(opening, "VoidsElements", None) or []):
+                    host = getattr(void_relation, "RelatingBuildingElement", None)
+                    if host is None:
+                        continue
+                    if host.is_a("IfcWall") or host.is_a("IfcWallStandardCase"):
+                        return str(getattr(host, "GlobalId", "") or "")
+        except Exception:
+            pass
+        return ""
+
+    @staticmethod
+    def _default_opening_attenuation_profile(category: str, material: str, type_name: str) -> Dict[float, float]:
+        """Planning assumptions for door/window penetration loss by RF band."""
+        text = f"{material} {type_name}".lower()
+        if category == "window":
+            if any(key in text for key in ("low-e", "low e", "metallised", "metalized", "solar control", "coated")):
+                return {433.0: 3.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 14.0, 6000.0: 18.0}
+            if "triple" in text:
+                return {433.0: 1.2, 868.0: 1.8, 2400.0: 3.0, 5000.0: 5.0, 6000.0: 6.0}
+            if "double" in text:
+                return {433.0: 1.0, 868.0: 1.5, 2400.0: 2.5, 5000.0: 4.0, 6000.0: 5.0}
+            return {433.0: 0.8, 868.0: 1.2, 2400.0: 2.0, 5000.0: 3.0, 6000.0: 4.0}
+        if category == "door":
+            if any(key in text for key in ("steel", "metal", "fire", "security")):
+                return {433.0: 8.0, 868.0: 10.0, 2400.0: 12.0, 5000.0: 18.0, 6000.0: 22.0}
+            if "glass" in text or "glazed" in text:
+                return {433.0: 0.8, 868.0: 1.2, 2400.0: 2.0, 5000.0: 3.0, 6000.0: 4.0}
+            if any(key in text for key in ("timber", "wood")):
+                return {433.0: 1.5, 868.0: 2.0, 2400.0: 3.0, 5000.0: 4.0, 6000.0: 5.0}
+            return {433.0: 2.0, 868.0: 3.0, 2400.0: 4.0, 5000.0: 6.0, 6000.0: 8.0}
+        return {}
+
+    @staticmethod
     def _default_attenuation_profile(material: str, type_name: str) -> Dict[float, float]:
         """Default attenuation assumptions by Wi-Fi band.
 
@@ -1669,6 +1777,8 @@ class CombinedIFCModel:
             for element in getattr(inc_floor, "elements", []):
                 element.floor = key
                 element.guid = f"{source_name}:{element.guid}"
+                if getattr(element, "host_wall_guid", ""):
+                    element.host_wall_guid = f"{source_name}:{element.host_wall_guid}"
                 target[key].elements.append(element)
         return target
 
@@ -1746,6 +1856,7 @@ class RFEngine:
         include_inter_floor: bool = True,
         heatmap_settings: Optional[HeatmapSettings] = None,
         wall_indexes: Optional[Dict[str, Tuple[object, List[Wall2D], Dict[int, Wall2D]]]] = None,
+        opening_indexes: Optional[Dict[str, Tuple[object, List[IFCElement2D], Dict[int, IFCElement2D]]]] = None,
     ) -> float:
         """Calculate RSSI at a receiver point on receiver_floor.
 
@@ -1785,21 +1896,38 @@ class RFEngine:
 
         line = LineString([(ap.x, ap.y), (x, y)])
         wall_loss = 0.0
+        opening_loss = 0.0
         checked_wall_guids = set()
-        # Include walls on every floor crossed by the 3D path. This matters for
-        # multi-storey elements which have been copied into each intersected
-        # storey slice during IFC loading, such as lift shafts, riser walls,
-        # atrium glazing and external facade elements. A GUID is counted only
-        # once so the same spanning object does not multiply its attenuation.
+        checked_opening_guids = set()
+        # Include walls and RF-active openings on every floor crossed by the 3D
+        # path. A door/window replaces its host wall at that crossing rather
+        # than adding both losses together. The vertical opening extent is also
+        # checked so a ray above a door or below/above a window still sees wall.
         for path_floor in RFEngine.floors_between_inclusive(receiver_floor, ap_floor, floors):
+            active_openings: List[IFCElement2D] = []
+            for opening in RFEngine._openings_intersecting_line(path_floor, line, opening_indexes):
+                opening_key = opening.guid or f"{opening.source_file}:{opening.name}:{opening.z_min:.3f}:{opening.z_max:.3f}"
+                if opening_key in checked_opening_guids:
+                    continue
+                if not opening.polygon.intersects(line):
+                    continue
+                if not RFEngine._opening_intersects_3d_path(opening, line, ap_z, rx_z):
+                    continue
+                opening_loss += opening.attenuation_db_for_frequency(radio.frequency_mhz)
+                checked_opening_guids.add(opening_key)
+                active_openings.append(opening)
+
             for wall in RFEngine._walls_intersecting_line(path_floor, line, wall_indexes):
                 wall_key = wall.guid or f"{wall.source_file}:{wall.name}:{wall.z_min:.3f}:{wall.z_max:.3f}"
-                if wall_key not in checked_wall_guids and wall.polygon.intersects(line):
-                    wall_loss += wall.attenuation_db_for_frequency(radio.frequency_mhz)
-                    checked_wall_guids.add(wall_key)
+                if wall_key in checked_wall_guids or not wall.polygon.intersects(line):
+                    continue
+                if any(RFEngine._opening_replaces_wall(opening, wall) for opening in active_openings):
+                    continue
+                wall_loss += wall.attenuation_db_for_frequency(radio.frequency_mhz)
+                checked_wall_guids.add(wall_key)
 
         floor_loss = RFEngine.floor_penetration_loss_db(receiver_floor, ap_floor, floors, radio.frequency_mhz)
-        return radio.tx_power_dbm + pattern_gain + float(getattr(radio, "antenna_gain_dbi", 0.0) or 0.0) - path_loss - wall_loss - floor_loss
+        return radio.tx_power_dbm + pattern_gain + float(getattr(radio, "antenna_gain_dbi", 0.0) or 0.0) - path_loss - wall_loss - opening_loss - floor_loss
 
     @staticmethod
     def floors_between_inclusive(receiver_floor: FloorModel, ap_floor: FloorModel, floors: Dict[str, FloorModel]) -> List[FloorModel]:
@@ -1894,6 +2022,94 @@ class RFEngine:
         return list(getattr(floor, "walls", []) or [])
 
     @staticmethod
+    def _build_opening_indexes(
+        floors: Dict[str, FloorModel],
+    ) -> Dict[str, Tuple[object, List[IFCElement2D], Dict[int, IFCElement2D]]]:
+        indexes: Dict[str, Tuple[object, List[IFCElement2D], Dict[int, IFCElement2D]]] = {}
+        try:
+            from shapely.strtree import STRtree
+        except Exception:
+            return indexes
+        for floor in floors.values():
+            openings = [
+                element for element in (getattr(floor, "elements", []) or [])
+                if getattr(element, "is_rf_opening", False)
+                and element.polygon is not None
+                and not element.polygon.is_empty
+            ]
+            if not openings:
+                continue
+            try:
+                tree = STRtree([opening.polygon for opening in openings])
+                by_geometry_id = {id(opening.polygon): opening for opening in openings}
+                indexes[floor.name] = (tree, openings, by_geometry_id)
+            except Exception:
+                continue
+        return indexes
+
+    @staticmethod
+    def _openings_intersecting_line(
+        floor: FloorModel,
+        line: LineString,
+        opening_indexes: Optional[Dict[str, Tuple[object, List[IFCElement2D], Dict[int, IFCElement2D]]]] = None,
+    ) -> Iterable[IFCElement2D]:
+        if opening_indexes:
+            indexed = opening_indexes.get(floor.name)
+            if indexed is not None:
+                tree, openings, by_geometry_id = indexed
+                try:
+                    hits = tree.query(line)
+                    result: List[IFCElement2D] = []
+                    for hit in hits:
+                        if isinstance(hit, (int, np.integer)):
+                            idx = int(hit)
+                            if 0 <= idx < len(openings):
+                                result.append(openings[idx])
+                        else:
+                            opening = by_geometry_id.get(id(hit))
+                            if opening is not None:
+                                result.append(opening)
+                    return result
+                except Exception:
+                    pass
+        return [
+            element for element in (getattr(floor, "elements", []) or [])
+            if getattr(element, "is_rf_opening", False)
+        ]
+
+    @staticmethod
+    def _opening_intersects_3d_path(opening: IFCElement2D, line: LineString, ap_z: float, rx_z: float) -> bool:
+        try:
+            intersection = opening.polygon.intersection(line)
+            if intersection.is_empty:
+                return False
+            point = intersection.centroid
+            horizontal_length = float(line.length)
+            fraction = 0.0 if horizontal_length <= 1e-9 else max(0.0, min(1.0, float(line.project(point)) / horizontal_length))
+            path_z = float(ap_z) + fraction * (float(rx_z) - float(ap_z))
+            tolerance = 0.12
+            return float(opening.z_min) - tolerance <= path_z <= float(opening.z_max) + tolerance
+        except Exception:
+            # If an IFC exporter gives unusable vertical metadata, retaining the
+            # 2D opening is preferable to silently ignoring all door/window loss.
+            return True
+
+    @staticmethod
+    def _opening_replaces_wall(opening: IFCElement2D, wall: Wall2D) -> bool:
+        host_guid = str(getattr(opening, "host_wall_guid", "") or "")
+        if host_guid and host_guid == str(getattr(wall, "guid", "") or ""):
+            return True
+        if host_guid:
+            return False
+        try:
+            # Fallback for IFCs that omit IfcRelFillsElement/IfcRelVoidsElement:
+            # use a small tolerance because simplified panel footprints can sit
+            # just proud of the host wall centreline.
+            return opening.polygon.buffer(0.08).intersects(wall.polygon)
+        except Exception:
+            return False
+
+    @staticmethod
     def simulate(
         floor: FloorModel,
         floors: Dict[str, FloorModel],
@@ -1950,6 +2166,7 @@ class RFEngine:
             progress_callback(0, len(ys))
 
         wall_indexes = RFEngine._build_wall_indexes(floors)
+        opening_indexes = RFEngine._build_opening_indexes(floors)
         for iy, yy in enumerate(ys):
             for ix, xx in enumerate(xs):
                 values = []
@@ -1960,7 +2177,7 @@ class RFEngine:
                     if RFEngine.point_is_inside_radio_cutoff(xx, yy, floor, ap, floors, radio, heatmap_settings):
                         values.append(RFEngine.rssi_at(
                             xx, yy, floor, ap, floors, patterns, radio,
-                            include_inter_floor, heatmap_settings, wall_indexes,
+                            include_inter_floor, heatmap_settings, wall_indexes, opening_indexes,
                         ))
                 grid[iy, ix] = max(values) if values else disconnected
             if progress_callback:
@@ -2598,6 +2815,7 @@ def _rf_grid_tile_worker(args):
     tile = np.full((len(ys_slice), len(xs)), float(disconnected), dtype=float)
     radio_links = RFEngine._active_radio_links(floor, aps, include_inter_floor)
     wall_indexes = RFEngine._build_wall_indexes(floors)
+    opening_indexes = RFEngine._build_opening_indexes(floors)
     for iy, yy in enumerate(ys_slice):
         for ix, xx in enumerate(xs):
             values = []
@@ -2605,7 +2823,7 @@ def _rf_grid_tile_worker(args):
                 if RFEngine.point_is_inside_radio_cutoff(float(xx), float(yy), floor, ap, floors, radio, heatmap_settings):
                     values.append(RFEngine.rssi_at(
                         float(xx), float(yy), floor, ap, floors, patterns, radio,
-                        include_inter_floor, heatmap_settings, wall_indexes,
+                        include_inter_floor, heatmap_settings, wall_indexes, opening_indexes,
                     ))
             tile[iy, ix] = max(values) if values else float(disconnected)
     return int(start_index), tile
@@ -2627,6 +2845,8 @@ Z_CONTOUR_LINE = 20
 Z_SAMPLE_MARK = 30
 Z_TEXT = 40
 Z_AP = 50
+Z_AP_RULER = 52
+Z_AP_RULER_LABEL = 54
 Z_AP_LABEL = 55
 
 class WallAttenuationDialog(QDialog):
@@ -3067,12 +3287,23 @@ class IFCElementGraphicsItem(QGraphicsPolygonItem):
         self.element = element
         self.setPen(pen)
         self.setBrush(brush)
-        self.setZValue(Z_IFC_SPACE_OUTLINE)
+        self.setZValue(Z_IFC_WALL + 1 if element.is_rf_opening else Z_IFC_SPACE_OUTLINE)
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         self.setAcceptedMouseButtons(Qt.LeftButton | Qt.RightButton)
         material = f"\n{element.material}" if element.material else ""
+        if element.is_rf_opening:
+            losses = ", ".join(
+                f"{frequency:g} MHz: {loss:g} dB"
+                for frequency, loss in sorted(element.attenuation_by_band_db.items())
+            )
+            rf_note = (
+                f"\nRF {element.rf_category} barrier: {losses}\n"
+                "When crossed, this opening loss replaces its host wall loss."
+            )
+        else:
+            rf_note = ""
         self.setToolTip(
-            f"{element.name or element.guid}\n{element.type_name}{material}\n"
+            f"{element.name or element.guid}\n{element.type_name}{material}{rf_note}\n"
             "Right-click to remove this imported IFC element from the RF model."
         )
 
@@ -3291,8 +3522,10 @@ class AccessPointGraphicsItem(QGraphicsPathItem):
         self.main = main
         self.ap = ap
         self.radius = radius
-        self._drag_origin: Optional[QPointF] = None
+        self._drag_press_scene: Optional[QPointF] = None
+        self._drag_items: List[Tuple[QGraphicsItem, QPointF]] = []
         self._dragged = False
+        self._toggle_selection_on_click = False
         self.setPos(float(ap.x), float(ap.y))
         self.setBrush(QBrush(colour))
         pen = QPen(main._theme_colours()["ap_outline"], 0.2)
@@ -3317,52 +3550,115 @@ class AccessPointGraphicsItem(QGraphicsPathItem):
             f"{self.ap.name}{' (predicted)' if self.ap.planned else ''}\n"
             f"Type: {self.ap.ap_type}\nRadio profile: {self.ap.radio_profile}\n"
             f"{radio_summary}\nClients/AP: {self.ap.max_clients}\n"
-            "Drag to move; hold Shift to constrain movement; right-click for actions."
+            "Select several APs with Shift/Ctrl or a selection window, then drag any selected AP to move the group. "
+            "Hold Shift while dragging to constrain movement; right-click for actions."
         )
 
+    def _selected_ap_items(self) -> List["AccessPointGraphicsItem"]:
+        scene = self.scene()
+        if scene is None:
+            return [self]
+        selected = [
+            item for item in scene.selectedItems()
+            if isinstance(item, AccessPointGraphicsItem)
+        ]
+        return selected or [self]
+
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self._drag_origin = QPointF(self.pos())
-            self._dragged = False
-            self.setCursor(Qt.ClosedHandCursor)
-        super().mousePressEvent(event)
+        if event.button() != Qt.LeftButton:
+            super().mousePressEvent(event)
+            return
+
+        scene = self.scene()
+        modifiers = event.modifiers()
+        control = bool(modifiers & Qt.ControlModifier)
+        additive = control or bool(modifiers & Qt.ShiftModifier)
+        was_selected = self.isSelected()
+
+        # Preserve an existing multi-selection when a selected AP is grabbed.
+        # Ctrl/Shift can add an AP to the group; Ctrl-click without dragging can
+        # still remove an already selected AP on release.
+        if not was_selected:
+            if scene is not None and not additive:
+                scene.clearSelection()
+            self.setSelected(True)
+        self._toggle_selection_on_click = bool(control and was_selected)
+
+        selected_items = self._selected_ap_items()
+        if self not in selected_items:
+            selected_items.append(self)
+        self._drag_items = [(item, QPointF(item.pos())) for item in selected_items]
+        self._drag_press_scene = QPointF(event.scenePos())
+        self._dragged = False
+        self.setCursor(Qt.ClosedHandCursor)
+        event.accept()
 
     def mouseMoveEvent(self, event):
-        before = QPointF(self.pos())
-        super().mouseMoveEvent(event)
-        if self._drag_origin is not None and bool(event.modifiers() & Qt.ShiftModifier):
-            delta = self.pos() - self._drag_origin
+        if self._drag_press_scene is None or not (event.buttons() & Qt.LeftButton):
+            super().mouseMoveEvent(event)
+            return
+
+        delta = event.scenePos() - self._drag_press_scene
+        if bool(event.modifiers() & Qt.ShiftModifier):
             if abs(delta.x()) >= abs(delta.y()):
-                self.setPos(self._drag_origin.x() + delta.x(), self._drag_origin.y())
+                delta.setY(0.0)
             else:
-                self.setPos(self._drag_origin.x(), self._drag_origin.y() + delta.y())
-        if (self.pos() - before).manhattanLength() > 1e-6:
+                delta.setX(0.0)
+
+        for item, origin in self._drag_items:
+            item.setPos(origin + delta)
+        if getattr(self.main, "ap_ruler_enabled", False):
+            self.main.refresh_access_point_rulers()
+        if delta.manhattanLength() > 1e-6:
             self._dragged = True
+        event.accept()
 
     def mouseReleaseEvent(self, event):
+        if event.button() != Qt.LeftButton or self._drag_press_scene is None:
+            super().mouseReleaseEvent(event)
+            return
+
         self.setCursor(Qt.OpenHandCursor)
-        scene_pos = self.scenePos()
-        changed = abs(float(scene_pos.x()) - self.ap.x) > 1e-9 or abs(float(scene_pos.y()) - self.ap.y) > 1e-9
-        self.ap.x = float(scene_pos.x())
-        self.ap.y = float(scene_pos.y())
-        self._drag_origin = None
-        if changed:
-            self.main.last_result = None
-            self.main.rssi_results_by_frequency = {}
-            self.main.populate_ap_table()
-            self.main._preserve_view_on_redraw = True
-            QTimer.singleShot(0, self.main.draw_floor)
-            self.main.statusBar().showMessage(f"Moved {self.ap.name} to ({self.ap.x:.2f}, {self.ap.y:.2f})")
-        super().mouseReleaseEvent(event)
+        moved_aps: List[AccessPoint] = []
+        total_delta = QPointF(0.0, 0.0)
+        for item, origin in self._drag_items:
+            if not isinstance(item, AccessPointGraphicsItem):
+                continue
+            scene_pos = item.scenePos()
+            if (scene_pos - origin).manhattanLength() > 1e-9:
+                moved_aps.append(item.ap)
+                total_delta = scene_pos - origin
+            item.ap.x = float(scene_pos.x())
+            item.ap.y = float(scene_pos.y())
+
+        if self._toggle_selection_on_click and not self._dragged:
+            self.setSelected(False)
+
+        self._drag_press_scene = None
+        self._drag_items = []
+        self._toggle_selection_on_click = False
+        if moved_aps:
+            self.main.commit_access_point_group_move(moved_aps, total_delta)
+        event.accept()
 
     def mouseDoubleClickEvent(self, event):
         self.main.focus_ap_in_table(self.ap)
         event.accept()
 
     def contextMenuEvent(self, event):
+        # Right-clicking an unselected AP makes it the operation target. If it is
+        # already part of a multi-selection, preserve the complete selection.
+        if not self.isSelected():
+            scene = self.scene()
+            if scene is not None:
+                scene.clearSelection()
+            self.setSelected(True)
+
         menu = QMenu()
         focus_action = menu.addAction("Edit in access point table")
         duplicate_action = menu.addAction("Duplicate access point")
+        copy_action = menu.addAction("Copy selected access point(s)    Ctrl+C")
+        paste_action = menu.addAction("Paste access point(s)    Ctrl+V")
         type_menu = menu.addMenu("Change access point type")
         type_actions = {type_menu.addAction(name): name for name in AP_TYPE_PRESETS}
         profile_menu = menu.addMenu("Apply radio profile")
@@ -3375,6 +3671,10 @@ class AccessPointGraphicsItem(QGraphicsPathItem):
             self.main.focus_ap_in_table(self.ap)
         elif chosen == duplicate_action:
             self.main.duplicate_access_point(self.ap)
+        elif chosen == copy_action:
+            self.main.copy_selected_access_points()
+        elif chosen == paste_action:
+            self.main.paste_access_points()
         elif chosen == delete_action:
             self.main.delete_access_point(self.ap)
         elif chosen in type_actions:
@@ -3406,12 +3706,44 @@ class PlanView(QGraphicsView):
         self._middle_panning = False
         self._last_pan_pos = None
         self._press_pos = None
+        self._rssi_hover_label = QLabel(self.viewport())
+        self._rssi_hover_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._rssi_hover_label.setStyleSheet(
+            "QLabel { background: rgba(20, 24, 30, 225); color: white; "
+            "border: 1px solid rgba(255,255,255,120); border-radius: 4px; padding: 4px 7px; }"
+        )
+        self._rssi_hover_label.hide()
+
+    def show_rssi_hover(self, text: str, viewport_pos):
+        self._rssi_hover_label.setText(text)
+        self._rssi_hover_label.adjustSize()
+        margin = 8
+        x = int(viewport_pos.x()) + 16
+        y = int(viewport_pos.y()) + 16
+        x = max(margin, min(x, self.viewport().width() - self._rssi_hover_label.width() - margin))
+        y = max(margin, min(y, self.viewport().height() - self._rssi_hover_label.height() - margin))
+        self._rssi_hover_label.move(x, y)
+        self._rssi_hover_label.show()
+        self._rssi_hover_label.raise_()
+
+    def hide_rssi_hover(self):
+        self._rssi_hover_label.hide()
+
+    def leaveEvent(self, event):
+        self.hide_rssi_hover()
+        super().leaveEvent(event)
 
     def wheelEvent(self, event):
         factor = 1.2 if event.angleDelta().y() > 0 else 1 / 1.2
         self.scale(factor, factor)
 
     def mouseMoveEvent(self, event):
+        viewport_pos = event.position().toPoint()
+        scene_hover_pos = self.mapToScene(viewport_pos)
+        if self._middle_panning:
+            self.hide_rssi_hover()
+        else:
+            self.main.update_rssi_hover_readout(scene_hover_pos, viewport_pos)
         shift_constrain = bool(event.modifiers() & Qt.ShiftModifier)
         if getattr(self.main, "space_draw_mode", False) and bool(getattr(self.main, "_space_polygon_points", [])):
             pos = self.mapToScene(event.position().toPoint())
@@ -3544,6 +3876,14 @@ class PlanView(QGraphicsView):
         super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event):
+        if event.matches(QKeySequence.StandardKey.Copy):
+            if self.main.copy_selected_access_points():
+                event.accept()
+                return
+        if event.matches(QKeySequence.StandardKey.Paste):
+            if self.main.paste_access_points():
+                event.accept()
+                return
         if event.key() == Qt.Key_Escape and getattr(self.main, "ap_placement_mode", ""):
             self.main.cancel_ap_placement()
             event.accept()
@@ -3614,6 +3954,13 @@ class MainWindow(QMainWindow):
         self.view_rotation_deg: float = 0.0
         self.ap_interaction_mode: bool = False
         self.ap_placement_mode: str = ""
+        self.ap_ruler_enabled: bool = False
+        self._ap_ruler_items: List[QGraphicsItem] = []
+        self._updating_ap_rulers: bool = False
+        self._drawing_floor: bool = False
+        self._ap_clipboard_signature: str = ""
+        self._ap_paste_generation: int = 0
+        self._pending_ap_selection_ids = set()
         self._array_placement_settings: Dict[str, object] = {
             "axial_count": 3, "transverse_count": 2,
             "axial_spacing_m": 8.0, "transverse_spacing_m": 8.0,
@@ -3649,6 +3996,7 @@ class MainWindow(QMainWindow):
         self._preserve_view_on_redraw = False
 
         self.view = PlanView(self)
+        self.view.scene().selectionChanged.connect(self._ap_scene_selection_changed)
         self.rssi_legend = QLabel()
         self.rssi_legend.setWordWrap(True)
         self.rssi_legend.setMinimumHeight(72)
@@ -3759,7 +4107,7 @@ class MainWindow(QMainWindow):
         form.addRow("Slab loss 2.4 GHz", self.slab_att_24)
         form.addRow("Slab loss 5 GHz", self.slab_att_5)
         form.addRow("Slab loss 6 GHz", self.slab_att_6)
-        instruction = QLabel("Use the Access point tools ribbon to enter AP-only interaction, single placement, array placement or automatic space placement. Legacy double-click placement remains available outside AP-only mode.")
+        instruction = QLabel("Use the Access point tools ribbon to enter AP-only interaction, toggle horizontal/vertical AP rulers, use single or array placement, or place automatically from spaces. Window-select or Shift/Ctrl-select APs for group movement. Ctrl+C and Ctrl+V copy and paste selected AP layouts. Legacy double-click placement remains available outside AP-only mode.")
         instruction.setWordWrap(True)
         form.addRow(instruction)
 
@@ -3848,6 +4196,9 @@ class MainWindow(QMainWindow):
         self.ap_interaction_action = QAction("AP interaction mode", self)
         self.ap_interaction_action.setCheckable(True)
         self.ap_interaction_action.toggled.connect(self.toggle_ap_interaction_mode)
+        self.ap_ruler_action = QAction("Access point ruler", self)
+        self.ap_ruler_action.setCheckable(True)
+        self.ap_ruler_action.toggled.connect(self.toggle_ap_ruler)
         self.place_ap_action = QAction("Place access points", self)
         self.place_ap_action.setCheckable(True)
         self.place_ap_action.toggled.connect(self.toggle_single_ap_placement)
@@ -3857,6 +4208,10 @@ class MainWindow(QMainWindow):
         self.space_ap_action.triggered.connect(self.show_space_ap_placement_dialog)
         self.cancel_ap_tool_action = QAction("Cancel AP tool", self)
         self.cancel_ap_tool_action.triggered.connect(self.cancel_ap_placement)
+        self.copy_ap_action = QAction("Copy access points", self)
+        self.copy_ap_action.triggered.connect(self.copy_selected_access_points)
+        self.paste_ap_action = QAction("Paste access points", self)
+        self.paste_ap_action.triggered.connect(self.paste_access_points)
         self.load_pattern_action = QAction("Load pattern CSV", self)
         self.load_pattern_action.triggered.connect(self.load_pattern_csv)
         self.load_heatmap_settings_action = QAction("Load heatmap settings", self)
@@ -3904,6 +4259,9 @@ class MainWindow(QMainWindow):
         self.load_plan_action = QAction("Load RF plan", self)
         self.load_plan_action.triggered.connect(self.load_rf_plan)
         self._configure_ribbon_actions()
+        for shortcut_action in (self.copy_ap_action, self.paste_ap_action):
+            shortcut_action.setShortcutContext(Qt.WidgetWithChildrenShortcut)
+            self.view.addAction(shortcut_action)
         self.ribbon = self._build_ribbon()
 
         central = QWidget()
@@ -4166,8 +4524,12 @@ class MainWindow(QMainWindow):
                 "SP_TrashIcon", ""
             ),
             "ap_interaction_action": (
-                "AP interaction", "Make access points the only selectable/movable plan objects. Drag to move and hold Shift to constrain movement.",
+                "AP interaction", "Make access points the only selectable/movable plan objects. Window-select or Shift/Ctrl-select several APs, then drag any selected AP to move the group; hold Shift to constrain movement.",
                 "SP_ArrowCursor", "Ctrl+Alt+A"
+            ),
+            "ap_ruler_action": (
+                "AP ruler", "Toggle horizontal and vertical dimension rulers between access points. Selected APs are prioritised; with no selection a minimal connected ruler set is shown for the current floor.",
+                "SP_FileDialogDetailedView", "Ctrl+Alt+R"
             ),
             "place_ap_action": (
                 "Single placement", "Enter continuous single-click access point placement mode. Right-click or press the cancel tool to finish.",
@@ -4184,6 +4546,14 @@ class MainWindow(QMainWindow):
             "cancel_ap_tool_action": (
                 "Cancel AP tool", "Exit the active access point placement tool without deleting placed APs.",
                 "SP_DialogCancelButton", "Escape"
+            ),
+            "copy_ap_action": (
+                "Copy APs", "Copy every selected access point, including its type, radios, channels and relative position.",
+                "SP_FileIcon", "Ctrl+C"
+            ),
+            "paste_ap_action": (
+                "Paste APs", "Paste copied access points onto the current floor with a small cascade offset while preserving their layout.",
+                "SP_DialogApplyButton", "Ctrl+V"
             ),
             "load_pattern_action": (
                 "Load antenna pattern", "Import a directional antenna pattern from a CSV file.",
@@ -4346,7 +4716,7 @@ class MainWindow(QMainWindow):
             ("Results and cleanup", ["export_action", "clear_ap_action"]),
         ]), "Home")
         ribbon.addTab(self._make_ribbon_page([
-            ("Interaction", ["ap_interaction_action", "cancel_ap_tool_action"]),
+            ("Interaction", ["ap_interaction_action", "ap_ruler_action", "copy_ap_action", "paste_ap_action", "cancel_ap_tool_action"]),
             ("Manual placement", ["place_ap_action", "array_ap_action"]),
             ("Space-assisted placement", ["space_ap_action", "select_ap_spaces_action"]),
         ]), "Access points")
@@ -4368,6 +4738,202 @@ class MainWindow(QMainWindow):
         return ribbon
 
     # ----------------------------- Access point interaction and placement -----------------------------
+
+    def toggle_ap_ruler(self, enabled: bool):
+        """Show or hide horizontal/vertical spacing dimensions between APs."""
+        self.ap_ruler_enabled = bool(enabled)
+        self.refresh_access_point_rulers()
+        if enabled:
+            self.statusBar().showMessage(
+                "AP ruler enabled: select two or more APs to dimension that layout; select one AP for its nearest neighbour; clear selection to dimension the current floor."
+            )
+        else:
+            self.statusBar().showMessage("AP ruler hidden")
+
+    def _ap_scene_selection_changed(self):
+        if not self.ap_ruler_enabled or self._drawing_floor or self._updating_ap_rulers:
+            return
+        self.refresh_access_point_rulers()
+
+    def _clear_access_point_rulers(self, scene: Optional[QGraphicsScene] = None):
+        scene = scene or (self.view.scene() if getattr(self, "view", None) else None)
+        items = list(getattr(self, "_ap_ruler_items", []))
+        self._ap_ruler_items = []
+        if scene is None:
+            return
+        for item in items:
+            try:
+                if item.scene() is scene:
+                    scene.removeItem(item)
+            except RuntimeError:
+                # scene.clear() may already have deleted the wrapped C++ item.
+                pass
+
+    def _minimum_spanning_ap_pairs(
+        self, aps: List[AccessPoint], positions: Dict[int, QPointF]
+    ) -> List[Tuple[AccessPoint, AccessPoint]]:
+        """Return a compact connected set of AP pairs rather than every O(n²) pair."""
+        ordered = [ap for ap in aps if id(ap) in positions]
+        if len(ordered) < 2:
+            return []
+        if len(ordered) == 2:
+            return [(ordered[0], ordered[1])]
+
+        visited = {0}
+        pairs: List[Tuple[AccessPoint, AccessPoint]] = []
+        while len(visited) < len(ordered):
+            best = None
+            for source_index in sorted(visited):
+                source = positions[id(ordered[source_index])]
+                for target_index, target_ap in enumerate(ordered):
+                    if target_index in visited:
+                        continue
+                    target = positions[id(target_ap)]
+                    dx = float(target.x() - source.x())
+                    dy = float(target.y() - source.y())
+                    candidate = (dx * dx + dy * dy, source_index, target_index)
+                    if best is None or candidate < best:
+                        best = candidate
+            if best is None:
+                break
+            _, source_index, target_index = best
+            pairs.append((ordered[source_index], ordered[target_index]))
+            visited.add(target_index)
+        return pairs
+
+    def _add_ap_ruler_path(
+        self, scene: QGraphicsScene, path: QPainterPath, colour: QColor, tooltip: str
+    ) -> QGraphicsPathItem:
+        item = QGraphicsPathItem(path)
+        pen = QPen(colour, 1.25)
+        pen.setCosmetic(True)
+        item.setPen(pen)
+        item.setBrush(QBrush(Qt.NoBrush))
+        item.setZValue(Z_AP_RULER)
+        item.setFlag(QGraphicsItem.ItemIsSelectable, False)
+        item.setAcceptedMouseButtons(Qt.NoButton)
+        item.setToolTip(tooltip)
+        scene.addItem(item)
+        self._ap_ruler_items.append(item)
+        return item
+
+    def _draw_ap_ruler_pair(
+        self, scene: QGraphicsScene, first: AccessPoint, second: AccessPoint,
+        first_pos: QPointF, second_pos: QPointF, lane: int
+    ):
+        x1, y1 = float(first_pos.x()), float(first_pos.y())
+        x2, y2 = float(second_pos.x()), float(second_pos.y())
+        horizontal = abs(x2 - x1)
+        vertical = abs(y2 - y1)
+        if horizontal < 1e-9 and vertical < 1e-9:
+            return
+
+        lane_offset = 1.25 + 0.45 * float(lane % 5)
+        tick = 0.22
+        horizontal_colour = QColor("#00A6D6")
+        vertical_colour = QColor("#F59E0B")
+        tooltip = f"{first.name} to {second.name}: horizontal {horizontal:.2f} m, vertical {vertical:.2f} m"
+
+        if horizontal >= 1e-9:
+            y_dim = min(y1, y2) - lane_offset
+            path = QPainterPath()
+            path.moveTo(x1, y1)
+            path.lineTo(x1, y_dim)
+            path.moveTo(x2, y2)
+            path.lineTo(x2, y_dim)
+            path.moveTo(x1, y_dim)
+            path.lineTo(x2, y_dim)
+            path.moveTo(x1, y_dim - tick)
+            path.lineTo(x1, y_dim + tick)
+            path.moveTo(x2, y_dim - tick)
+            path.lineTo(x2, y_dim + tick)
+            self._add_ap_ruler_path(scene, path, horizontal_colour, tooltip)
+            label = self._add_upright_text(
+                scene, f"H {horizontal:.2f} m", (x1 + x2) * 0.5, y_dim - 0.38,
+                horizontal_colour, max(2, int(self.heatmap_settings.ap_label_font_size)),
+                Z_AP_RULER_LABEL, bold=True,
+            )
+            label.setToolTip(tooltip)
+            self._ap_ruler_items.append(label)
+
+        if vertical >= 1e-9:
+            x_dim = max(x1, x2) + lane_offset
+            path = QPainterPath()
+            path.moveTo(x1, y1)
+            path.lineTo(x_dim, y1)
+            path.moveTo(x2, y2)
+            path.lineTo(x_dim, y2)
+            path.moveTo(x_dim, y1)
+            path.lineTo(x_dim, y2)
+            path.moveTo(x_dim - tick, y1)
+            path.lineTo(x_dim + tick, y1)
+            path.moveTo(x_dim - tick, y2)
+            path.lineTo(x_dim + tick, y2)
+            self._add_ap_ruler_path(scene, path, vertical_colour, tooltip)
+            label = self._add_upright_text(
+                scene, f"V {vertical:.2f} m", x_dim + 0.48, (y1 + y2) * 0.5,
+                vertical_colour, max(2, int(self.heatmap_settings.ap_label_font_size)),
+                Z_AP_RULER_LABEL, bold=True,
+            )
+            label.setToolTip(tooltip)
+            self._ap_ruler_items.append(label)
+
+    def refresh_access_point_rulers(self):
+        """Rebuild the AP ruler overlay using current graphics-item positions."""
+        if self._drawing_floor or self._updating_ap_rulers:
+            return
+        scene = self.view.scene() if getattr(self, "view", None) else None
+        if scene is None:
+            return
+
+        self._updating_ap_rulers = True
+        try:
+            self._clear_access_point_rulers(scene)
+            if not self.ap_ruler_enabled or not self.floor:
+                return
+
+            ap_items = {
+                id(item.ap): item
+                for item in scene.items()
+                if isinstance(item, AccessPointGraphicsItem) and item.ap.floor == self.floor.name
+            }
+            floor_aps = [ap for ap in self.aps if ap.floor == self.floor.name and id(ap) in ap_items]
+            if len(floor_aps) < 2:
+                return
+
+            selected = [
+                ap for ap in floor_aps
+                if ap_items[id(ap)].isSelected()
+            ]
+            positions = {
+                id(ap): QPointF(ap_items[id(ap)].scenePos())
+                for ap in floor_aps
+            }
+
+            if len(selected) >= 2:
+                ruler_aps = selected
+            elif len(selected) == 1:
+                anchor = selected[0]
+                anchor_pos = positions[id(anchor)]
+                neighbours = [ap for ap in floor_aps if ap is not anchor]
+                nearest = min(
+                    neighbours,
+                    key=lambda ap: (
+                        (positions[id(ap)].x() - anchor_pos.x()) ** 2
+                        + (positions[id(ap)].y() - anchor_pos.y()) ** 2,
+                        ap.name,
+                    ),
+                )
+                ruler_aps = [anchor, nearest]
+            else:
+                ruler_aps = floor_aps
+
+            for lane, (first, second) in enumerate(self._minimum_spanning_ap_pairs(ruler_aps, positions)):
+                self._draw_ap_ruler_pair(
+                    scene, first, second, positions[id(first)], positions[id(second)], lane
+                )
+        finally:
+            self._updating_ap_rulers = False
 
     def _new_ap_type_changed(self, ap_type: str):
         definition = AP_TYPE_PRESETS.get(str(ap_type), {})
@@ -4657,6 +5223,155 @@ class MainWindow(QMainWindow):
             f"Placed {len(created)} access point(s) inside {successful_spaces} space(s)."
             + (f"\n{skipped_spaces} processed space(s) produced no new point because of geometry or minimum-spacing constraints." if skipped_spaces else "")
             + (f"\nPlacement stopped at the safety limit of {placement_limit:,} APs after processing {processed_spaces} of {len(spaces)} spaces." if limit_reached else "")
+        )
+
+    def selected_access_points(self) -> List[AccessPoint]:
+        scene = self.view.scene() if getattr(self, "view", None) else None
+        selected_ids = set()
+        if scene is not None:
+            selected_ids = {
+                id(item.ap) for item in scene.selectedItems()
+                if isinstance(item, AccessPointGraphicsItem)
+            }
+        return [ap for ap in self.aps if id(ap) in selected_ids]
+
+    def _access_point_clipboard_record(self, ap: AccessPoint) -> Dict[str, object]:
+        return {
+            "name": ap.name,
+            "x": float(ap.x),
+            "y": float(ap.y),
+            "floor": ap.floor,
+            "tx_power_dbm": float(ap.tx_power_dbm),
+            "frequency_mhz": float(ap.frequency_mhz),
+            "reference_loss_db_at_1m": float(ap.reference_loss_db_at_1m),
+            "path_loss_exponent": float(ap.path_loss_exponent),
+            "antenna_pattern": ap.antenna_pattern,
+            "azimuth_deg": float(ap.azimuth_deg),
+            "downtilt_deg": float(ap.downtilt_deg),
+            "mount_height_m": float(ap.mount_height_m),
+            "rx_height_m": float(ap.rx_height_m),
+            "ap_type": ap.ap_type,
+            "radio_profile": ap.radio_profile,
+            "max_clients": int(ap.max_clients),
+            "planned": bool(ap.planned),
+            "radios": [self._radio_to_dict(radio) for radio in ap.radios],
+        }
+
+    def copy_selected_access_points(self) -> bool:
+        selected = self.selected_access_points()
+        if not selected:
+            self.statusBar().showMessage("Select one or more access points before copying")
+            return False
+        payload = {
+            "format": "rf-access-point-clipboard",
+            "version": 1,
+            "access_points": [self._access_point_clipboard_record(ap) for ap in selected],
+        }
+        text = json.dumps(payload, separators=(",", ":"))
+        QApplication.clipboard().setText(text)
+        self._ap_clipboard_signature = text
+        self._ap_paste_generation = 0
+        self.statusBar().showMessage(f"Copied {len(selected)} access point(s). Press Ctrl+V to paste.")
+        return True
+
+    def paste_access_points(self) -> bool:
+        if not self.floor:
+            self.statusBar().showMessage("Select a floor before pasting access points")
+            return False
+        text = QApplication.clipboard().text().strip()
+        if not text:
+            self.statusBar().showMessage("The clipboard is empty")
+            return False
+        try:
+            payload = json.loads(text)
+        except Exception:
+            self.statusBar().showMessage("The clipboard does not contain copied RF access points")
+            return False
+        if not isinstance(payload, dict) or payload.get("format") != "rf-access-point-clipboard":
+            self.statusBar().showMessage("The clipboard does not contain copied RF access points")
+            return False
+        records = payload.get("access_points", [])
+        if not isinstance(records, list) or not records:
+            self.statusBar().showMessage("The copied access point set is empty")
+            return False
+
+        if text != self._ap_clipboard_signature:
+            self._ap_clipboard_signature = text
+            self._ap_paste_generation = 0
+        self._ap_paste_generation += 1
+        cascade_offset = float(self._ap_paste_generation)
+
+        created: List[AccessPoint] = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            try:
+                radios = [
+                    self._radio_from_dict(value)
+                    for value in record.get("radios", [])
+                    if isinstance(value, dict)
+                ]
+                ap_type = str(record.get("ap_type", "Ceiling AP"))
+                if ap_type not in AP_TYPE_PRESETS:
+                    ap_type = "Ceiling AP"
+                pasted = AccessPoint(
+                    name=self._next_ap_name(),
+                    x=float(record.get("x", 0.0)) + cascade_offset,
+                    y=float(record.get("y", 0.0)) + cascade_offset,
+                    floor=self.floor.name,
+                    tx_power_dbm=float(record.get("tx_power_dbm", 20.0)),
+                    frequency_mhz=float(record.get("frequency_mhz", 2400.0)),
+                    reference_loss_db_at_1m=float(record.get("reference_loss_db_at_1m", 40.0)),
+                    path_loss_exponent=float(record.get("path_loss_exponent", 2.2)),
+                    antenna_pattern=str(record.get("antenna_pattern", "Omni ceiling AP")),
+                    azimuth_deg=float(record.get("azimuth_deg", 0.0)),
+                    downtilt_deg=float(record.get("downtilt_deg", 0.0)),
+                    mount_height_m=float(record.get("mount_height_m", 2.7)),
+                    rx_height_m=float(record.get("rx_height_m", 1.2)),
+                    ap_type=ap_type,
+                    radio_profile=str(record.get("radio_profile", "Project default radios")),
+                    radios=radios,
+                    max_clients=max(1, int(record.get("max_clients", 50))),
+                    planned=False,
+                )
+            except (TypeError, ValueError, OverflowError):
+                continue
+            self.aps.append(pasted)
+            created.append(pasted)
+
+        if not created:
+            self.statusBar().showMessage("No valid access points could be pasted")
+            return False
+        self.last_result = None
+        self.rssi_results_by_frequency = {}
+        self._refresh_rssi_frequency_dropdown()
+        self._pending_ap_selection_ids = {id(ap) for ap in created}
+        self._preserve_view_on_redraw = True
+        self.draw_floor()
+        self.populate_ap_table()
+        self.statusBar().showMessage(
+            f"Pasted {len(created)} access point(s) onto {self.floor.name}; the pasted group remains selected."
+        )
+        return True
+
+    def commit_access_point_group_move(self, moved_aps: List[AccessPoint], delta: QPointF):
+        unique: List[AccessPoint] = []
+        seen = set()
+        for ap in moved_aps:
+            if id(ap) in seen:
+                continue
+            seen.add(id(ap))
+            unique.append(ap)
+        if not unique:
+            return
+        self.last_result = None
+        self.rssi_results_by_frequency = {}
+        self.populate_ap_table()
+        self._pending_ap_selection_ids = {id(ap) for ap in unique}
+        self._preserve_view_on_redraw = True
+        QTimer.singleShot(0, self.draw_floor)
+        self.statusBar().showMessage(
+            f"Moved {len(unique)} access point(s) by ΔX {float(delta.x()):.2f} m, ΔY {float(delta.y()):.2f} m"
         )
 
     def focus_ap_in_table(self, ap: AccessPoint):
@@ -7800,6 +8515,60 @@ class MainWindow(QMainWindow):
             self.last_result = None
         self.draw_floor()
 
+    @staticmethod
+    def _bilinear_heatmap_value(result: SimulationResult, x: float, y: float) -> Optional[float]:
+        xs = np.asarray(result.xs, dtype=float)
+        ys = np.asarray(result.ys, dtype=float)
+        grid = np.asarray(result.rssi, dtype=float)
+        if xs.size == 0 or ys.size == 0 or grid.shape != (ys.size, xs.size):
+            return None
+        if x < float(xs[0]) or x > float(xs[-1]) or y < float(ys[0]) or y > float(ys[-1]):
+            return None
+
+        if xs.size == 1 or ys.size == 1:
+            ix = int(np.argmin(np.abs(xs - x)))
+            iy = int(np.argmin(np.abs(ys - y)))
+            value = float(grid[iy, ix])
+            return value if math.isfinite(value) else None
+
+        right = int(np.searchsorted(xs, x, side="right"))
+        top = int(np.searchsorted(ys, y, side="right"))
+        ix0 = max(0, min(right - 1, xs.size - 2))
+        iy0 = max(0, min(top - 1, ys.size - 2))
+        ix1 = ix0 + 1
+        iy1 = iy0 + 1
+        x0, x1 = float(xs[ix0]), float(xs[ix1])
+        y0, y1 = float(ys[iy0]), float(ys[iy1])
+        tx = 0.0 if abs(x1 - x0) <= 1e-12 else (float(x) - x0) / (x1 - x0)
+        ty = 0.0 if abs(y1 - y0) <= 1e-12 else (float(y) - y0) / (y1 - y0)
+        values = np.asarray([
+            grid[iy0, ix0], grid[iy0, ix1], grid[iy1, ix0], grid[iy1, ix1]
+        ], dtype=float)
+        if not np.all(np.isfinite(values)):
+            finite = values[np.isfinite(values)]
+            return float(finite[0]) if finite.size else None
+        bottom = float(values[0]) * (1.0 - tx) + float(values[1]) * tx
+        upper = float(values[2]) * (1.0 - tx) + float(values[3]) * tx
+        return bottom * (1.0 - ty) + upper * ty
+
+    def update_rssi_hover_readout(self, scene_pos: QPointF, viewport_pos):
+        result = getattr(self, "last_result", None)
+        frequency = self._selected_rssi_view_frequency()
+        if result is None or frequency is None or not self.floor:
+            self.view.hide_rssi_hover()
+            return
+        value = self._bilinear_heatmap_value(result, float(scene_pos.x()), float(scene_pos.y()))
+        if value is None:
+            self.view.hide_rssi_hover()
+            return
+        frequency_text = f"{frequency / 1000.0:g} GHz" if frequency >= 1000.0 else f"{frequency:g} MHz"
+        disconnect = float(getattr(self.heatmap_settings, "disconnected_rssi_dbm", -120.0))
+        rssi_text = f"≤ {disconnect:.0f} dBm" if value <= disconnect + 0.05 else f"{value:.1f} dBm"
+        self.view.show_rssi_hover(
+            f"{frequency_text}: {rssi_text}\nX {scene_pos.x():.2f} m   Y {scene_pos.y():.2f} m",
+            viewport_pos,
+        )
+
     def _detect_dark_theme(self) -> bool:
         """Return True when the active Qt/OS palette appears to be dark."""
         app = QApplication.instance()
@@ -8922,7 +9691,10 @@ class MainWindow(QMainWindow):
 
     def draw_floor(self):
         scene = self.view.scene()
+        self.view.hide_rssi_hover()
+        self._drawing_floor = True
         scene.clear()
+        self._ap_ruler_items = []
         self._ifc_snap_marker_items = []
         self._wall_preview_items = []
         self._space_preview_items = []
@@ -8930,6 +9702,7 @@ class MainWindow(QMainWindow):
         self._suggested_boundary_preview_items = []
         self._suggested_space_preview_items = []
         if not self.floor:
+            self._drawing_floor = False
             return
         # Draw heatmap first so the building geometry remains visible above it.
         if self.last_result:
@@ -8988,11 +9761,9 @@ class MainWindow(QMainWindow):
                     self.heatmap_settings.space_label_font_size, Z_TEXT, bold=True
                 )
 
-        element_pen_colour = QColor("#526D82") if not getattr(self, "dark_theme", False) else QColor("#88A6BC")
-        element_fill_colour = QColor("#B6C6D2") if not getattr(self, "dark_theme", False) else QColor("#364854")
-        element_fill_colour.setAlpha(80)
-        element_pen = QPen(element_pen_colour, 0.08)
-        element_pen.setCosmetic(True)
+        generic_element_pen_colour = QColor("#526D82") if not getattr(self, "dark_theme", False) else QColor("#88A6BC")
+        generic_element_fill_colour = QColor("#B6C6D2") if not getattr(self, "dark_theme", False) else QColor("#364854")
+        generic_element_fill_colour.setAlpha(80)
         for element in getattr(self.floor, "elements", []):
             try:
                 coords = list(element.polygon.exterior.coords)
@@ -9000,6 +9771,19 @@ class MainWindow(QMainWindow):
                 continue
             if len(coords) < 3:
                 continue
+            if element.rf_category == "door":
+                element_pen_colour = QColor("#A85D00") if not getattr(self, "dark_theme", False) else QColor("#FFB454")
+                element_fill_colour = QColor("#E5A04B")
+                element_fill_colour.setAlpha(175)
+            elif element.rf_category == "window":
+                element_pen_colour = QColor("#007EA8") if not getattr(self, "dark_theme", False) else QColor("#65D5FF")
+                element_fill_colour = QColor("#72C7E7")
+                element_fill_colour.setAlpha(165)
+            else:
+                element_pen_colour = QColor(generic_element_pen_colour)
+                element_fill_colour = QColor(generic_element_fill_colour)
+            element_pen = QPen(element_pen_colour, 0.11 if element.is_rf_opening else 0.08)
+            element_pen.setCosmetic(True)
             poly = QPolygonF([QPointF(float(x), float(y)) for x, y in coords])
             item = IFCElementGraphicsItem(self, element, poly, element_pen, QBrush(element_fill_colour))
             scene.addItem(item)
@@ -9031,6 +9815,7 @@ class MainWindow(QMainWindow):
                 fill_colour.setAlpha(150)
             item = WallGraphicsItem(self, wall, poly, wall_pen, QBrush(fill_colour))
             scene.addItem(item)
+        pending_ap_selection_ids = set(getattr(self, "_pending_ap_selection_ids", set()))
         visible_aps = [a for a in self.aps if a.floor == self.floor.name or self.include_inter_floor.isChecked()]
         for ap in visible_aps:
             same_floor = ap.floor == self.floor.name
@@ -9056,6 +9841,8 @@ class MainWindow(QMainWindow):
             if same_floor:
                 dot = AccessPointGraphicsItem(self, ap, radius, colour)
                 scene.addItem(dot)
+                if id(ap) in pending_ap_selection_ids:
+                    dot.setSelected(True)
             else:
                 dot = QGraphicsPathItem(_access_point_symbol_path(ap.ap_type, radius))
                 dot.setPos(float(ap.x), float(ap.y))
@@ -9085,6 +9872,10 @@ class MainWindow(QMainWindow):
                 scene, label, ap.x + radius + 0.25, ap.y + radius + 0.25,
                 colour, self.heatmap_settings.ap_label_font_size, Z_AP_LABEL, bold=same_floor,
             )
+
+        self._pending_ap_selection_ids = set()
+        self._drawing_floor = False
+        self.refresh_access_point_rulers()
 
         if self.ap_interaction_mode:
             for item in scene.items():
@@ -9416,6 +10207,19 @@ class MainWindow(QMainWindow):
                 return dict(profile)
         return dict(profiles.get("default", {}))
 
+    def _profile_for_opening_from_settings(self, element: IFCElement2D) -> Dict[float, float]:
+        profiles = (
+            self.heatmap_settings.default_door_attenuation_by_material_db
+            if element.rf_category == "door"
+            else self.heatmap_settings.default_window_attenuation_by_material_db
+        )
+        text = f"{element.material} {element.type_name} {element.name}".lower()
+        # Prefer the longest matching key so 'low-e' wins over a generic token.
+        for key in sorted((k for k in profiles if k != "default"), key=len, reverse=True):
+            if key.lower() in text:
+                return dict(profiles[key])
+        return dict(profiles.get("default", {}))
+
     def _apply_frequency_settings_to_model(self, replace_existing: bool = False):
         """Ensure loaded floors/walls contain attenuation values for all configured frequencies."""
         bands = self._frequency_bands()
@@ -9429,6 +10233,15 @@ class MainWindow(QMainWindow):
                 for band in bands:
                     if replace_existing or band not in wall.attenuation_by_band_db:
                         wall.attenuation_by_band_db[band] = float(profile.get(band, wall.attenuation_db_for_frequency(band)))
+            for element in getattr(floor, "elements", []):
+                if not element.is_rf_opening:
+                    continue
+                profile = self._profile_for_opening_from_settings(element)
+                # Doors/windows do not yet have per-object edits, so the active
+                # heatmap settings are always authoritative for their defaults.
+                for band in bands:
+                    fallback = element.attenuation_db_for_frequency(band)
+                    element.attenuation_by_band_db[band] = float(profile.get(band, fallback))
         self._configure_wall_table_headers()
 
     def populate_ap_table(self):
@@ -9709,6 +10522,10 @@ class MainWindow(QMainWindow):
             self.last_result = None
 
         self.draw_floor()
+        if self.last_result is not None:
+            self.statusBar().showMessage(
+                "RSSI calculation complete. Hover over the heatmap to inspect the selected frequency at any location."
+            )
 
     def load_pattern_csv_path(self, path: Path) -> str:
         """Load one antenna pattern CSV and return the pattern name."""
