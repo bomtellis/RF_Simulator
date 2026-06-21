@@ -14,10 +14,17 @@ import math
 import multiprocessing
 import os
 import uuid
+import time
 from rf_dxf_prealign import DxfPreAlignDialog, SimilarityTransform2D, two_point_transform
-from rf_boundary_tools import estimate_outer_wall_gap_tolerance, suggest_external_boundary_polygons
+from rf_boundary_tools import (
+    estimate_outer_wall_gap_tolerance,
+    estimate_space_gap_tolerance,
+    infer_space_polygons,
+    missing_external_wall_polygons,
+    suggest_external_boundary_polygons,
+)
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -54,6 +61,8 @@ from PySide6.QtWidgets import (
     QGraphicsView,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -88,7 +97,7 @@ except Exception:  # pragma: no cover
 
 try:
     from shapely.geometry import LineString, Point, Polygon, box
-    from shapely.ops import unary_union
+    from shapely.ops import nearest_points, unary_union
     from shapely.affinity import affine_transform
     try:
         from shapely import concave_hull as shapely_concave_hull
@@ -446,6 +455,27 @@ class Space2D:
     z_min: float = 0.0
     z_max: float = 0.0
     source_storey: str = ""
+    # Spaces inferred in the simulator are RF/planning geometry only. They do
+    # not modify the source IFC and are persisted in RF plan files.
+    is_inferred: bool = False
+    is_user_created: bool = False
+    ap_planning_selected: bool = False
+    assumption_note: str = ""
+
+
+@dataclass
+class IFCElement2D:
+    guid: str
+    name: str
+    floor: str
+    source_file: str
+    type_name: str
+    material: str
+    polygon: Polygon
+    z_min: float = 0.0
+    z_max: float = 0.0
+    source_storey: str = ""
+    projected_to_floor: bool = False
 
 
 @dataclass
@@ -454,6 +484,7 @@ class FloorModel:
     elevation: float
     walls: List[Wall2D] = field(default_factory=list)
     spaces: List[Space2D] = field(default_factory=list)
+    elements: List[IFCElement2D] = field(default_factory=list)
     slab_attenuation_by_band_db: Dict[float, float] = field(default_factory=lambda: {2400.0: 12.0, 5000.0: 18.0, 6000.0: 22.0})
 
     def slab_attenuation_db_for_frequency(self, frequency_mhz: float) -> float:
@@ -890,13 +921,18 @@ class IFCModelLoader:
         self.dx = dx
         self.dy = dy
         self.dz = dz
+        self.ifc = ifcopenshell.open(str(path))
+        try:
+            import ifcopenshell.util.unit as ifc_unit_util
+            self.unit_scale = float(ifc_unit_util.calculate_unit_scale(self.ifc) or 1.0)
+        except Exception:
+            self.unit_scale = 1.0
         self.project_external_walls_across_floors = bool(project_external_walls_across_floors)
         self.external_wall_keywords = [
             str(v).strip().lower() for v in (external_wall_keywords or [
                 "external", "exterior", "outer", "facade", "façade", "curtain", "envelope", "perimeter"
             ]) if str(v).strip()
         ]
-        self.ifc = ifcopenshell.open(str(path))
         self.settings = ifcopenshell.geom.settings()
         self.settings.set(self.settings.USE_WORLD_COORDS, True)
 
@@ -907,6 +943,7 @@ class IFCModelLoader:
         self,
         wall_guids: Optional[Iterable[str]] = None,
         space_guids: Optional[Iterable[str]] = None,
+        element_guids: Optional[Iterable[str]] = None,
         storeys_override: Optional[Dict[str, float]] = None,
     ) -> Dict[str, FloorModel]:
         """Load only selected wall/space GlobalIds.
@@ -922,10 +959,13 @@ class IFCModelLoader:
 
         wanted_walls = set(wall_guids or [])
         wanted_spaces = set(space_guids or [])
+        wanted_elements = set(element_guids or [])
         filter_walls = bool(wall_guids is not None)
         filter_spaces = bool(space_guids is not None)
+        filter_elements = bool(element_guids is not None)
 
         seen_wall_guids = set()
+        wall_entities = []
         for wall in list(self.ifc.by_type("IfcWall")) + list(self.ifc.by_type("IfcWallStandardCase")):
             guid = getattr(wall, "GlobalId", "") or ""
             if guid in seen_wall_guids:
@@ -933,8 +973,18 @@ class IFCModelLoader:
             seen_wall_guids.add(guid)
             if filter_walls and guid not in wanted_walls:
                 continue
+            wall_entities.append(wall)
+
+        wall_geometry = self._plan_polygons_from_geometry_iterator(
+            wall_entities,
+            max_threads=(1 if filter_walls else min(8, os.cpu_count() or 1)),
+        )
+        for wall in wall_entities:
+            guid = getattr(wall, "GlobalId", "") or ""
             source_floor = self._container_storey_name(wall)
-            geom = self._plan_polygon_from_geometry(wall)
+            geom = wall_geometry.get(guid)
+            if geom is None:
+                geom = self._plan_polygon_from_geometry(wall)
             if geom is None:
                 continue
             poly, z_min, z_max = geom
@@ -942,7 +992,7 @@ class IFCModelLoader:
                 continue
             mat = self._material_name(wall)
             type_name = self._type_name(wall)
-            assigned_floor = source_floor or self._nearest_floor_name(floors, z_min)
+            assigned_floor = self._assigned_floor_name(wall, floors, z_min, z_max, source_floor)
             is_envelope = self._is_external_or_envelope_wall(wall, mat, type_name)
             if is_envelope and self.project_external_walls_across_floors:
                 floor_names = self._floor_names_for_z_span(floors, z_min, z_max, assigned_floor)
@@ -967,6 +1017,42 @@ class IFCModelLoader:
                     )
                 )
 
+        handled_wall_guids = set(seen_wall_guids)
+        for element in self.ifc.by_type("IfcElement"):
+            if element.is_a("IfcWall") or element.is_a("IfcWallStandardCase") or element.is_a("IfcOpeningElement"):
+                continue
+            guid = getattr(element, "GlobalId", "") or ""
+            if not guid or guid in handled_wall_guids:
+                continue
+            if filter_elements and guid not in wanted_elements:
+                continue
+            source_floor = self._container_storey_name(element)
+            geom = self._plan_polygon_from_element(element)
+            if geom is None:
+                continue
+            poly, z_min, z_max = geom
+            if poly is None or poly.area <= 0:
+                continue
+            assigned_floor = self._assigned_floor_name(element, floors, z_min, z_max, source_floor)
+            floor_names = [assigned_floor]
+            mat = self._material_name(element)
+            type_name = self._type_name(element)
+            for floor_name in floor_names:
+                floors.setdefault(floor_name, FloorModel(name=floor_name, elevation=0.0)).elements.append(
+                    IFCElement2D(
+                        guid=guid,
+                        name=getattr(element, "Name", "") or type_name or "IFC element",
+                        floor=floor_name,
+                        source_file=self.path.name,
+                        type_name=type_name,
+                        material=mat,
+                        polygon=poly,
+                        z_min=z_min,
+                        z_max=z_max,
+                        source_storey=source_floor or "",
+                    )
+                )
+
         for space in self.ifc.by_type("IfcSpace"):
             guid = getattr(space, "GlobalId", "") or ""
             if filter_spaces and guid not in wanted_spaces:
@@ -978,7 +1064,8 @@ class IFCModelLoader:
             poly, z_min, z_max = geom
             if poly is None or poly.area <= 0:
                 continue
-            floor_names = [source_floor or self._nearest_floor_name(floors, z_min)]
+            assigned_floor = self._assigned_floor_name(space, floors, z_min, z_max, source_floor)
+            floor_names = [assigned_floor]
             for floor_name in floor_names:
                 floors.setdefault(floor_name, FloorModel(name=floor_name, elevation=0.0)).spaces.append(
                     Space2D(
@@ -998,8 +1085,11 @@ class IFCModelLoader:
         out = {}
         for st in self.ifc.by_type("IfcBuildingStorey"):
             name = st.Name or st.GlobalId
-            out[name] = float(getattr(st, "Elevation", 0.0) or 0.0) + self.dz
+            out[name] = self._storey_elevation(st)
         return out
+
+    def _storey_elevation(self, storey) -> float:
+        return _ifc_storey_elevation_m(storey, dz=self.dz, unit_scale=self.unit_scale)
 
     def _container_storey_name(self, product) -> Optional[str]:
         for rel in getattr(product, "ContainedInStructure", []) or []:
@@ -1011,6 +1101,74 @@ class IFCModelLoader:
     @staticmethod
     def _nearest_floor_name(floors: Dict[str, FloorModel], z: float) -> str:
         return min(floors.values(), key=lambda f: abs(f.elevation - z)).name
+
+    @staticmethod
+    def _local_placement_z(product) -> float:
+        placement = getattr(product, "ObjectPlacement", None)
+        rel = getattr(placement, "RelativePlacement", None)
+        coords = getattr(getattr(rel, "Location", None), "Coordinates", None)
+        try:
+            return float(coords[2]) if coords and len(coords) > 2 else 0.0
+        except Exception:
+            return 0.0
+
+    def _product_world_placement_z(self, product) -> Optional[float]:
+        try:
+            return float(_ifc_local_placement_summary(product).get("z", 0.0)) * self.unit_scale + self.dz
+        except Exception:
+            return None
+
+    def _assigned_floor_name(
+        self,
+        product,
+        floors: Dict[str, FloorModel],
+        z_min: float,
+        z_max: float,
+        source_floor: Optional[str],
+    ) -> str:
+        """Choose the floor using host/storey elevation plus element placement offset.
+
+        IFC containment alone is not reliable: some exports contain elements in
+        a storey while their local placement has a vertical offset into another
+        level. Geometry Z is also kept as a fallback for files where placement
+        chains are incomplete.
+        """
+        if not floors:
+            return source_floor or "Default"
+
+        candidates: List[float] = []
+        world_z = self._product_world_placement_z(product)
+        source_host_z = None
+        if source_floor in floors:
+            source_host_z = float(floors[source_floor].elevation) + self._local_placement_z(product) * self.unit_scale
+        if world_z is not None and math.isfinite(world_z):
+            local_z = self._local_placement_z(product) * self.unit_scale
+            if (
+                source_host_z is not None
+                and abs(float(world_z) - float(local_z)) <= 0.05
+                and abs(float(source_host_z) - float(world_z)) > 0.50
+            ):
+                candidates.extend([source_host_z, world_z])
+            else:
+                candidates.append(world_z)
+        if source_host_z is not None and source_host_z not in candidates:
+            candidates.append(source_host_z)
+        if math.isfinite(float(z_min)):
+            candidates.append(float(z_min))
+        if math.isfinite(float(z_max)):
+            candidates.append(float(z_max))
+        if not candidates:
+            return source_floor if source_floor in floors else next(iter(floors))
+
+        ordered = sorted(floors.values(), key=lambda floor: (floor.elevation, floor.name))
+
+        def floor_for_z(value: float) -> str:
+            return min(ordered, key=lambda floor: abs(float(floor.elevation) - float(value))).name
+
+        # Placement is the strongest signal because it includes the host/storey
+        # chain and any element offset from that host. Use geometry only when no
+        # placement-derived candidate was available.
+        return floor_for_z(candidates[0])
 
     def _plan_polygon_from_geometry(self, product) -> Optional[Tuple[Polygon, float, float]]:
         """Project product mesh vertices onto XY and return footprint plus Z span."""
@@ -1024,6 +1182,43 @@ class IFCModelLoader:
         verts[:, 0] += self.dx
         verts[:, 1] += self.dy
         verts[:, 2] += self.dz
+        return self._plan_polygon_from_vertices(verts)
+
+    def _plan_polygons_from_geometry_iterator(self, products: List[object], max_threads: int = 1) -> Dict[str, Tuple[Polygon, float, float]]:
+        if not products:
+            return {}
+        result: Dict[str, Tuple[Polygon, float, float]] = {}
+        try:
+            iterator = ifcopenshell.geom.iterator(
+                self.settings,
+                self.ifc,
+                max(1, int(max_threads)),
+                include=products,
+            )
+            if not iterator.initialize():
+                return result
+            while True:
+                shape = iterator.get()
+                guid = str(getattr(shape, "guid", "") or "")
+                try:
+                    verts = np.array(shape.geometry.verts, dtype=float).reshape((-1, 3))
+                    if verts.size:
+                        verts[:, 0] += self.dx
+                        verts[:, 1] += self.dy
+                        verts[:, 2] += self.dz
+                        geom = self._plan_polygon_from_vertices(verts)
+                        if geom is not None and guid:
+                            result[guid] = geom
+                except Exception:
+                    pass
+                if not iterator.next():
+                    break
+        except Exception:
+            return {}
+        return result
+
+    @staticmethod
+    def _plan_polygon_from_vertices(verts: np.ndarray) -> Optional[Tuple[Polygon, float, float]]:
         z_min = float(np.min(verts[:, 2]))
         z_max = float(np.max(verts[:, 2]))
         xy = verts[:, :2]
@@ -1037,6 +1232,51 @@ class IFCModelLoader:
             maxx, maxy = xy.max(axis=0)
             rect = Polygon([(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy)])
         return rect, z_min, z_max
+
+    def _plan_polygon_from_element(self, product) -> Optional[Tuple[Polygon, float, float]]:
+        """Return a plan footprint for imported context elements.
+
+        Doors and windows in large architectural IFCs can have very detailed
+        symbolic/3D representation geometry.  For RF/model context display, a
+        placement-based panel footprint is enough and avoids minutes of OCC
+        shape extraction.
+        """
+        fast = self._fast_panel_footprint(product)
+        if fast is not None:
+            return fast
+        return self._plan_polygon_from_geometry(product)
+
+    def _fast_panel_footprint(self, product) -> Optional[Tuple[Polygon, float, float]]:
+        if not (product.is_a("IfcDoor") or product.is_a("IfcWindow")):
+            return None
+        try:
+            width = float(getattr(product, "OverallWidth", 0.0) or 0.0) * self.unit_scale
+            height = float(getattr(product, "OverallHeight", 0.0) or 0.0) * self.unit_scale
+        except Exception:
+            return None
+        if width <= 0.01:
+            return None
+        depth = 0.10 if product.is_a("IfcWindow") else 0.16
+        placement = _ifc_local_placement_summary(product)
+        cx = float(placement.get("x", 0.0)) * self.unit_scale + self.dx
+        cy = float(placement.get("y", 0.0)) * self.unit_scale + self.dy
+        z_min = float(placement.get("z", 0.0)) * self.unit_scale + self.dz
+        z_max = z_min + max(0.05, height)
+        angle = math.radians(float(placement.get("rotation_from_x_deg", 0.0) or 0.0))
+        ux, uy = math.cos(angle), math.sin(angle)
+        vx, vy = -uy, ux
+        half_w = width * 0.5
+        half_d = depth * 0.5
+        points = [
+            (cx - ux * half_w - vx * half_d, cy - uy * half_w - vy * half_d),
+            (cx + ux * half_w - vx * half_d, cy + uy * half_w - vy * half_d),
+            (cx + ux * half_w + vx * half_d, cy + uy * half_w + vy * half_d),
+            (cx - ux * half_w + vx * half_d, cy - uy * half_w + vy * half_d),
+        ]
+        polygon = Polygon(points)
+        if polygon.is_empty or float(polygon.area) <= 1e-6:
+            return None
+        return polygon, z_min, z_max
 
     @staticmethod
     def _floor_names_for_z_span(
@@ -1153,6 +1393,194 @@ class IFCModelLoader:
         return {433.0: 2.0, 868.0: 3.0, 2400.0: 5.0, 5000.0: 7.0, 6000.0: 8.0}
 
 
+def _wall_axis_from_polygon(polygon: Polygon) -> Optional[Tuple[Tuple[float, float], Tuple[float, float], float, float]]:
+    """Return centre, unit long-axis, length and width for a rectangular wall footprint."""
+    if polygon is None or polygon.is_empty:
+        return None
+    try:
+        rectangle = polygon.minimum_rotated_rectangle
+        coords = list(rectangle.exterior.coords)
+    except Exception:
+        return None
+    if len(coords) < 5:
+        return None
+    edges: List[Tuple[float, Tuple[float, float]]] = []
+    for first, second in zip(coords, coords[1:]):
+        dx = float(second[0]) - float(first[0])
+        dy = float(second[1]) - float(first[1])
+        edge_length = math.hypot(dx, dy)
+        if edge_length > 1e-9:
+            edges.append((edge_length, (dx / edge_length, dy / edge_length)))
+    if not edges:
+        return None
+    lengths = sorted(edge_length for edge_length, _ in edges)
+    width = float(lengths[0])
+    length = float(lengths[-1])
+    if length <= 1e-9 or width <= 1e-9:
+        return None
+    axis = max(edges, key=lambda item: item[0])[1]
+    centroid = rectangle.centroid
+    return (float(centroid.x), float(centroid.y)), axis, length, width
+
+
+def _close_wall_endpoint_gaps_on_floor(floor: FloorModel, deadline: Optional[float] = None) -> int:
+    """Extend imported wall rectangles across small endpoint gaps on one floor."""
+    walls = [
+        wall for wall in getattr(floor, "walls", []) or []
+        if not getattr(wall, "is_user_created", False)
+        and wall.polygon is not None
+        and not wall.polygon.is_empty
+        and float(getattr(wall.polygon, "area", 0.0)) > 1e-6
+    ]
+    if len(walls) < 2:
+        return 0
+
+    axes: Dict[int, Tuple[Tuple[float, float], Tuple[float, float], float, float]] = {}
+    widths: List[float] = []
+    for index, wall in enumerate(walls):
+        axis = _wall_axis_from_polygon(wall.polygon)
+        if axis is None:
+            continue
+        axes[index] = axis
+        width = axis[3]
+        if 0.03 <= width <= 3.0:
+            widths.append(width)
+    if not axes:
+        return 0
+
+    typical_width = float(np.median(widths)) if widths else 0.20
+    touch_tolerance = max(0.005, min(0.03, typical_width * 0.10))
+    max_extension = max(0.08, min(0.60, typical_width * 2.5))
+    extensions: Dict[int, List[float]] = {}
+    wall_indices = list(axes.keys())
+    try:
+        from shapely.strtree import STRtree
+        indexed_polygons = [walls[index].polygon for index in wall_indices]
+        wall_tree = STRtree(indexed_polygons)
+        geometry_to_index = {id(polygon): index for index, polygon in zip(wall_indices, indexed_polygons)}
+    except Exception:
+        wall_tree = None
+        indexed_polygons = []
+        geometry_to_index = {}
+
+    def nearby_wall_indices(corridor) -> List[int]:
+        if wall_tree is None:
+            # Avoid locking the GUI on very large floors if spatial indexing is
+            # unavailable for any reason.
+            return wall_indices if len(wall_indices) <= 250 else []
+        try:
+            hits = wall_tree.query(corridor)
+        except Exception:
+            return []
+        result: List[int] = []
+        for hit in hits:
+            if isinstance(hit, (int, np.integer)):
+                pos = int(hit)
+                if 0 <= pos < len(wall_indices):
+                    result.append(wall_indices[pos])
+            else:
+                index = geometry_to_index.get(id(hit))
+                if index is not None:
+                    result.append(index)
+        return result
+
+    def endpoint_extension(index: int, sign: float) -> float:
+        wall = walls[index]
+        centre, unit, length, width = axes[index]
+        ux, uy = unit
+        half = length * 0.5
+        ex = centre[0] + ux * half * sign
+        ey = centre[1] + uy * half * sign
+        direction = (ux * sign, uy * sign)
+        endpoint = Point(ex, ey)
+        cap = LineString([
+            (ex - uy * width * 0.55, ey + ux * width * 0.55),
+            (ex + uy * width * 0.55, ey - ux * width * 0.55),
+        ])
+        best_extension = 0.0
+        best_distance = max_extension + 1.0
+        corridor = LineString([
+            (ex, ey),
+            (ex + direction[0] * max_extension, ey + direction[1] * max_extension),
+        ]).buffer(max(width * 0.60, typical_width * 0.35, 0.04), cap_style=2, join_style=2)
+
+        for other_index in nearby_wall_indices(corridor):
+            if other_index == index:
+                continue
+            other = walls[other_index]
+            other_polygon = other.polygon
+            try:
+                if other_polygon.distance(cap) <= touch_tolerance or other_polygon.distance(endpoint) <= touch_tolerance:
+                    continue
+                if not other_polygon.intersects(corridor):
+                    continue
+                _, nearest = nearest_points(endpoint, other_polygon)
+            except Exception:
+                continue
+            vx = float(nearest.x) - ex
+            vy = float(nearest.y) - ey
+            along = vx * direction[0] + vy * direction[1]
+            if along <= touch_tolerance or along > max_extension:
+                continue
+            perpendicular = abs(vx * (-direction[1]) + vy * direction[0])
+            if perpendicular > max(width * 0.75, typical_width * 0.50, 0.06):
+                continue
+
+            other_axis = axes.get(other_index)
+            split_gap = False
+            if other_axis is not None:
+                other_unit = other_axis[1]
+                if abs(unit[0] * other_unit[0] + unit[1] * other_unit[1]) >= 0.92:
+                    split_gap = True
+            extension = along * 0.5 if split_gap else along
+            if extension < best_distance:
+                best_distance = extension
+                best_extension = extension
+        return best_extension
+
+    for index in axes:
+        if deadline is not None and time.perf_counter() >= deadline:
+            break
+        backward = endpoint_extension(index, -1.0)
+        if deadline is not None and time.perf_counter() >= deadline:
+            break
+        forward = endpoint_extension(index, 1.0)
+        if backward > touch_tolerance or forward > touch_tolerance:
+            extensions[index] = [backward, forward]
+
+    changed = 0
+    for index, (backward, forward) in extensions.items():
+        if deadline is not None and time.perf_counter() >= deadline:
+            break
+        centre, unit, length, width = axes[index]
+        ux, uy = unit
+        half = length * 0.5
+        start = (centre[0] - ux * (half + backward), centre[1] - uy * (half + backward))
+        end = (centre[0] + ux * (half + forward), centre[1] + uy * (half + forward))
+        try:
+            expanded = LineString([start, end]).buffer(width * 0.5, cap_style=2, join_style=2)
+            if not expanded.is_valid:
+                expanded = expanded.buffer(0)
+            if expanded.is_empty or float(expanded.area) <= float(walls[index].polygon.area):
+                continue
+            walls[index].polygon = expanded
+            changed += 1
+        except Exception:
+            continue
+    return changed
+
+
+def close_imported_wall_endpoint_gaps(floors: Dict[str, FloorModel], max_seconds: float = 4.0) -> int:
+    """Close small endpoint gaps between imported wall footprints across all floors."""
+    deadline = time.perf_counter() + max(0.25, float(max_seconds))
+    total = 0
+    for floor in floors.values():
+        if time.perf_counter() >= deadline:
+            break
+        total += _close_wall_endpoint_gaps_on_floor(floor, deadline=deadline)
+    return total
+
+
 class CombinedIFCModel:
     """Utility for merging wall/floor data from several IFC files."""
 
@@ -1172,6 +1600,10 @@ class CombinedIFCModel:
                 space.floor = key
                 space.guid = f"{source_name}:{space.guid}"
                 target[key].spaces.append(space)
+            for element in getattr(inc_floor, "elements", []):
+                element.floor = key
+                element.guid = f"{source_name}:{element.guid}"
+                target[key].elements.append(element)
         return target
 
     @staticmethod
@@ -1247,6 +1679,7 @@ class RFEngine:
         radio: Optional[APRadio] = None,
         include_inter_floor: bool = True,
         heatmap_settings: Optional[HeatmapSettings] = None,
+        wall_indexes: Optional[Dict[str, Tuple[object, List[Wall2D], Dict[int, Wall2D]]]] = None,
     ) -> float:
         """Calculate RSSI at a receiver point on receiver_floor.
 
@@ -1293,7 +1726,7 @@ class RFEngine:
         # atrium glazing and external facade elements. A GUID is counted only
         # once so the same spanning object does not multiply its attenuation.
         for path_floor in RFEngine.floors_between_inclusive(receiver_floor, ap_floor, floors):
-            for wall in path_floor.walls:
+            for wall in RFEngine._walls_intersecting_line(path_floor, line, wall_indexes):
                 wall_key = wall.guid or f"{wall.source_file}:{wall.name}:{wall.z_min:.3f}:{wall.z_max:.3f}"
                 if wall_key not in checked_wall_guids and wall.polygon.intersects(line):
                     wall_loss += wall.attenuation_db_for_frequency(radio.frequency_mhz)
@@ -1335,6 +1768,66 @@ class RFEngine:
         return sum(f.slab_attenuation_db_for_frequency(frequency_mhz) for f in crossed_boundaries)
 
     @staticmethod
+    def _active_radio_links(
+        receiver_floor: FloorModel,
+        aps: List[AccessPoint],
+        include_inter_floor: bool,
+    ) -> List[Tuple[AccessPoint, APRadio]]:
+        links: List[Tuple[AccessPoint, APRadio]] = []
+        for ap in aps:
+            if not include_inter_floor and ap.floor != receiver_floor.name:
+                continue
+            for radio in ap.active_radios():
+                links.append((ap, radio))
+        return links
+
+    @staticmethod
+    def _build_wall_indexes(floors: Dict[str, FloorModel]) -> Dict[str, Tuple[object, List[Wall2D], Dict[int, Wall2D]]]:
+        indexes: Dict[str, Tuple[object, List[Wall2D], Dict[int, Wall2D]]] = {}
+        try:
+            from shapely.strtree import STRtree
+        except Exception:
+            return indexes
+        for floor in floors.values():
+            walls = list(getattr(floor, "walls", []) or [])
+            if not walls:
+                continue
+            try:
+                tree = STRtree([wall.polygon for wall in walls])
+                by_geometry_id = {id(wall.polygon): wall for wall in walls}
+                indexes[floor.name] = (tree, walls, by_geometry_id)
+            except Exception:
+                continue
+        return indexes
+
+    @staticmethod
+    def _walls_intersecting_line(
+        floor: FloorModel,
+        line: LineString,
+        wall_indexes: Optional[Dict[str, Tuple[object, List[Wall2D], Dict[int, Wall2D]]]] = None,
+    ) -> Iterable[Wall2D]:
+        if wall_indexes:
+            indexed = wall_indexes.get(floor.name)
+            if indexed is not None:
+                tree, walls, by_geometry_id = indexed
+                try:
+                    hits = tree.query(line)
+                    result: List[Wall2D] = []
+                    for hit in hits:
+                        if isinstance(hit, (int, np.integer)):
+                            idx = int(hit)
+                            if 0 <= idx < len(walls):
+                                result.append(walls[idx])
+                        else:
+                            wall = by_geometry_id.get(id(hit))
+                            if wall is not None:
+                                result.append(wall)
+                    return result
+                except Exception:
+                    pass
+        return list(getattr(floor, "walls", []) or [])
+
+    @staticmethod
     def simulate(
         floor: FloorModel,
         floors: Dict[str, FloorModel],
@@ -1355,13 +1848,14 @@ class RFEngine:
         ys = np.arange(miny, maxy + resolution_m, resolution_m)
         disconnected = float(getattr(heatmap_settings, "disconnected_rssi_dbm", -120.0) if heatmap_settings else -120.0)
         grid = np.full((len(ys), len(xs)), disconnected)
-        candidate_aps = [a for a in aps if include_inter_floor or a.floor == floor.name]
-        if not candidate_aps:
+        radio_links = RFEngine._active_radio_links(floor, aps, include_inter_floor)
+        if not radio_links:
             return None
         total_points = int(len(xs) * len(ys))
+        total_work_units = total_points * max(1, len(radio_links))
         use_mp = bool(getattr(heatmap_settings, "enable_rf_multiprocessing", False)) if heatmap_settings else False
         min_points = int(getattr(heatmap_settings, "rf_multiprocessing_min_points", 5000) if heatmap_settings else 5000)
-        if use_mp and total_points >= min_points and len(ys) > 1:
+        if use_mp and total_work_units >= min_points and len(ys) > 1:
             requested = int(getattr(heatmap_settings, "max_rf_worker_processes", 0) or 0)
             process_count = min(_logical_process_count(requested), max(1, len(ys)))
             tile_rows = max(1, int(getattr(heatmap_settings, "rf_tile_rows", 16) or 16))
@@ -1389,19 +1883,22 @@ class RFEngine:
         if progress_callback:
             progress_callback(0, len(ys))
 
+        wall_indexes = RFEngine._build_wall_indexes(floors)
         for iy, yy in enumerate(ys):
             for ix, xx in enumerate(xs):
                 values = []
-                for ap in candidate_aps:
-                    for radio in ap.active_radios():
-                        # Fast cut-off test avoids expensive wall/floor intersection
-                        # calculations when this radio cannot contribute to the
-                        # sample point. This is the main large-IFC speed-up.
-                        if RFEngine.point_is_inside_radio_cutoff(xx, yy, floor, ap, floors, radio, heatmap_settings):
-                            values.append(RFEngine.rssi_at(xx, yy, floor, ap, floors, patterns, radio, include_inter_floor, heatmap_settings))
+                for ap, radio in radio_links:
+                    # Fast cut-off test avoids expensive wall/floor intersection
+                    # calculations when this radio cannot contribute to the
+                    # sample point. This is the main large-IFC speed-up.
+                    if RFEngine.point_is_inside_radio_cutoff(xx, yy, floor, ap, floors, radio, heatmap_settings):
+                        values.append(RFEngine.rssi_at(
+                            xx, yy, floor, ap, floors, patterns, radio,
+                            include_inter_floor, heatmap_settings, wall_indexes,
+                        ))
                 grid[iy, ix] = max(values) if values else disconnected
-                if progress_callback:
-                    progress_callback(iy + 1, len(ys))
+            if progress_callback:
+                progress_callback(iy + 1, len(ys))
         return SimulationResult(xs=xs, ys=ys, rssi=grid)
 
     @staticmethod
@@ -1803,6 +2300,30 @@ def _ifc_local_placement_summary(product) -> Dict[str, float]:
     return out
 
 
+def _ifc_storey_elevation_m(storey, dz: float = 0.0, unit_scale: float = 1.0) -> float:
+    """Return a storey elevation using host placement, falling back to Elevation."""
+    placement_z = None
+    if getattr(storey, "ObjectPlacement", None) is not None:
+        try:
+            placement_z = float(_ifc_local_placement_summary(storey).get("z", 0.0))
+        except Exception:
+            placement_z = None
+    raw_elevation = getattr(storey, "Elevation", None)
+    try:
+        elevation = float(raw_elevation) if raw_elevation is not None else None
+    except Exception:
+        elevation = None
+    if placement_z is not None and math.isfinite(placement_z):
+        scaled_placement = placement_z * float(unit_scale)
+        scaled_elevation = elevation * float(unit_scale) if elevation is not None and math.isfinite(elevation) else None
+        if scaled_elevation is not None and abs(scaled_placement) <= 0.05 and abs(scaled_elevation) > 0.05:
+            return scaled_elevation + float(dz)
+        return scaled_placement + float(dz)
+    if elevation is not None and math.isfinite(elevation):
+        return elevation * float(unit_scale) + float(dz)
+    return float(dz)
+
+
 def _extract_ifc_origin_information(model, path: Path) -> Dict[str, object]:
     """Extract import origin, site orientation, true north and map CRS metadata."""
     try:
@@ -1935,14 +2456,20 @@ def _load_ifc_file_in_process(args):
 def _index_ifc_file_for_chunking(args):
     """Lightweight IFC index pass for large-file chunked geometry extraction."""
     path_str = args[0]
+    dz = float(args[3]) if len(args) > 3 else 0.0
     if ifcopenshell is None:
         raise RuntimeError("ifcopenshell is not installed. Run: pip install ifcopenshell")
     path = Path(path_str)
     model = ifcopenshell.open(str(path))
+    try:
+        import ifcopenshell.util.unit as ifc_unit_util
+        unit_scale = float(ifc_unit_util.calculate_unit_scale(model) or 1.0)
+    except Exception:
+        unit_scale = 1.0
     storeys: Dict[str, float] = {}
     for st in model.by_type("IfcBuildingStorey"):
         name = getattr(st, "Name", None) or getattr(st, "GlobalId", None) or "Storey"
-        storeys[str(name)] = float(getattr(st, "Elevation", 0.0) or 0.0)
+        storeys[str(name)] = _ifc_storey_elevation_m(st, dz=dz, unit_scale=unit_scale)
     seen = set()
     wall_guids: List[str] = []
     for wall in list(model.by_type("IfcWall")) + list(model.by_type("IfcWallStandardCase")):
@@ -1952,15 +2479,22 @@ def _index_ifc_file_for_chunking(args):
             wall_guids.append(guid)
     space_guids = [getattr(sp, "GlobalId", "") or "" for sp in model.by_type("IfcSpace")]
     space_guids = [g for g in space_guids if g]
+    element_guids: List[str] = []
+    for element in model.by_type("IfcElement"):
+        if element.is_a("IfcWall") or element.is_a("IfcWallStandardCase") or element.is_a("IfcOpeningElement"):
+            continue
+        guid = getattr(element, "GlobalId", "") or ""
+        if guid:
+            element_guids.append(guid)
     origin_info = _extract_ifc_origin_information(model, path)
-    return path_str, storeys, wall_guids, space_guids, path.name, origin_info
+    return path_str, storeys, wall_guids, space_guids, element_guids, path.name, origin_info
 
 
 def _load_ifc_geometry_chunk_in_process(args):
     """Extract geometry for one GlobalId chunk from a large IFC file."""
     (
         path_str, dx, dy, dz, project_external_walls, external_keywords,
-        storeys, wall_guids, space_guids, chunk_index, chunk_count,
+        storeys, wall_guids, space_guids, element_guids, chunk_index, chunk_count,
     ) = args
     path = Path(path_str)
     floors = IFCModelLoader(
@@ -1973,6 +2507,7 @@ def _load_ifc_geometry_chunk_in_process(args):
     ).load_filtered(
         wall_guids=list(wall_guids or []),
         space_guids=list(space_guids or []),
+        element_guids=list(element_guids or []),
         storeys_override={str(k): float(v) for k, v in dict(storeys or {}).items()},
     )
     return path_str, floors, path.name, int(chunk_index), int(chunk_count)
@@ -1995,14 +2530,17 @@ def _rf_grid_tile_worker(args):
     xs = np.asarray(xs, dtype=float)
     ys_slice = np.asarray(ys_slice, dtype=float)
     tile = np.full((len(ys_slice), len(xs)), float(disconnected), dtype=float)
-    candidate_aps = [a for a in aps if include_inter_floor or a.floor == floor.name]
+    radio_links = RFEngine._active_radio_links(floor, aps, include_inter_floor)
+    wall_indexes = RFEngine._build_wall_indexes(floors)
     for iy, yy in enumerate(ys_slice):
         for ix, xx in enumerate(xs):
             values = []
-            for ap in candidate_aps:
-                for radio in ap.active_radios():
-                    if RFEngine.point_is_inside_radio_cutoff(float(xx), float(yy), floor, ap, floors, radio, heatmap_settings):
-                        values.append(RFEngine.rssi_at(float(xx), float(yy), floor, ap, floors, patterns, radio, include_inter_floor, heatmap_settings))
+            for ap, radio in radio_links:
+                if RFEngine.point_is_inside_radio_cutoff(float(xx), float(yy), floor, ap, floors, radio, heatmap_settings):
+                    values.append(RFEngine.rssi_at(
+                        float(xx), float(yy), floor, ap, floors, patterns, radio,
+                        include_inter_floor, heatmap_settings, wall_indexes,
+                    ))
             tile[iy, ix] = max(values) if values else float(disconnected)
     return int(start_index), tile
 
@@ -2331,7 +2869,8 @@ class WallGraphicsItem(QGraphicsPolygonItem):
         self.setPen(pen); self.setBrush(brush); self.setZValue(Z_IFC_WALL)
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         self.setAcceptedMouseButtons(Qt.LeftButton | Qt.RightButton)
-        self.setToolTip(f"{wall.label}\nRight-click to inspect or edit RF attenuation")
+        delete_hint = "delete this user-created RF wall" if wall.is_user_created else "remove this imported IFC wall from the simulator model"
+        self.setToolTip(f"{wall.label}\nRight-click to inspect, edit RF attenuation or {delete_hint}")
 
     def contextMenuEvent(self, event):
         menu = QMenu()
@@ -2347,6 +2886,9 @@ class WallGraphicsItem(QGraphicsPolygonItem):
         if self.wall.is_user_created:
             menu.addSeparator()
             delete_action = menu.addAction("Delete user-created RF wall")
+        else:
+            menu.addSeparator()
+            delete_action = menu.addAction("Remove imported IFC wall from this RF model")
         chosen = menu.exec(event.screenPos())
         if chosen == edit_action:
             self.main.edit_wall_rf_properties(self.wall)
@@ -2355,7 +2897,137 @@ class WallGraphicsItem(QGraphicsPolygonItem):
         elif chosen == reset_action:
             self.main.reset_wall_rf_properties(self.wall)
         elif delete_action is not None and chosen == delete_action:
-            self.main.delete_user_wall(self.wall)
+            if self.wall.is_user_created:
+                self.main.delete_user_wall(self.wall)
+            else:
+                self.main.delete_imported_wall(self.wall)
+        event.accept()
+
+
+class SpaceGraphicsItem(QGraphicsPolygonItem):
+    """Imported or user-created RF/planning space."""
+
+    def __init__(self, main, space: Space2D, polygon: QPolygonF, pen: QPen, brush: QBrush):
+        super().__init__(polygon)
+        self.main = main
+        self.space = space
+        self.setPen(pen)
+        self.setBrush(brush)
+        self.setZValue(Z_IFC_SPACE_FILL)
+        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
+        self.setAcceptedMouseButtons(Qt.LeftButton | Qt.RightButton)
+        source = "User-created simulator space" if space.is_user_created else "Imported IFC space"
+        action = "delete this user-created space" if space.is_user_created else "remove this imported IFC space from the simulator model"
+        selection = "Selected for AP placement" if space.ap_planning_selected else "Click to select for AP placement"
+        self.setToolTip(f"{space.name}\n{source}\n{selection}\nRight-click to {action}.")
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.main.toggle_space_ap_planning_selection(self.space)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def contextMenuEvent(self, event):
+        menu = QMenu()
+        self.setSelected(True)
+        toggle_action = menu.addAction(
+            "Remove from AP placement spaces" if self.space.ap_planning_selected else "Select for AP placement"
+        )
+        menu.addSeparator()
+        if self.space.is_user_created:
+            delete_action = menu.addAction("Delete user-created space")
+        else:
+            delete_action = menu.addAction("Remove imported IFC space from this RF model")
+        chosen = menu.exec(event.screenPos())
+        if chosen == toggle_action:
+            self.main.toggle_space_ap_planning_selection(self.space)
+        elif chosen == delete_action:
+            if self.space.is_user_created:
+                self.main.delete_user_space(self.space)
+            else:
+                self.main.delete_imported_space(self.space)
+        event.accept()
+
+
+class InferredSpaceGraphicsItem(QGraphicsPolygonItem):
+    """RF/planning space inferred from wall and boundary geometry."""
+
+    def __init__(self, main, space: Space2D, polygon: QPolygonF, pen: QPen, brush: QBrush):
+        super().__init__(polygon)
+        self.main = main
+        self.space = space
+        self.setPen(pen)
+        self.setBrush(brush)
+        self.setZValue(Z_IFC_SPACE_OUTLINE + 1)
+        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
+        self.setAcceptedMouseButtons(Qt.LeftButton | Qt.RightButton)
+        note = space.assumption_note or "Created from wall boundaries and the external planning baseline."
+        selection = "Selected for AP placement" if space.ap_planning_selected else "Click to select for AP placement"
+        self.setToolTip(
+            f"{space.name}\nInferred simulator space - source IFC is unchanged.\n{note}\n"
+            f"{selection}\nRight-click to delete this inferred space."
+        )
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.main.toggle_space_ap_planning_selection(self.space)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def contextMenuEvent(self, event):
+        menu = QMenu()
+        self.setSelected(True)
+        toggle_action = menu.addAction(
+            "Remove from AP placement spaces" if self.space.ap_planning_selected else "Select for AP placement"
+        )
+        menu.addSeparator()
+        delete_action = menu.addAction("Delete inferred space")
+        chosen = menu.exec(event.screenPos())
+        if chosen == toggle_action:
+            self.main.toggle_space_ap_planning_selection(self.space)
+        elif chosen == delete_action:
+            self.main.delete_inferred_space(self.space)
+        event.accept()
+
+
+class IFCElementGraphicsItem(QGraphicsPolygonItem):
+    """Imported non-wall IFC element shown as model context."""
+
+    def __init__(self, main, element: IFCElement2D, polygon: QPolygonF, pen: QPen, brush: QBrush):
+        super().__init__(polygon)
+        self.main = main
+        self.element = element
+        self.setPen(pen)
+        self.setBrush(brush)
+        self.setZValue(Z_IFC_SPACE_OUTLINE)
+        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
+        self.setAcceptedMouseButtons(Qt.LeftButton | Qt.RightButton)
+        material = f"\n{element.material}" if element.material else ""
+        self.setToolTip(
+            f"{element.name or element.guid}\n{element.type_name}{material}\n"
+            "Right-click to remove this imported IFC element from the RF model."
+        )
+
+    def contextMenuEvent(self, event):
+        menu = QMenu()
+        self.setSelected(True)
+        inferred_space_actions = []
+        for space in self.main.inferred_spaces_at_scene_pos(event.scenePos()):
+            label = f"Delete inferred space '{space.name}'" if space.name else "Delete inferred space"
+            inferred_space_actions.append((menu.addAction(label), space))
+        if inferred_space_actions:
+            menu.addSeparator()
+        delete_action = menu.addAction("Remove imported IFC element from this RF model")
+        chosen = menu.exec(event.screenPos())
+        for action, space in inferred_space_actions:
+            if chosen == action:
+                self.main.delete_inferred_space(space)
+                event.accept()
+                return
+        if chosen == delete_action:
+            self.main.delete_imported_element(self.element)
         event.accept()
 
 
@@ -2457,16 +3129,26 @@ class PlanView(QGraphicsView):
         self.scale(factor, factor)
 
     def mouseMoveEvent(self, event):
+        shift_constrain = bool(event.modifiers() & Qt.ShiftModifier)
+        if getattr(self.main, "space_draw_mode", False) and bool(getattr(self.main, "_space_polygon_points", [])):
+            pos = self.mapToScene(event.position().toPoint())
+            self.main.show_space_preview(pos, shift_constrain=shift_constrain)
+
         if getattr(self.main, "boundary_draw_mode", False):
             has_rectangle_start = getattr(self.main, "_boundary_draw_start", None) is not None
             has_polygon_points = bool(getattr(self.main, "_boundary_polygon_points", []))
             if has_rectangle_start or has_polygon_points:
                 pos = self.mapToScene(event.position().toPoint())
-                self.main.show_planner_boundary_preview(pos)
+                self.main.show_planner_boundary_preview(pos, shift_constrain=shift_constrain)
 
         if getattr(self.main, "wall_draw_mode", False) and getattr(self.main, "_wall_draw_start", None) is not None:
             pos = self.mapToScene(event.position().toPoint())
-            snap, _ = self.main.nearest_ifc_connection_point(pos)
+            start = self.main._wall_draw_start
+            snap, snapped = self.main.nearest_ifc_connection_point(
+                pos, straight_from=start if shift_constrain else None
+            )
+            if shift_constrain and not snapped:
+                snap = self.main.axis_constrained_point(start, pos)
             self.main.show_user_wall_preview(snap)
 
         if self._middle_panning and self._last_pan_pos is not None:
@@ -2485,6 +3167,21 @@ class PlanView(QGraphicsView):
         super().mouseMoveEvent(event)
 
     def mousePressEvent(self, event):
+        if getattr(self.main, "space_draw_mode", False):
+            if event.button() == Qt.RightButton:
+                if len(getattr(self.main, "_space_polygon_points", [])) >= 3:
+                    self.main.finish_user_space()
+                else:
+                    self.main.cancel_space_drawing()
+                event.accept()
+                return
+            if event.button() == Qt.LeftButton:
+                pos = self.mapToScene(event.position().toPoint())
+                shift_constrain = bool(event.modifiers() & Qt.ShiftModifier)
+                self.main.capture_space_point(pos, shift_constrain=shift_constrain)
+                event.accept()
+                return
+
         if getattr(self.main, "boundary_draw_mode", False):
             if event.button() == Qt.RightButton:
                 if (
@@ -2498,7 +3195,8 @@ class PlanView(QGraphicsView):
                 return
             if event.button() == Qt.LeftButton:
                 pos = self.mapToScene(event.position().toPoint())
-                self.main.capture_planner_boundary_point(pos)
+                shift_constrain = bool(event.modifiers() & Qt.ShiftModifier)
+                self.main.capture_planner_boundary_point(pos, shift_constrain=shift_constrain)
                 event.accept()
                 return
 
@@ -2509,7 +3207,8 @@ class PlanView(QGraphicsView):
                 return
             if event.button() == Qt.LeftButton:
                 pos = self.mapToScene(event.position().toPoint())
-                self.main.capture_user_wall_point(pos)
+                shift_constrain = bool(event.modifiers() & Qt.ShiftModifier)
+                self.main.capture_user_wall_point(pos, shift_constrain=shift_constrain)
                 event.accept()
                 return
 
@@ -2528,6 +3227,15 @@ class PlanView(QGraphicsView):
                 event.accept()
                 return
 
+        if event.button() == Qt.LeftButton:
+            selectable_items = self.main.selectable_scene_items_at_view_pos(self, event.position().toPoint())
+            if len(selectable_items) > 1:
+                chosen = self.main.choose_scene_item_from_overlap(selectable_items, event.globalPosition().toPoint())
+                if chosen is not None:
+                    self.main.activate_scene_item_selection(chosen)
+                event.accept()
+                return
+
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event):
@@ -2540,12 +3248,20 @@ class PlanView(QGraphicsView):
 
         super().mouseReleaseEvent(event)
 
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            if self.main.delete_selected_scene_items():
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
     def mouseDoubleClickEvent(self, event):
         if self.main.floor is None:
             return
         if (
             getattr(self.main, "alignment_pick_mode", None)
             or getattr(self.main, "wall_draw_mode", False)
+            or getattr(self.main, "space_draw_mode", False)
             or getattr(self.main, "boundary_draw_mode", False)
         ):
             return
@@ -2598,6 +3314,10 @@ class MainWindow(QMainWindow):
         self.wall_draw_mode: bool = False
         self._wall_draw_start: Optional[QPointF] = None
         self._wall_preview_items: List[QGraphicsItem] = []
+        self.space_draw_mode: bool = False
+        self._space_polygon_points: List[QPointF] = []
+        self._space_preview_items: List[QGraphicsItem] = []
+        self.excluded_ifc_elements: List[Dict[str, str]] = []
         self.planner_boundaries: List[PlannerBoundary2D] = []
         self.boundary_draw_mode: bool = False
         self.boundary_draw_shape: str = "rectangle"
@@ -2605,6 +3325,7 @@ class MainWindow(QMainWindow):
         self._boundary_polygon_points: List[QPointF] = []
         self._boundary_preview_items: List[QGraphicsItem] = []
         self._suggested_boundary_preview_items: List[QGraphicsItem] = []
+        self._suggested_space_preview_items: List[QGraphicsItem] = []
         self._pending_plan_data: Optional[Dict[str, object]] = None
         self.dxf_overlay: Optional[DxfOverlay] = None
         self.ifc_alignment = AlignmentTransform()
@@ -2829,6 +3550,15 @@ class MainWindow(QMainWindow):
         )
         self.suggest_external_boundary_action = QAction("Suggest external boundary", self)
         self.suggest_external_boundary_action.triggered.connect(self.suggest_external_planner_boundary)
+        self.draw_space_action = QAction("Draw space", self)
+        self.draw_space_action.setCheckable(True)
+        self.draw_space_action.toggled.connect(self.toggle_space_draw_mode)
+        self.create_spaces_action = QAction("Create spaces from walls", self)
+        self.create_spaces_action.triggered.connect(self.suggest_spaces_from_wall_boundaries)
+        self.select_ap_spaces_action = QAction("Choose AP spaces", self)
+        self.select_ap_spaces_action.triggered.connect(self.show_ap_space_selection_dialog)
+        self.clear_inferred_spaces_action = QAction("Clear inferred spaces", self)
+        self.clear_inferred_spaces_action.triggered.connect(self.clear_inferred_spaces)
         self.clear_boundaries_action = QAction("Clear planner boundaries", self)
         self.clear_boundaries_action.triggered.connect(self.clear_planner_boundaries)
         self.ifc_origin_action = QAction("IFC origin / orientation", self)
@@ -2857,6 +3587,148 @@ class MainWindow(QMainWindow):
 
         self.floor_combo.currentTextChanged.connect(self.select_floor)
         self.include_inter_floor.stateChanged.connect(lambda *_: self.draw_floor())
+
+    def selectable_scene_items_at_view_pos(self, view: QGraphicsView, view_pos) -> List[QGraphicsItem]:
+        selectable_types = (
+            AccessPointGraphicsItem,
+            PlannerBoundaryGraphicsItem,
+            IFCElementGraphicsItem,
+            InferredSpaceGraphicsItem,
+            SpaceGraphicsItem,
+            WallGraphicsItem,
+        )
+        seen = set()
+        selectable: List[QGraphicsItem] = []
+        for item in view.items(view_pos):
+            if not isinstance(item, selectable_types):
+                continue
+            if not (item.flags() & QGraphicsItem.ItemIsSelectable):
+                continue
+            key = id(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            selectable.append(item)
+        return selectable
+
+    def _scene_item_selection_label(self, item: QGraphicsItem) -> str:
+        if isinstance(item, AccessPointGraphicsItem):
+            return f"Access point: {item.ap.name}"
+        if isinstance(item, PlannerBoundaryGraphicsItem):
+            return f"Planner boundary: {item.boundary.name}"
+        if isinstance(item, InferredSpaceGraphicsItem):
+            return f"Inferred space: {item.space.name or item.space.guid}"
+        if isinstance(item, SpaceGraphicsItem):
+            source = "User space" if item.space.is_user_created else "IFC space"
+            return f"{source}: {item.space.name or item.space.guid}"
+        if isinstance(item, WallGraphicsItem):
+            source = "User RF wall" if item.wall.is_user_created else "IFC wall"
+            return f"{source}: {item.wall.label}"
+        if isinstance(item, IFCElementGraphicsItem):
+            name = item.element.name or item.element.guid
+            return f"IFC element: {item.element.type_name} - {name}"
+        return item.toolTip() or type(item).__name__
+
+    def choose_scene_item_from_overlap(self, items: List[QGraphicsItem], screen_pos: QPointF) -> Optional[QGraphicsItem]:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Select item")
+        dialog.setModal(True)
+        layout = QVBoxLayout(dialog)
+        label = QLabel("Multiple selectable items overlap here. Choose the item to select.")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+
+        list_widget = QListWidget(dialog)
+        list_widget.setMinimumWidth(460)
+        for item in items:
+            list_widget.addItem(QListWidgetItem(self._scene_item_selection_label(item)))
+        list_widget.setCurrentRow(0)
+        list_widget.itemDoubleClicked.connect(lambda *_: dialog.accept())
+        layout.addWidget(list_widget)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, dialog)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.move(screen_pos)
+
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        row = list_widget.currentRow()
+        if row < 0 or row >= len(items):
+            return None
+        return items[row]
+
+    def activate_scene_item_selection(self, item: QGraphicsItem):
+        scene = self.view.scene() if getattr(self, "view", None) else None
+        if scene is not None:
+            scene.clearSelection()
+        item.setSelected(True)
+        if isinstance(item, (InferredSpaceGraphicsItem, SpaceGraphicsItem)):
+            self.toggle_space_ap_planning_selection(item.space)
+            return
+        if isinstance(item, AccessPointGraphicsItem):
+            self.statusBar().showMessage(f"Selected access point '{item.ap.name}'")
+            return
+        if isinstance(item, PlannerBoundaryGraphicsItem):
+            self.statusBar().showMessage(f"Selected planner boundary '{item.boundary.name}'. Right-click for actions.")
+            return
+        if isinstance(item, WallGraphicsItem):
+            self.statusBar().showMessage(f"Selected wall '{item.wall.label}'. Right-click for actions.")
+            return
+        if isinstance(item, IFCElementGraphicsItem):
+            name = item.element.name or item.element.guid
+            self.statusBar().showMessage(f"Selected IFC element '{name}'. Right-click for actions.")
+
+    def delete_selected_scene_items(self) -> bool:
+        scene = self.view.scene() if getattr(self, "view", None) else None
+        if scene is None:
+            return False
+        selected_items = [
+            item for item in scene.selectedItems()
+            if isinstance(item, (
+                AccessPointGraphicsItem,
+                PlannerBoundaryGraphicsItem,
+                IFCElementGraphicsItem,
+                InferredSpaceGraphicsItem,
+                SpaceGraphicsItem,
+                WallGraphicsItem,
+            ))
+        ]
+        if not selected_items:
+            self.statusBar().showMessage("Select an AP, wall, space, IFC element or boundary before pressing Delete")
+            return False
+
+        item = max(selected_items, key=lambda candidate: candidate.zValue())
+        if isinstance(item, AccessPointGraphicsItem):
+            self.aps = [ap for ap in self.aps if ap is not item.ap]
+            self.last_result = None
+            self.draw_floor()
+            self.populate_ap_table()
+            self.statusBar().showMessage(f"Deleted access point '{item.ap.name}'")
+            return True
+        if isinstance(item, PlannerBoundaryGraphicsItem):
+            self.delete_planner_boundary(item.boundary)
+            return True
+        if isinstance(item, InferredSpaceGraphicsItem):
+            self.delete_inferred_space(item.space)
+            return True
+        if isinstance(item, SpaceGraphicsItem):
+            if item.space.is_user_created:
+                self.delete_user_space(item.space)
+            else:
+                self.delete_imported_space(item.space)
+            return True
+        if isinstance(item, WallGraphicsItem):
+            if item.wall.is_user_created:
+                self.delete_user_wall(item.wall)
+            else:
+                self.delete_imported_wall(item.wall)
+            return True
+        if isinstance(item, IFCElementGraphicsItem):
+            self.delete_imported_element(item.element)
+            return True
+        return False
 
     # ----------------------------- Ribbon interface -----------------------------
 
@@ -2921,7 +3793,7 @@ class MainWindow(QMainWindow):
                 "SP_DialogApplyButton", "Ctrl+P"
             ),
             "draw_wall_action": (
-                "Draw RF wall", "Draw a connected RF-blocking wall where the IFC model has missing geometry.",
+                "Draw RF wall", "Draw a connected RF-blocking wall where the IFC model has missing geometry. Hold Shift to constrain it horizontal or vertical.",
                 "SP_FileDialogContentsView", ""
             ),
             "draw_boundary_action": (
@@ -2929,12 +3801,28 @@ class MainWindow(QMainWindow):
                 "SP_TitleBarMaxButton", ""
             ),
             "draw_polygon_boundary_action": (
-                "Polygon boundary", "Draw a polygon hard boundary shared by all IFC floors; right-click to finish.",
+                "Polygon boundary", "Draw a polygon hard boundary shared by all IFC floors; hold Shift for horizontal/vertical segments and right-click to finish.",
                 "SP_DriveNetIcon", ""
             ),
             "suggest_external_boundary_action": (
-                "Suggest outer boundary", "Trace the outermost IFC wall chain, preview it on the plan and accept it as a shared planner boundary.",
+                "Suggest outer boundary", "Trace the outermost combined IFC and manually placed RF wall chain, preview it on the plan and accept it as a shared planner boundary.",
                 "SP_FileDialogListView", ""
+            ),
+            "create_spaces_action": (
+                "Create spaces from walls", "Infer room spaces from wall boundaries. Missing facade walls are closed using the accepted planner boundary or a suggested outer baseline.",
+                "SP_FileDialogDetailedView", ""
+            ),
+            "draw_space_action": (
+                "Draw space", "Create a simulator space on the selected floor by clicking polygon vertices; hold Shift for horizontal or vertical segments and right-click to finish.",
+                "SP_FileDialogNewFolder", ""
+            ),
+            "select_ap_spaces_action": (
+                "AP spaces", "Choose the spaces where predictive AP placement is allowed. Selected spaces are highlighted on the plan.",
+                "SP_DialogApplyButton", ""
+            ),
+            "clear_inferred_spaces_action": (
+                "Clear inferred spaces", "Remove inferred wall-derived spaces from the selected floor without changing IFC or manually drawn spaces.",
+                "SP_TrashIcon", ""
             ),
             "clear_boundaries_action": (
                 "Clear boundaries", "Remove every rectangular and polygon planner boundary.",
@@ -3055,6 +3943,7 @@ class MainWindow(QMainWindow):
         ]), "Model and view")
         ribbon.addTab(self._make_ribbon_page([
             ("RF obstructions", ["draw_wall_action"]),
+            ("Space creation", ["draw_space_action", "create_spaces_action", "select_ap_spaces_action", "clear_inferred_spaces_action"]),
             ("Permitted planning area", ["draw_boundary_action", "draw_polygon_boundary_action", "suggest_external_boundary_action", "clear_boundaries_action"]),
         ]), "Walls and boundaries")
         ribbon.addTab(self._make_ribbon_page([
@@ -3115,6 +4004,8 @@ class MainWindow(QMainWindow):
     def toggle_wall_draw_mode(self, enabled: bool):
         if enabled and getattr(self, "boundary_draw_mode", False):
             self.cancel_planner_boundary_drawing()
+        if enabled and getattr(self, "space_draw_mode", False):
+            self.cancel_space_drawing()
         self.wall_draw_mode = bool(enabled)
         self._wall_draw_start = None
         self._clear_wall_preview()
@@ -3125,7 +4016,7 @@ class MainWindow(QMainWindow):
                 self.wall_draw_mode = False
                 return
             self.view.setCursor(Qt.CrossCursor)
-            self.statusBar().showMessage("Draw RF wall: click an existing IFC wall/space edge for the first endpoint. Right-click to cancel.")
+            self.statusBar().showMessage("Draw RF wall: click an existing IFC wall/space edge for the first endpoint. Hold Shift for a horizontal or vertical wall. Right-click to cancel.")
         else:
             self.view.setCursor(Qt.ArrowCursor)
             self.statusBar().showMessage("RF wall drawing stopped")
@@ -3138,6 +4029,59 @@ class MainWindow(QMainWindow):
             self.draw_wall_action.blockSignals(True); self.draw_wall_action.setChecked(False); self.draw_wall_action.blockSignals(False)
         self.view.setCursor(Qt.ArrowCursor)
         self.statusBar().showMessage("RF wall drawing cancelled")
+
+    def _clear_space_preview(self):
+        scene = self.view.scene()
+        for item in list(getattr(self, "_space_preview_items", [])):
+            try:
+                if scene is not None and item.scene() is scene:
+                    scene.removeItem(item)
+            except RuntimeError:
+                pass
+        self._space_preview_items = []
+
+    def toggle_space_draw_mode(self, enabled: bool):
+        if enabled and getattr(self, "wall_draw_mode", False):
+            self.cancel_user_wall_drawing()
+        if enabled and getattr(self, "boundary_draw_mode", False):
+            self.cancel_planner_boundary_drawing(show_status=False)
+        self.space_draw_mode = bool(enabled)
+        self._space_polygon_points = []
+        self._clear_space_preview()
+        if enabled:
+            if not self.floor:
+                QMessageBox.information(self, "No floor selected", "Load an IFC and select a floor before drawing a space.")
+                self.cancel_space_drawing(show_status=False)
+                return
+            self.view.setCursor(Qt.CrossCursor)
+            self.statusBar().showMessage(
+                "Draw space: left-click each vertex; hold Shift to constrain the next segment horizontal or vertical; right-click or click the first vertex to finish."
+            )
+        else:
+            self.view.setCursor(Qt.ArrowCursor)
+            self.statusBar().showMessage("Space drawing stopped")
+
+    def cancel_space_drawing(self, show_status: bool = True):
+        self._space_polygon_points = []
+        self._clear_space_preview()
+        self.space_draw_mode = False
+        action = getattr(self, "draw_space_action", None)
+        if action is not None:
+            action.blockSignals(True)
+            action.setChecked(False)
+            action.blockSignals(False)
+        self.view.setCursor(Qt.ArrowCursor)
+        if show_status:
+            self.statusBar().showMessage("Space drawing cancelled")
+
+    @staticmethod
+    def axis_constrained_point(start: QPointF, candidate: QPointF) -> QPointF:
+        """Constrain a drawing point to the dominant horizontal/vertical axis."""
+        sx, sy = float(start.x()), float(start.y())
+        cx, cy = float(candidate.x()), float(candidate.y())
+        if abs(cx - sx) >= abs(cy - sy):
+            return QPointF(cx, sy)
+        return QPointF(sx, cy)
 
     def _clear_boundary_preview(self):
         scene = self.view.scene()
@@ -3157,6 +4101,8 @@ class MainWindow(QMainWindow):
             return
         if enabled and getattr(self, "wall_draw_mode", False):
             self.cancel_user_wall_drawing()
+        if enabled and getattr(self, "space_draw_mode", False):
+            self.cancel_space_drawing()
         if enabled and self.boundary_draw_mode and self.boundary_draw_shape != shape:
             self.cancel_planner_boundary_drawing(show_status=False)
 
@@ -3187,7 +4133,7 @@ class MainWindow(QMainWindow):
             self.view.setCursor(Qt.CrossCursor)
             if shape == "polygon":
                 self.statusBar().showMessage(
-                    "Draw shared polygon boundary: left-click each vertex; click the first vertex or right-click after at least three vertices to finish."
+                    "Draw shared polygon boundary: left-click each vertex; hold Shift to constrain the next segment horizontal or vertical; click the first vertex or right-click after at least three vertices to finish."
                 )
             else:
                 self.statusBar().showMessage(
@@ -3212,7 +4158,7 @@ class MainWindow(QMainWindow):
         if show_status:
             self.statusBar().showMessage("Planner boundary drawing cancelled")
 
-    def show_planner_boundary_preview(self, end_point: QPointF):
+    def show_planner_boundary_preview(self, end_point: QPointF, shift_constrain: bool = False):
         self._clear_boundary_preview()
         if self.view.scene() is None:
             return
@@ -3224,7 +4170,10 @@ class MainWindow(QMainWindow):
             points = list(self._boundary_polygon_points)
             if not points:
                 return
-            points.append(QPointF(float(end_point.x()), float(end_point.y())))
+            preview_point = QPointF(float(end_point.x()), float(end_point.y()))
+            if shift_constrain:
+                preview_point = self.axis_constrained_point(points[-1], preview_point)
+            points.append(preview_point)
             polygon = QPolygonF(points)
             preview = QGraphicsPolygonItem(polygon)
             preview.setPen(pen)
@@ -3269,18 +4218,121 @@ class MainWindow(QMainWindow):
             float(first.y()) - float(second.y()),
         ) <= float(tolerance_m)
 
-    def capture_planner_boundary_point(self, scene_pos: QPointF):
+    def show_space_preview(self, end_point: QPointF, shift_constrain: bool = False):
+        self._clear_space_preview()
+        scene = self.view.scene()
+        if scene is None or not self._space_polygon_points:
+            return
+        points = list(self._space_polygon_points)
+        preview_point = QPointF(float(end_point.x()), float(end_point.y()))
+        if shift_constrain:
+            preview_point = self.axis_constrained_point(points[-1], preview_point)
+        points.append(preview_point)
+        polygon = QPolygonF(points)
+        fill = QColor("#2D9CDB")
+        fill.setAlpha(45 if len(points) >= 3 else 0)
+        pen = QPen(QColor("#2D9CDB"), 1.5)
+        pen.setCosmetic(True)
+        pen.setStyle(Qt.DashLine)
+        preview = QGraphicsPolygonItem(polygon)
+        preview.setPen(pen)
+        preview.setBrush(QBrush(fill) if fill.alpha() else QBrush(Qt.NoBrush))
+        preview.setZValue(Z_AP_LABEL + 24)
+        scene.addItem(preview)
+        items: List[QGraphicsItem] = [preview]
+        marker_pen = QPen(QColor("#2D9CDB"), 1.0)
+        marker_pen.setCosmetic(True)
+        marker_brush = QBrush(QColor("#FFFFFF"))
+        for vertex in self._space_polygon_points:
+            marker = scene.addEllipse(
+                float(vertex.x()) - 0.08,
+                float(vertex.y()) - 0.08,
+                0.16,
+                0.16,
+                marker_pen,
+                marker_brush,
+            )
+            marker.setZValue(Z_AP_LABEL + 25)
+            items.append(marker)
+        self._space_preview_items = items
+
+    def capture_space_point(self, scene_pos: QPointF, shift_constrain: bool = False):
         if not self.floor:
             return
-        point = QPointF(float(scene_pos.x()), float(scene_pos.y()))
+        raw_point = QPointF(float(scene_pos.x()), float(scene_pos.y()))
+        if (
+            len(self._space_polygon_points) >= 3
+            and self._planner_points_are_close(self._space_polygon_points[0], raw_point)
+        ):
+            self.finish_user_space()
+            return
+        point = raw_point
+        if shift_constrain and self._space_polygon_points:
+            point = self.axis_constrained_point(self._space_polygon_points[-1], raw_point)
+        if (
+            self._space_polygon_points
+            and self._planner_points_are_close(self._space_polygon_points[-1], point, 0.05)
+        ):
+            self.statusBar().showMessage("Space vertices must be at least 0.05 m apart.")
+            return
+        self._space_polygon_points.append(point)
+        self.show_space_preview(point)
+        count = len(self._space_polygon_points)
+        if count < 3:
+            self.statusBar().showMessage(f"Space vertex {count} captured. Add at least {3 - count} more vertex/vertices.")
+        else:
+            self.statusBar().showMessage("Space polygon ready. Right-click or click the first vertex to finish.")
+
+    def finish_user_space(self):
+        if not self.floor:
+            return
+        points = list(self._space_polygon_points)
+        if len(points) < 3:
+            self.statusBar().showMessage("A space requires at least three vertices.")
+            return
+        polygon = Polygon([(float(point.x()), float(point.y())) for point in points])
+        if not polygon.is_valid:
+            self.statusBar().showMessage("Space polygon is self-intersecting or otherwise invalid. Adjust the vertices or cancel drawing.")
+            return
+        if polygon.is_empty or float(polygon.area) < 0.05:
+            self.statusBar().showMessage("Space area must be at least 0.05 m2.")
+            return
+        index = 1 + sum(1 for space in self.floor.spaces if space.is_user_created)
+        self.floor.spaces.append(Space2D(
+            guid=f"user-space-{uuid.uuid4().hex}",
+            name=f"User Space {index}",
+            floor=self.floor.name,
+            source_file="RF simulator user space",
+            polygon=polygon,
+            z_min=float(self.floor.elevation),
+            z_max=float(self.floor.elevation + 3.0),
+            source_storey=self.floor.name,
+            is_user_created=True,
+            assumption_note="Drawn manually in the RF simulator; source IFC is unchanged.",
+        ))
+        self._space_polygon_points = []
+        self._clear_space_preview()
+        self.last_result = None
+        self.draw_floor()
+        self.statusBar().showMessage(
+            f"Created User Space {index} on '{self.floor.name}'. Continue drawing another space or toggle the tool off."
+        )
+
+    def capture_planner_boundary_point(self, scene_pos: QPointF, shift_constrain: bool = False):
+        if not self.floor:
+            return
+        raw_point = QPointF(float(scene_pos.x()), float(scene_pos.y()))
+        point = raw_point
 
         if self.boundary_draw_shape == "polygon":
             if (
                 len(self._boundary_polygon_points) >= 3
-                and self._planner_points_are_close(self._boundary_polygon_points[0], point)
+                and self._planner_points_are_close(self._boundary_polygon_points[0], raw_point)
             ):
                 self.finish_planner_polygon_boundary()
                 return
+            if shift_constrain and self._boundary_polygon_points:
+                point = self.axis_constrained_point(self._boundary_polygon_points[-1], raw_point)
             if (
                 self._boundary_polygon_points
                 and self._planner_points_are_close(self._boundary_polygon_points[-1], point, 0.05)
@@ -3296,7 +4348,7 @@ class MainWindow(QMainWindow):
                 )
             else:
                 self.statusBar().showMessage(
-                    f"Polygon vertex {count} captured. Right-click or click the first vertex to finish."
+                    f"Polygon vertex {count} captured. Hold Shift for horizontal/vertical segments; right-click or click the first vertex to finish."
                 )
             return
 
@@ -3444,19 +4496,22 @@ class MainWindow(QMainWindow):
         return max(0.0, maxx - minx) * max(0.0, maxy - miny)
 
     def _wall_polygons_for_boundary_suggestion(self) -> Tuple[List[Polygon], str, int]:
-        """Return unique wall polygons for tracing the outermost chain.
+        """Return unique IFC and RF wall polygons for tracing the outer chain.
 
         All IFC walls are used rather than trusting an ``IsExternal`` flag,
         because many authoring exports omit or only partially populate that
-        property. Internal walls remain inside the union and therefore do not
-        alter the extracted outer ring.
+        property. Manually placed RF walls are always included as well, so a
+        user can close missing facade sections before requesting a boundary
+        suggestion. Internal walls remain inside the union and therefore do
+        not alter the extracted outer ring.
         """
         if not self.floor:
             return [], "", 0
 
         unique = set()
         ifc_walls: List[Wall2D] = []
-        fallback_walls: List[Wall2D] = []
+        manual_rf_walls: List[Wall2D] = []
+        generated_rf_walls: List[Wall2D] = []
         for wall in self.floor.walls:
             polygon = getattr(wall, "polygon", None)
             if polygon is None or polygon.is_empty or float(polygon.area) <= 1e-6:
@@ -3465,13 +4520,34 @@ class MainWindow(QMainWindow):
             if key in unique:
                 continue
             unique.add(key)
-            fallback_walls.append(wall)
             if not wall.is_user_created:
                 ifc_walls.append(wall)
+            elif str(getattr(wall, "source_file", "")) == "RF simulator external baseline":
+                generated_rf_walls.append(wall)
+            else:
+                manual_rf_walls.append(wall)
 
-        selected = ifc_walls or fallback_walls
-        selected_label = "IFC walls" if ifc_walls else "available IFC/RF walls"
-        return [wall.polygon for wall in selected], selected_label, len(selected)
+        selected = ifc_walls + manual_rf_walls + generated_rf_walls
+        source_parts: List[str] = []
+        if ifc_walls:
+            source_parts.append(f"{len(ifc_walls)} IFC wall{'s' if len(ifc_walls) != 1 else ''}")
+        if manual_rf_walls:
+            source_parts.append(
+                f"{len(manual_rf_walls)} manually placed RF wall"
+                f"{'s' if len(manual_rf_walls) != 1 else ''}"
+            )
+        if generated_rf_walls:
+            source_parts.append(
+                f"{len(generated_rf_walls)} generated RF wall"
+                f"{'s' if len(generated_rf_walls) != 1 else ''}"
+            )
+        if not source_parts:
+            source_label = "no usable walls"
+        elif len(source_parts) == 1:
+            source_label = source_parts[0]
+        else:
+            source_label = ", ".join(source_parts[:-1]) + " and " + source_parts[-1]
+        return [wall.polygon for wall in selected], source_label, len(selected)
 
     def suggest_external_planner_boundary(self):
         """Preview and optionally accept an outer-wall-derived shared boundary."""
@@ -3493,7 +4569,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "No wall geometry",
-                "The selected floor has no usable IFC wall geometry from which to form an external chain.",
+                "The selected floor has no usable IFC or manually placed RF wall geometry from which to form an external chain.",
             )
             return
 
@@ -3505,7 +4581,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(dialog)
 
         explanation = QLabel(
-            f"The magenta chain is derived from {source_count} {source_label} on "
+            f"The magenta chain is derived from {source_label} on "
             f"'{self.floor.name}'. If accepted, the resulting polygon boundary is shared by all IFC floors. "
             "Increase the bridge distance where doors or missing wall segments leave the chain open."
         )
@@ -3556,7 +4632,7 @@ class MainWindow(QMainWindow):
 
         def update_preview():
             nonlocal current_polygons, current_metadata
-            self.statusBar().showMessage("Tracing the outermost IFC wall chain...")
+            self.statusBar().showMessage("Tracing the outermost IFC and RF wall chain...")
             QApplication.setOverrideCursor(Qt.WaitCursor)
             try:
                 current_polygons, current_metadata = suggest_external_boundary_polygons(
@@ -3594,6 +4670,7 @@ class MainWindow(QMainWindow):
                 )
 
         update_button.clicked.connect(update_preview)
+        # The preview is recalculated explicitly with the Update preview button.
         accept_button.clicked.connect(dialog.accept)
         cancel_button.clicked.connect(dialog.reject)
         update_preview()
@@ -3624,6 +4701,466 @@ class MainWindow(QMainWindow):
             "the permitted area now applies to all IFC floors."
         )
 
+    def _clear_suggested_space_preview(self):
+        scene = self.view.scene()
+        for item in list(getattr(self, "_suggested_space_preview_items", [])):
+            try:
+                if scene is not None and item.scene() is scene:
+                    scene.removeItem(item)
+            except RuntimeError:
+                pass
+        self._suggested_space_preview_items = []
+
+    def _show_suggested_space_preview(
+        self, polygons: List[Polygon], external_wall_polygons: Optional[List[Polygon]] = None
+    ):
+        """Overlay inferred spaces and optional missing-facade RF walls."""
+        self._clear_suggested_space_preview()
+        scene = self.view.scene()
+        if scene is None:
+            return
+        items: List[QGraphicsItem] = []
+        outline = QColor("#00B894")
+        fill = QColor("#00B894")
+        fill.setAlpha(55)
+        pen = QPen(outline, 1.6)
+        pen.setCosmetic(True)
+        pen.setStyle(Qt.DashLine)
+        for index, polygon in enumerate(polygons, start=1):
+            coords = list(polygon.exterior.coords)
+            qpolygon = QPolygonF([QPointF(float(x), float(y)) for x, y in coords])
+            item = QGraphicsPolygonItem(qpolygon)
+            item.setPen(pen)
+            item.setBrush(QBrush(fill))
+            item.setAcceptedMouseButtons(Qt.NoButton)
+            item.setZValue(Z_AP_LABEL + 30)
+            scene.addItem(item)
+            items.append(item)
+            point = polygon.representative_point()
+            label = self._add_upright_text(
+                scene,
+                f"Proposed space {index}\n{float(polygon.area):,.1f} m²",
+                float(point.x),
+                float(point.y),
+                outline,
+                max(3, int(self.heatmap_settings.space_label_font_size)),
+                Z_AP_LABEL + 31,
+                bold=True,
+            )
+            items.append(label)
+
+        wall_outline = QColor("#FF7A00")
+        wall_fill = QColor("#FF7A00")
+        wall_fill.setAlpha(105)
+        wall_pen = QPen(wall_outline, 2.0)
+        wall_pen.setCosmetic(True)
+        for polygon in external_wall_polygons or []:
+            coords = list(polygon.exterior.coords)
+            qpolygon = QPolygonF([QPointF(float(x), float(y)) for x, y in coords])
+            item = QGraphicsPolygonItem(qpolygon)
+            item.setPen(wall_pen)
+            item.setBrush(QBrush(wall_fill))
+            item.setAcceptedMouseButtons(Qt.NoButton)
+            item.setZValue(Z_AP_LABEL + 33)
+            scene.addItem(item)
+            items.append(item)
+        self._suggested_space_preview_items = items
+
+    @staticmethod
+    def _ifc_element_blocks_space_inference(element: IFCElement2D) -> bool:
+        text = f"{element.type_name} {element.name} {element.material}".lower()
+        blocking_tokens = (
+            "curtainwall", "curtain wall", "stair", "stairflight",
+            "ramp", "railing", "member", "column", "beam", "plate",
+            "footing", "roof", "covering",
+        )
+        pass_through_tokens = (
+            "door", "window", "opening", "slab", "floor", "ceiling", "deck",
+            "proxy", "buildingelementproxy", "generic model", "generic_model",
+        )
+        return any(token in text for token in blocking_tokens) and not any(token in text for token in pass_through_tokens)
+
+    def _space_inference_barrier_polygons(self) -> Tuple[List[Polygon], Dict[str, int]]:
+        if not self.floor:
+            return [], {"wall_count": 0, "element_count": 0}
+        polygons: List[Polygon] = []
+        seen = set()
+        wall_count = 0
+        element_count = 0
+
+        def add_polygon(polygon: Polygon, source_key: str) -> bool:
+            if polygon is None or polygon.is_empty or float(polygon.area) <= 1e-6:
+                return False
+            key = (source_key, bytes(polygon.wkb))
+            if key in seen:
+                return False
+            seen.add(key)
+            polygons.append(polygon)
+            return True
+
+        for wall in self.floor.walls:
+            # Previously inferred facade segments are regenerated from the
+            # current baseline and must not mask a changed boundary.
+            if str(getattr(wall, "source_file", "")) == "RF simulator external baseline":
+                continue
+            if add_polygon(getattr(wall, "polygon", None), f"wall:{wall.source_file}:{wall.guid}"):
+                wall_count += 1
+
+        for element in getattr(self.floor, "elements", []):
+            if not self._ifc_element_blocks_space_inference(element):
+                continue
+            if add_polygon(getattr(element, "polygon", None), f"element:{element.source_file}:{element.guid}"):
+                element_count += 1
+
+        return polygons, {"wall_count": wall_count, "element_count": element_count}
+
+    def _space_inference_wall_polygons(self) -> List[Polygon]:
+        polygons, _ = self._space_inference_barrier_polygons()
+        return polygons
+
+    def suggest_spaces_from_wall_boundaries(self):
+        """Preview and create RF/planning spaces from wall-enclosed floor areas."""
+        if not self.floor:
+            QMessageBox.information(
+                self,
+                "No floor selected",
+                "Load an IFC model and select a floor before creating spaces from walls.",
+            )
+            return
+        if getattr(self, "wall_draw_mode", False):
+            self.cancel_user_wall_drawing()
+        if getattr(self, "boundary_draw_mode", False):
+            self.cancel_planner_boundary_drawing(show_status=False)
+
+        wall_polygons, barrier_counts = self._space_inference_barrier_polygons()
+        if not wall_polygons:
+            QMessageBox.information(
+                self,
+                "No wall geometry",
+                "The selected floor has no usable IFC/RF wall or blocking element geometry from which to create spaces.",
+            )
+            return
+
+        accepted_baselines = [
+            boundary.polygon for boundary in self.planner_boundaries
+            if boundary.polygon is not None and not boundary.polygon.is_empty
+        ]
+        existing_ifc_spaces = sum(1 for space in self.floor.spaces if not space.is_inferred and not space.is_user_created)
+        default_gap = estimate_space_gap_tolerance(wall_polygons)
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Create spaces from wall boundaries")
+        dialog.setModal(True)
+        dialog.resize(660, 420)
+        layout = QVBoxLayout(dialog)
+
+        baseline_text = (
+            f"{len(accepted_baselines)} accepted shared planner boundary polygon(s) will be used as the external wall baseline."
+            if accepted_baselines else
+            "No shared planner boundary exists. The outermost-wall algorithm will suggest an external baseline and preview it in magenta."
+        )
+        explanation = QLabel(
+            "The green polygons are proposed simulator spaces. Small wall gaps and ordinary door openings are bridged before the free floor area is split. "
+            "Imported curtain walls, stairs, railings, structural members, plates and roofs are also used as barriers where they appear on this floor; floor slabs, ceiling elements and generic model/proxy elements are ignored. "
+            "Where facade walls are absent, the external planner boundary is treated as a virtual outside wall. "
+            "The source IFC is never modified.\n\n" + baseline_text
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+
+        form_widget = QWidget(dialog)
+        form = QFormLayout(form_widget)
+        form.setContentsMargins(0, 4, 0, 4)
+        gap_spin = QDoubleSpinBox(form_widget)
+        gap_spin.setRange(0.05, 5.0)
+        gap_spin.setDecimals(2)
+        gap_spin.setSingleStep(0.10)
+        gap_spin.setValue(float(default_gap))
+        gap_spin.setSuffix(" m")
+        gap_spin.setToolTip(
+            "Maximum doorway or modelling gap bridged when forming closed room cells. Reduce this if adjacent rooms merge; increase it if doorway gaps leave rooms connected."
+        )
+        form.addRow("Wall/door gap bridge", gap_spin)
+        minimum_area_spin = QDoubleSpinBox(form_widget)
+        minimum_area_spin.setRange(0.05, 1000.0)
+        minimum_area_spin.setDecimals(2)
+        minimum_area_spin.setSingleStep(0.5)
+        minimum_area_spin.setValue(2.0)
+        minimum_area_spin.setSuffix(" m²")
+        minimum_area_spin.setToolTip("Enclosed fragments smaller than this area are ignored as wall pockets or modelling artefacts.")
+        form.addRow("Minimum space area", minimum_area_spin)
+        layout.addWidget(form_widget)
+
+        replace_inferred = QCheckBox("Replace existing inferred spaces on this floor when accepted")
+        replace_inferred.setChecked(True)
+        layout.addWidget(replace_inferred)
+        create_baseline = QCheckBox("Create the suggested external baseline as shared planner boundaries")
+        create_baseline.setChecked(not bool(accepted_baselines))
+        create_baseline.setEnabled(not bool(accepted_baselines))
+        create_baseline.setToolTip(
+            "Stores the inferred exterior chain as the same shared boundary used by AP planning on every IFC floor."
+        )
+        layout.addWidget(create_baseline)
+        create_external_walls = QCheckBox("Create missing external RF walls along the baseline")
+        create_external_walls.setChecked(True)
+        create_external_walls.setToolTip(
+            "Adds RF-only wall geometry only where the accepted or suggested exterior baseline is not already covered by an IFC/RF wall. Existing facade walls are not duplicated."
+        )
+        layout.addWidget(create_external_walls)
+        replace_external_walls = QCheckBox("Replace external RF walls previously inferred by this tool")
+        replace_external_walls.setChecked(True)
+        replace_external_walls.setToolTip(
+            "Removes only facade segments previously generated from a space-inference baseline before rebuilding them. Manually drawn RF walls are retained."
+        )
+        layout.addWidget(replace_external_walls)
+
+        summary = QLabel()
+        summary.setWordWrap(True)
+        summary.setFrameShape(QFrame.StyledPanel)
+        summary.setMinimumHeight(90)
+        layout.addWidget(summary)
+
+        controls = QHBoxLayout()
+        update_button = QPushButton("Update preview")
+        update_button.setIcon(self._standard_icon("SP_BrowserReload"))
+        controls.addWidget(update_button)
+        controls.addStretch(1)
+        accept_button = QPushButton("Accept spaces")
+        accept_button.setIcon(self._standard_icon("SP_DialogApplyButton"))
+        cancel_button = QPushButton("Cancel")
+        cancel_button.setIcon(self._standard_icon("SP_DialogCancelButton"))
+        controls.addWidget(accept_button)
+        controls.addWidget(cancel_button)
+        layout.addLayout(controls)
+
+        current_spaces: List[Polygon] = []
+        current_external_wall_parts: List[Polygon] = []
+        current_metadata: Dict[str, object] = {}
+
+        def update_preview():
+            nonlocal current_spaces, current_external_wall_parts, current_metadata
+            self.statusBar().showMessage("Creating candidate spaces from wall boundaries...")
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                current_spaces, current_metadata = infer_space_polygons(
+                    wall_polygons,
+                    external_boundary_polygons=accepted_baselines or None,
+                    gap_tolerance_m=float(gap_spin.value()),
+                    minimum_area_m2=float(minimum_area_spin.value()),
+                )
+            finally:
+                QApplication.restoreOverrideCursor()
+
+            inferred_baselines = list(current_metadata.get("external_boundaries", []) or [])
+            used_suggested = bool(current_metadata.get("used_suggested_external_boundary", False))
+            if used_suggested:
+                self._show_suggested_boundary_preview(inferred_baselines)
+            else:
+                self._clear_suggested_boundary_preview()
+            active_preview_baselines = accepted_baselines or inferred_baselines
+            current_external_wall_parts = (
+                missing_external_wall_polygons(
+                    wall_polygons,
+                    active_preview_baselines,
+                    wall_thickness_m=0.20,
+                    existing_wall_tolerance_m=max(0.25, float(gap_spin.value()) * 0.35),
+                )
+                if create_external_walls.isChecked() and active_preview_baselines else []
+            )
+            self._show_suggested_space_preview(current_spaces, current_external_wall_parts)
+
+            warnings = list(current_metadata.get("warnings", []) or [])
+            if current_spaces:
+                area = float(current_metadata.get("total_area_m2", 0.0) or 0.0)
+                message = (
+                    f"Preview: {len(current_spaces)} proposed space{'s' if len(current_spaces) != 1 else ''}, "
+                    f"covering {area:,.1f} m² on '{self.floor.name}'."
+                )
+                if barrier_counts.get("element_count", 0):
+                    wall_count = barrier_counts.get("wall_count", 0)
+                    element_count = barrier_counts.get("element_count", 0)
+                    message += (
+                        f" Inference used {wall_count} wall/RF barrier"
+                        f"{'s' if wall_count != 1 else ''} and {element_count} imported IFC element barrier"
+                        f"{'s' if element_count != 1 else ''}."
+                    )
+                if existing_ifc_spaces:
+                    message += f" The floor already contains {existing_ifc_spaces} IFC space(s); these will be retained."
+                if used_suggested:
+                    message += " The magenta external baseline was inferred using the same outer-wall chain method as planner boundary creation."
+                if current_external_wall_parts:
+                    message += (
+                        f" {len(current_external_wall_parts)} uncovered facade segment"
+                        f"{'s are' if len(current_external_wall_parts) != 1 else ' is'} shown in orange and will be added as RF-only external walls."
+                    )
+                if warnings:
+                    message += "\n\nReview: " + " ".join(str(value) for value in warnings)
+                summary.setText(message)
+                accept_button.setEnabled(True)
+                self.statusBar().showMessage("Space proposal previewed in green. Review the assumptions before accepting.")
+            else:
+                message = "No usable room spaces were formed with the current assumptions."
+                if warnings:
+                    message += "\n\n" + " ".join(str(value) for value in warnings)
+                summary.setText(message)
+                accept_button.setEnabled(False)
+                self.statusBar().showMessage("No spaces were formed; adjust the gap bridge, minimum area, or external boundary.")
+
+        update_button.clicked.connect(update_preview)
+        create_external_walls.toggled.connect(lambda *_: update_preview())
+        accept_button.clicked.connect(dialog.accept)
+        cancel_button.clicked.connect(dialog.reject)
+        update_preview()
+        result = dialog.exec()
+        self._clear_suggested_space_preview()
+        self._clear_suggested_boundary_preview()
+
+        if result != QDialog.Accepted or not current_spaces:
+            self.statusBar().showMessage("Space creation cancelled")
+            return
+
+        used_suggested = bool(current_metadata.get("used_suggested_external_boundary", False))
+        inferred_baselines = list(current_metadata.get("external_boundaries", []) or [])
+        if used_suggested and create_baseline.isChecked():
+            for offset, polygon in enumerate(inferred_baselines):
+                suffix = f" {offset + 1}" if len(inferred_baselines) > 1 else ""
+                self.planner_boundaries.append(PlannerBoundary2D(
+                    guid=f"planner-boundary-{uuid.uuid4().hex}",
+                    name=f"Space inference external boundary{suffix}",
+                    polygon=polygon,
+                    shape_type="polygon",
+                ))
+
+        active_baselines = accepted_baselines or inferred_baselines
+        removed_external_walls = 0
+        if replace_external_walls.isChecked():
+            retained_walls = []
+            for wall in self.floor.walls:
+                if str(getattr(wall, "source_file", "")) == "RF simulator external baseline":
+                    removed_external_walls += 1
+                else:
+                    retained_walls.append(wall)
+            self.floor.walls = retained_walls
+
+        created_external_walls = 0
+        if create_external_walls.isChecked() and active_baselines:
+            for polygon in current_external_wall_parts:
+                wall = Wall2D(
+                    guid=f"user-rf-wall-{uuid.uuid4().hex}",
+                    name="Inferred missing external RF wall",
+                    floor=self.floor.name,
+                    source_file="RF simulator external baseline",
+                    type_name="external wall",
+                    material="masonry external wall",
+                    polygon=polygon,
+                    z_min=float(self.floor.elevation),
+                    z_max=float(self.floor.elevation + 3.0),
+                    source_storey=self.floor.name,
+                    rf_type_override="external wall",
+                    rf_customised=True,
+                    is_user_created=True,
+                    user_wall_thickness_m=0.20,
+                )
+                wall.attenuation_by_band_db = self._profile_for_wall_from_settings(wall)
+                self.floor.walls.append(wall)
+                created_external_walls += 1
+
+        if replace_inferred.isChecked():
+            self.floor.spaces = [space for space in self.floor.spaces if not space.is_inferred]
+
+        starting_index = 1 + sum(1 for space in self.floor.spaces if space.is_inferred)
+        assumption_note = (
+            f"Generated from wall boundaries using a {float(gap_spin.value()):.2f} m gap bridge and "
+            + (
+                "an inferred outer-wall baseline."
+                if used_suggested else
+                "the accepted shared planner boundary as the external wall."
+            )
+        )
+        if barrier_counts.get("element_count", 0):
+            element_count = barrier_counts.get("element_count", 0)
+            assumption_note += (
+                f" Included {element_count} imported IFC element barrier"
+                f"{'s' if element_count != 1 else ''}."
+            )
+        for offset, polygon in enumerate(current_spaces):
+            self.floor.spaces.append(Space2D(
+                guid=f"inferred-space-{uuid.uuid4().hex}",
+                name=f"Inferred Space {starting_index + offset}",
+                floor=self.floor.name,
+                source_file="RF simulator inferred space",
+                polygon=polygon,
+                z_min=float(self.floor.elevation),
+                z_max=float(self.floor.elevation + 3.0),
+                source_storey=self.floor.name,
+                is_inferred=True,
+                assumption_note=assumption_note,
+            ))
+
+        self.last_result = None
+        self.draw_floor()
+        created = len(current_spaces)
+        wall_message = (
+            f" Added {created_external_walls} missing external RF wall segment{'s' if created_external_walls != 1 else ''} along the baseline."
+            if created_external_walls else ""
+        )
+        if removed_external_walls and not created_external_walls:
+            wall_message += f" Removed {removed_external_walls} previously inferred external RF wall segment{'s' if removed_external_walls != 1 else ''}."
+        self.statusBar().showMessage(
+            f"Created {created} inferred space{'s' if created != 1 else ''} on '{self.floor.name}'."
+            + wall_message
+            + " The source IFC was not changed."
+        )
+
+    def delete_inferred_space(self, space: Space2D):
+        floor = self.floors.get(space.floor)
+        if floor is None or not space.is_inferred:
+            return
+        floor.spaces = [candidate for candidate in floor.spaces if candidate is not space]
+        self.last_result = None
+        self.draw_floor()
+        self.statusBar().showMessage(f"Deleted inferred space '{space.name}'")
+
+    def inferred_spaces_at_scene_pos(self, scene_pos: QPointF) -> List[Space2D]:
+        if not self.floor:
+            return []
+        point = Point(float(scene_pos.x()), float(scene_pos.y()))
+        matches: List[Space2D] = []
+        for space in self.floor.spaces:
+            if not getattr(space, "is_inferred", False):
+                continue
+            polygon = getattr(space, "polygon", None)
+            if polygon is None or polygon.is_empty:
+                continue
+            try:
+                if polygon.covers(point):
+                    matches.append(space)
+            except Exception:
+                continue
+        return matches
+
+    def clear_inferred_spaces(self):
+        if not self.floor:
+            self.statusBar().showMessage("No floor selected")
+            return
+        count = sum(1 for space in self.floor.spaces if space.is_inferred)
+        if count == 0:
+            self.statusBar().showMessage("No inferred spaces exist on the selected floor")
+            return
+        answer = QMessageBox.question(
+            self,
+            "Clear inferred spaces",
+            f"Delete {count} inferred space{'s' if count != 1 else ''} from '{self.floor.name}'? IFC spaces will be retained.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self.floor.spaces = [space for space in self.floor.spaces if not space.is_inferred]
+        self.last_result = None
+        self.draw_floor()
+        self.statusBar().showMessage(f"Cleared {count} inferred space{'s' if count != 1 else ''}")
+
     def delete_planner_boundary(self, boundary: PlannerBoundary2D):
         self.planner_boundaries = [
             candidate for candidate in self.planner_boundaries if candidate is not boundary
@@ -3650,8 +5187,19 @@ class MainWindow(QMainWindow):
         self.draw_floor()
         self.statusBar().showMessage("Cleared all shared planner boundaries")
 
-    def nearest_ifc_connection_point(self, scene_pos: QPointF) -> Tuple[QPointF, bool]:
-        """Snap to a vertex or nearest boundary point on existing IFC/user geometry."""
+    def nearest_ifc_connection_point(
+        self,
+        scene_pos: QPointF,
+        straight_from: Optional[QPointF] = None,
+    ) -> Tuple[QPointF, bool]:
+        """Snap to existing IFC/user geometry, optionally on a straight axis.
+
+        When ``straight_from`` is supplied (the Shift-key drawing mode), only
+        intersections on the dominant horizontal or vertical axis through the
+        first point are accepted. This keeps the new wall exactly straight
+        while retaining the requirement that its second endpoint connects to
+        existing IFC, inferred-space or manually drawn RF geometry.
+        """
         if not self.floor:
             return scene_pos, False
         try:
@@ -3660,11 +5208,72 @@ class MainWindow(QMainWindow):
             snap_radius = max(0.02, abs(p1.x() - p0.x()))
         except Exception:
             snap_radius = 0.75
+
         sx, sy = float(scene_pos.x()), float(scene_pos.y())
         source = Point(sx, sy)
+        objects = list(self.floor.walls) + list(self.floor.spaces)
+
+        if straight_from is not None:
+            constrained = self.axis_constrained_point(straight_from, scene_pos)
+            horizontal = abs(sx - float(straight_from.x())) >= abs(sy - float(straight_from.y()))
+            bounds = [obj.polygon.bounds for obj in objects if getattr(obj, "polygon", None) is not None and not obj.polygon.is_empty]
+            if bounds:
+                minx = min(float(item[0]) for item in bounds)
+                miny = min(float(item[1]) for item in bounds)
+                maxx = max(float(item[2]) for item in bounds)
+                maxy = max(float(item[3]) for item in bounds)
+            else:
+                minx = min(float(straight_from.x()), sx) - 10.0
+                miny = min(float(straight_from.y()), sy) - 10.0
+                maxx = max(float(straight_from.x()), sx) + 10.0
+                maxy = max(float(straight_from.y()), sy) + 10.0
+            span = max(maxx - minx, maxy - miny, 10.0)
+            margin = max(10.0, span * 0.25)
+            if horizontal:
+                axis_line = LineString([
+                    (minx - margin, float(straight_from.y())),
+                    (maxx + margin, float(straight_from.y())),
+                ])
+            else:
+                axis_line = LineString([
+                    (float(straight_from.x()), miny - margin),
+                    (float(straight_from.x()), maxy + margin),
+                ])
+
+            best = constrained
+            best_distance = snap_radius
+
+            def consider_geometry(geometry):
+                nonlocal best, best_distance
+                if geometry is None or geometry.is_empty:
+                    return
+                geometry_type = str(getattr(geometry, "geom_type", ""))
+                if geometry_type == "Point":
+                    candidates = [geometry]
+                elif geometry_type in {"LineString", "LinearRing"}:
+                    candidates = [geometry.interpolate(geometry.project(source))]
+                elif hasattr(geometry, "geoms"):
+                    for part in geometry.geoms:
+                        consider_geometry(part)
+                    return
+                else:
+                    candidates = []
+                for candidate in candidates:
+                    distance = float(candidate.distance(source))
+                    if distance <= best_distance:
+                        best = QPointF(float(candidate.x), float(candidate.y))
+                        best_distance = distance
+
+            for obj in objects:
+                try:
+                    consider_geometry(obj.polygon.boundary.intersection(axis_line))
+                except Exception:
+                    continue
+            return best, best_distance <= snap_radius
+
         best = QPointF(sx, sy)
         best_distance = snap_radius
-        for obj in list(self.floor.walls) + list(self.floor.spaces):
+        for obj in objects:
             try:
                 boundary = obj.polygon.exterior
                 projected = boundary.interpolate(boundary.project(source))
@@ -3696,17 +5305,21 @@ class MainWindow(QMainWindow):
         marker.setZValue(Z_AP_LABEL + 21)
         self._wall_preview_items = [line, marker]
 
-    def capture_user_wall_point(self, scene_pos: QPointF):
+    def capture_user_wall_point(self, scene_pos: QPointF, shift_constrain: bool = False):
         if not self.floor:
             return
-        snap, snapped = self.nearest_ifc_connection_point(scene_pos)
+        straight_from = self._wall_draw_start if shift_constrain and self._wall_draw_start is not None else None
+        snap, snapped = self.nearest_ifc_connection_point(scene_pos, straight_from=straight_from)
         if not snapped:
-            self.statusBar().showMessage("RF wall endpoints must connect to an existing IFC wall or space boundary. Click closer to an edge.")
+            if straight_from is not None:
+                self.statusBar().showMessage("No existing wall or space boundary intersects the Shift-constrained horizontal/vertical line near the cursor.")
+            else:
+                self.statusBar().showMessage("RF wall endpoints must connect to an existing IFC wall or space boundary. Click closer to an edge.")
             return
         if self._wall_draw_start is None:
             self._wall_draw_start = snap
             self.show_user_wall_preview(snap)
-            self.statusBar().showMessage("First wall endpoint captured. Click another existing IFC element/edge for the second endpoint.")
+            self.statusBar().showMessage("First wall endpoint captured. Click another existing IFC element/edge; hold Shift to constrain the wall horizontal or vertical.")
             return
         start = self._wall_draw_start
         if math.hypot(start.x() - snap.x(), start.y() - snap.y()) < 0.05:
@@ -3918,6 +5531,255 @@ class MainWindow(QMainWindow):
         self.last_result = None
         self.populate_wall_table(); self.draw_floor()
 
+    @staticmethod
+    def _ifc_exclusion_record(kind: str, source_file: str, guid: str, floor: str = "") -> Dict[str, str]:
+        return {
+            "kind": str(kind),
+            "source_file": str(source_file),
+            "guid": str(guid),
+            "floor": str(floor or ""),
+        }
+
+    def _remember_ifc_exclusion(self, kind: str, source_file: str, guid: str, floor: str = ""):
+        record = self._ifc_exclusion_record(kind, source_file, guid, floor)
+        key = (record["kind"], record["source_file"], record["guid"], record["floor"])
+        existing = {
+            (
+                str(item.get("kind", "")),
+                str(item.get("source_file", "")),
+                str(item.get("guid", "")),
+                str(item.get("floor", "")),
+            )
+            for item in getattr(self, "excluded_ifc_elements", [])
+            if isinstance(item, dict)
+        }
+        if key not in existing:
+            self.excluded_ifc_elements.append(record)
+
+    @staticmethod
+    def _matches_ifc_exclusion(candidate, record: Dict[str, str], kind: str) -> bool:
+        if str(record.get("kind", "")) != kind:
+            return False
+        if str(getattr(candidate, "guid", "")) != str(record.get("guid", "")):
+            return False
+        if str(getattr(candidate, "source_file", "")) != str(record.get("source_file", "")):
+            return False
+        floor = str(record.get("floor", ""))
+        return not floor or str(getattr(candidate, "floor", "")) == floor
+
+    def _apply_ifc_exclusions(self):
+        records = [item for item in getattr(self, "excluded_ifc_elements", []) if isinstance(item, dict)]
+        if not records:
+            return
+        for floor in self.floors.values():
+            floor.walls = [
+                wall for wall in floor.walls
+                if not any(self._matches_ifc_exclusion(wall, record, "wall") for record in records)
+            ]
+            floor.spaces = [
+                space for space in floor.spaces
+                if not any(self._matches_ifc_exclusion(space, record, "space") for record in records)
+            ]
+            floor.elements = [
+                element for element in getattr(floor, "elements", [])
+                if not any(self._matches_ifc_exclusion(element, record, "element") for record in records)
+            ]
+
+    def delete_imported_wall(self, wall: Wall2D):
+        if wall.is_user_created:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Remove imported IFC wall",
+            f"Remove imported IFC wall '{wall.name or wall.guid}' from this RF model? The source IFC file will not be changed.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self._remember_ifc_exclusion("wall", wall.source_file, wall.guid)
+        removed = 0
+        for floor in self.floors.values():
+            before = len(floor.walls)
+            floor.walls = [
+                candidate for candidate in floor.walls
+                if not (
+                    candidate.guid == wall.guid
+                    and candidate.source_file == wall.source_file
+                    and not candidate.is_user_created
+                )
+            ]
+            removed += before - len(floor.walls)
+        self.last_result = None
+        self.populate_wall_table()
+        self.draw_floor()
+        self.statusBar().showMessage(f"Removed {removed} imported IFC wall instance{'s' if removed != 1 else ''} from the RF model")
+
+    def delete_user_space(self, space: Space2D):
+        if not space.is_user_created:
+            return
+        floor = self.floors.get(space.floor)
+        if floor is not None:
+            floor.spaces = [candidate for candidate in floor.spaces if candidate is not space]
+        self.last_result = None
+        self.draw_floor()
+        self.statusBar().showMessage(f"Deleted user-created space '{space.name}'")
+
+    def delete_imported_space(self, space: Space2D):
+        if space.is_user_created or space.is_inferred:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Remove imported IFC space",
+            f"Remove imported IFC space '{space.name or space.guid}' from this RF model? The source IFC file will not be changed.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self._remember_ifc_exclusion("space", space.source_file, space.guid)
+        removed = 0
+        for floor in self.floors.values():
+            before = len(floor.spaces)
+            floor.spaces = [
+                candidate for candidate in floor.spaces
+                if not (
+                    candidate.guid == space.guid
+                    and candidate.source_file == space.source_file
+                    and not candidate.is_user_created
+                    and not candidate.is_inferred
+                )
+            ]
+            removed += before - len(floor.spaces)
+        self.last_result = None
+        self.draw_floor()
+        self.statusBar().showMessage(f"Removed {removed} imported IFC space instance{'s' if removed != 1 else ''} from the RF model")
+
+    def delete_imported_element(self, element: IFCElement2D):
+        answer = QMessageBox.question(
+            self,
+            "Remove imported IFC element",
+            f"Remove imported IFC element '{element.name or element.guid}' from this RF model? The source IFC file will not be changed.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self._remember_ifc_exclusion("element", element.source_file, element.guid)
+        removed = 0
+        for floor in self.floors.values():
+            before = len(getattr(floor, "elements", []))
+            floor.elements = [
+                candidate for candidate in getattr(floor, "elements", [])
+                if not (
+                    candidate.guid == element.guid
+                    and candidate.source_file == element.source_file
+                )
+            ]
+            removed += before - len(floor.elements)
+        self.last_result = None
+        self.draw_floor()
+        self.statusBar().showMessage(f"Removed {removed} imported IFC element instance{'s' if removed != 1 else ''} from the RF model")
+
+    def _space_ref(self, space: Space2D) -> Tuple[str, str, str]:
+        return (str(space.source_file), str(space.guid), str(space.floor))
+
+    def _selected_ap_planning_spaces(self) -> List[Space2D]:
+        if not self.floor:
+            return []
+        return [
+            space for space in self.floor.spaces
+            if space.ap_planning_selected and space.polygon is not None and not space.polygon.is_empty
+        ]
+
+    def toggle_space_ap_planning_selection(self, space: Space2D):
+        floor = self.floors.get(space.floor)
+        if floor is None:
+            return
+        target_ref = self._space_ref(space)
+        selected = not bool(space.ap_planning_selected)
+        for candidate in floor.spaces:
+            if self._space_ref(candidate) == target_ref:
+                candidate.ap_planning_selected = selected
+        self.last_result = None
+        self.draw_floor()
+        count = len(self._selected_ap_planning_spaces())
+        if selected:
+            self.statusBar().showMessage(
+                f"Selected '{space.name}' for AP placement. Prediction will use {count} selected space{'s' if count != 1 else ''}."
+            )
+        else:
+            self.statusBar().showMessage(
+                f"Removed '{space.name}' from AP placement spaces. {count} selected space{'s' if count != 1 else ''} remain."
+            )
+
+    def show_ap_space_selection_dialog(self):
+        if not self.floor:
+            QMessageBox.information(self, "No floor selected", "Load an IFC and select a floor before choosing AP placement spaces.")
+            return
+        spaces = [
+            space for space in self.floor.spaces
+            if space.polygon is not None and not space.polygon.is_empty
+        ]
+        if not spaces:
+            QMessageBox.information(
+                self,
+                "No spaces available",
+                "The selected floor has no IFC, inferred, or manually drawn spaces to choose from.",
+            )
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Choose AP placement spaces")
+        dialog.setModal(True)
+        dialog.resize(520, 420)
+        layout = QVBoxLayout(dialog)
+        intro = QLabel(
+            "Checked spaces are used as the AP prediction area on the selected floor. "
+            "If none are checked, the planner uses the normal planning-area settings."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        scroll = QScrollArea(dialog)
+        scroll.setWidgetResizable(True)
+        box_widget = QWidget(scroll)
+        box_layout = QVBoxLayout(box_widget)
+        checks: List[Tuple[Space2D, QCheckBox]] = []
+        for space in spaces:
+            kind = "inferred" if space.is_inferred else ("user" if space.is_user_created else "IFC")
+            check = QCheckBox(f"{space.name or space.guid[:8]} [{kind}] - {float(space.polygon.area):,.1f} m2")
+            check.setChecked(bool(space.ap_planning_selected))
+            box_layout.addWidget(check)
+            checks.append((space, check))
+        box_layout.addStretch(1)
+        scroll.setWidget(box_widget)
+        layout.addWidget(scroll, 1)
+
+        controls = QHBoxLayout()
+        select_all = QPushButton("Select all")
+        clear_all = QPushButton("Clear")
+        controls.addWidget(select_all)
+        controls.addWidget(clear_all)
+        controls.addStretch(1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        controls.addWidget(buttons)
+        layout.addLayout(controls)
+        select_all.clicked.connect(lambda: [check.setChecked(True) for _, check in checks])
+        clear_all.clicked.connect(lambda: [check.setChecked(False) for _, check in checks])
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+        for space, check in checks:
+            space.ap_planning_selected = bool(check.isChecked())
+        self.last_result = None
+        self.draw_floor()
+        count = len(self._selected_ap_planning_spaces())
+        self.statusBar().showMessage(
+            f"Configured {count} AP placement space{'s' if count != 1 else ''} for '{self.floor.name}'."
+        )
+
     # ----------------------------- Predictive AP planning -----------------------------
 
     def show_auto_planner_settings(self):
@@ -3961,6 +5823,10 @@ class MainWindow(QMainWindow):
         boundary_area = self._planner_boundary_area()
         boundary_count = len(self.planner_boundaries)
         boundary_description = f"{boundary_count} shared planner {'boundary' if boundary_count == 1 else 'boundaries'}"
+        selected_spaces = [
+            space.polygon for space in self._selected_ap_planning_spaces()
+            if space.polygon is not None and not space.polygon.is_empty
+        ]
         spaces = [
             space.polygon for space in self.floor.spaces
             if space.polygon is not None and not space.polygon.is_empty
@@ -3984,6 +5850,20 @@ class MainWindow(QMainWindow):
                 source_label += f", clipped by {boundary_description}"
             self._planner_area_source_label = source_label
             return area
+
+        if selected_spaces:
+            try:
+                selected_area = unary_union(selected_spaces)
+                if not selected_area.is_valid:
+                    selected_area = selected_area.buffer(0)
+                if not selected_area.is_empty:
+                    return constrained(
+                        selected_area,
+                        f"{len(selected_spaces)} selected AP placement space{'s' if len(selected_spaces) != 1 else ''}",
+                    )
+            except Exception:
+                self._planner_area_source_label = "selected AP placement spaces could not be combined"
+                return None
 
         if mode == "boundaries":
             if boundary_area is None:
@@ -4422,7 +6302,7 @@ class MainWindow(QMainWindow):
             indices = np.linspace(0, len(candidate_specs) - 1, candidate_spec_limit, dtype=int)
             candidate_specs = [candidate_specs[int(i)] for i in indices]
 
-        progress = QProgressDialog("Evaluating RSSI-driven AP locations…", "Cancel", 0, len(candidate_specs) + settings.maximum_aps, self)
+        progress = QProgressDialog("Building RSSI-driven AP coverage...", "Cancel", 0, max(1, settings.maximum_aps), self)
         progress.setWindowTitle("Predictive AP planner")
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
@@ -4440,33 +6320,36 @@ class MainWindow(QMainWindow):
             strongest_by_radio = [pair[0] for pair in updated]
             second_by_radio = [pair[1] for pair in updated]
 
-        candidate_records: List[Tuple[AccessPoint, List[np.ndarray]]] = []
         try:
-            for idx, (x, y, azimuth) in enumerate(candidate_specs):
-                if progress.wasCanceled():
-                    raise RuntimeError("Predictive AP planning cancelled")
+            def make_candidate_ap(x: float, y: float, azimuth: float) -> AccessPoint:
                 radios = [APRadio(
                     name=req.name, frequency_mhz=req.frequency_mhz, tx_power_dbm=req.tx_power_dbm,
                     antenna_pattern=req.antenna_pattern, enabled=True, cutoff_radius_m=req.cutoff_radius_m,
                     antenna_gain_dbi=req.antenna_gain_dbi, channel="", channel_width_mhz=req.channel_width_mhz,
                     spectrum_occupancy_percent=req.spectrum_occupancy_percent,
                 ) for req in requirements]
-                temp_ap = AccessPoint(
+                return AccessPoint(
                     name="candidate", x=x, y=y, floor=self.floor.name, radios=radios,
                     path_loss_exponent=float(self.ple.value()), azimuth_deg=azimuth,
                     mount_height_m=float(self.mount_height.value()), rx_height_m=float(self.rx_height.value()),
                     max_clients=settings.clients_per_ap, planned=True,
                 )
-                # float16 keeps the RSSI candidate cache practical on large
-                # plans while retaining far more precision than RF assumptions.
-                rssi_values = [
-                    values.astype(np.float16)
-                    for values in self._planner_ap_rssi_values(temp_ap, requirements, samples, wall_tree, walls)
+
+            candidate_cache: Dict[int, Tuple[AccessPoint, List[np.ndarray]]] = {}
+
+            def candidate_record(index: int) -> Tuple[AccessPoint, List[np.ndarray]]:
+                cached = candidate_cache.get(index)
+                if cached is not None:
+                    return cached
+                x, y, azimuth = candidate_specs[index]
+                temp_ap = make_candidate_ap(float(x), float(y), float(azimuth))
+                values = [
+                    candidate_values.astype(np.float16)
+                    for candidate_values in self._planner_ap_rssi_values(temp_ap, requirements, samples, wall_tree, walls)
                 ]
-                candidate_records.append((temp_ap, rssi_values))
-                progress.setValue(idx + 1)
-                if idx % 5 == 0:
-                    QApplication.processEvents()
+                cached = (temp_ap, values)
+                candidate_cache[index] = cached
+                return cached
 
             coverage_by_radio, secondary_by_radio, overall, handover_overall = self._planner_top_rssi_masks(
                 strongest_by_radio, second_by_radio, requirements, settings, len(samples)
@@ -4484,11 +6367,146 @@ class MainWindow(QMainWindow):
             capacity_ap_count = int(math.ceil(settings.expected_clients / effective_clients)) if settings.expected_clients > 0 else 0
             selected: List[Tuple[AccessPoint, List[np.ndarray]]] = []
             positions = [(ap.x, ap.y) for ap in existing]
-            remaining = list(range(len(candidate_records)))
+            remaining = set(range(len(candidate_specs)))
+            sample_points = np.asarray(samples, dtype=np.float32)
+
+            def coverage_fraction_now() -> float:
+                return float(np.count_nonzero(overall)) / max(1, len(overall))
+
+            def handover_fraction_now() -> float:
+                return float(np.count_nonzero(handover_overall)) / max(1, len(handover_overall))
+
+            def candidate_spacing_ok(candidate_ap: AccessPoint) -> Tuple[bool, float]:
+                if not positions:
+                    return True, float(settings.minimum_ap_spacing_m)
+                min_distance = min(
+                    math.hypot(candidate_ap.x - px, candidate_ap.y - py)
+                    for px, py in positions
+                )
+                return min_distance + 1e-9 >= settings.minimum_ap_spacing_m, min_distance
+
+            def nearest_position_distance(points: np.ndarray) -> np.ndarray:
+                if points.size == 0:
+                    return np.zeros(0, dtype=np.float32)
+                if not positions:
+                    return np.full(len(points), float("inf"), dtype=np.float32)
+                distances = np.full(len(points), np.inf, dtype=np.float32)
+                for px, py in positions:
+                    dx = points[:, 0] - float(px)
+                    dy = points[:, 1] - float(py)
+                    distances = np.minimum(distances, np.sqrt(dx * dx + dy * dy))
+                return distances
+
+            def focus_sample_indices(coverage_needed: bool, handover_needed: bool, capacity_needed: bool) -> List[int]:
+                if coverage_needed:
+                    metric = np.asarray(coverage_deficit, dtype=np.float32)
+                elif handover_needed:
+                    metric = np.asarray(handover_deficit, dtype=np.float32)
+                elif capacity_needed:
+                    metric = nearest_position_distance(sample_points)
+                else:
+                    metric = np.zeros(len(samples), dtype=np.float32)
+                positive = np.flatnonzero(metric > 1e-6)
+                if positive.size == 0:
+                    positive = np.arange(len(samples))
+                order = positive[np.argsort(metric[positive])[::-1]]
+                focus = [int(i) for i in order[:12]]
+                if positions and len(focus) < 18:
+                    uncovered = np.flatnonzero(~overall) if coverage_needed else np.arange(len(samples))
+                    if uncovered.size:
+                        distances = nearest_position_distance(sample_points[uncovered])
+                        far_order = uncovered[np.argsort(distances)[::-1]]
+                        for idx in far_order[:12]:
+                            value = int(idx)
+                            if value not in focus:
+                                focus.append(value)
+                return focus[:18]
+
+            def nearby_candidate_indices(focus_indices: List[int], limit: int = 600) -> List[int]:
+                if not remaining:
+                    return []
+                if not focus_indices:
+                    return list(remaining)[:limit]
+                focus = sample_points[focus_indices]
+                scored: List[Tuple[float, int]] = []
+                for index in remaining:
+                    x, y, _ = candidate_specs[index]
+                    dx = focus[:, 0] - float(x)
+                    dy = focus[:, 1] - float(y)
+                    distance = float(np.min(np.sqrt(dx * dx + dy * dy)))
+                    scored.append((distance, index))
+                scored.sort(key=lambda item: item[0])
+                return [index for _, index in scored[:limit]]
+
+            def insert_candidate_state(candidate_rssi: List[np.ndarray]):
+                inserted = [
+                    self._planner_insert_rssi(strongest, second, values)
+                    for strongest, second, values in zip(strongest_by_radio, second_by_radio, candidate_rssi)
+                ]
+                proposed_strongest = [pair[0] for pair in inserted]
+                proposed_second = [pair[1] for pair in inserted]
+                proposed_coverage_by_radio, proposed_secondary_by_radio, proposed_overall, proposed_handover = self._planner_top_rssi_masks(
+                    proposed_strongest, proposed_second, requirements, settings, len(samples)
+                )
+                proposed_coverage_deficit = self._planner_rssi_deficit(
+                    proposed_strongest, requirements, settings.coverage_mode
+                )
+                proposed_handover_deficit = self._planner_rssi_deficit(
+                    proposed_second, requirements, settings.coverage_mode, settings.handover_margin_db
+                )
+                return (
+                    proposed_strongest, proposed_second,
+                    proposed_coverage_by_radio, proposed_secondary_by_radio,
+                    proposed_overall, proposed_handover,
+                    proposed_coverage_deficit, proposed_handover_deficit,
+                )
+
+            def score_candidate(candidate_ap: AccessPoint, candidate_rssi: List[np.ndarray], min_distance: float, coverage_needed: bool, handover_needed: bool, capacity_needed: bool):
+                state = insert_candidate_state(candidate_rssi)
+                (
+                    proposed_strongest, _proposed_second,
+                    _proposed_coverage_by_radio, _proposed_secondary_by_radio,
+                    proposed_overall, proposed_handover,
+                    proposed_coverage_deficit, proposed_handover_deficit,
+                ) = state
+                coverage_db_gain = float(np.sum(coverage_deficit - proposed_coverage_deficit))
+                newly_covered = int(np.count_nonzero(proposed_overall & ~overall))
+                handover_db_gain = float(np.sum(handover_deficit - proposed_handover_deficit))
+                newly_handover = int(np.count_nonzero(proposed_handover & ~handover_overall))
+                if (coverage_needed or handover_needed) and coverage_db_gain <= 1e-6 and handover_db_gain <= 1e-6:
+                    return -float("inf"), state
+                score = 0.0
+                if coverage_needed:
+                    score += coverage_db_gain * 20.0 + newly_covered * 250.0
+                else:
+                    score += coverage_db_gain * 2.0
+                if handover_needed:
+                    score += handover_db_gain * 12.0 + newly_handover * 160.0
+                elif settings.handover_enabled:
+                    score += handover_db_gain * 1.0
+                if capacity_needed and not coverage_needed and not handover_needed:
+                    mean_margin = float(np.mean(np.maximum(0.0, proposed_strongest[0] - strongest_by_radio[0])))
+                    score += min_distance * 10.0 + mean_margin
+                else:
+                    score += min_distance * 0.01
+                return score, state
+
+            def apply_selected(index: int, candidate_ap: AccessPoint, candidate_rssi: List[np.ndarray], state):
+                nonlocal strongest_by_radio, second_by_radio, coverage_by_radio, secondary_by_radio
+                nonlocal overall, handover_overall, coverage_deficit, handover_deficit
+                selected.append((candidate_ap, candidate_rssi))
+                positions.append((candidate_ap.x, candidate_ap.y))
+                (
+                    strongest_by_radio, second_by_radio, coverage_by_radio, secondary_by_radio,
+                    overall, handover_overall, coverage_deficit, handover_deficit,
+                ) = state
+                remaining.discard(index)
 
             while remaining and len(selected) < settings.maximum_aps:
-                coverage_fraction = float(np.count_nonzero(overall)) / max(1, len(overall))
-                handover_fraction = float(np.count_nonzero(handover_overall)) / max(1, len(handover_overall))
+                if progress.wasCanceled():
+                    raise RuntimeError("Predictive AP planning cancelled")
+                coverage_fraction = coverage_fraction_now()
+                handover_fraction = handover_fraction_now()
                 total_capacity_aps = len(existing) + len(selected)
                 coverage_needed = coverage_fraction + 1e-12 < target_fraction
                 handover_needed = (
@@ -4499,84 +6517,60 @@ class MainWindow(QMainWindow):
                 if not coverage_needed and not handover_needed and not capacity_needed:
                     break
 
+                if not positions:
+                    try:
+                        start_point = area.representative_point()
+                        sx, sy = float(start_point.x), float(start_point.y)
+                    except Exception:
+                        sx = float(np.mean(sample_points[:, 0])); sy = float(np.mean(sample_points[:, 1]))
+                    seed_index = min(
+                        remaining,
+                        key=lambda index: math.hypot(float(candidate_specs[index][0]) - sx, float(candidate_specs[index][1]) - sy),
+                    )
+                    candidate_ap, candidate_rssi = candidate_record(seed_index)
+                    state = insert_candidate_state(candidate_rssi)
+                    apply_selected(seed_index, candidate_ap, candidate_rssi, state)
+                    progress.setLabelText("Placed the first AP and calculated RSSI extremities...")
+                    progress.setValue(len(selected))
+                    QApplication.processEvents()
+                    continue
+
                 best_index = None
                 best_score = -float("inf")
                 best_state = None
-                for record_index in remaining:
-                    candidate_ap, candidate_rssi = candidate_records[record_index]
-                    if positions:
-                        min_distance = min(
-                            math.hypot(candidate_ap.x - px, candidate_ap.y - py)
-                            for px, py in positions
+                best_record = None
+                focus_indices = focus_sample_indices(coverage_needed, handover_needed, capacity_needed)
+                shortlist = nearby_candidate_indices(focus_indices)
+                if not shortlist:
+                    shortlist = list(remaining)[:180]
+                for scan_index, record_index in enumerate(shortlist, start=1):
+                    if progress.wasCanceled():
+                        raise RuntimeError("Predictive AP planning cancelled")
+                    if scan_index == 1 or scan_index % 20 == 0 or scan_index == len(shortlist):
+                        progress.setLabelText(
+                            f"AP {len(selected) + 1}: checking {scan_index}/{len(shortlist)} locations near weakest RSSI samples..."
                         )
-                        if min_distance + 1e-9 < settings.minimum_ap_spacing_m:
-                            continue
-                    else:
-                        min_distance = settings.minimum_ap_spacing_m
-
-                    inserted = [
-                        self._planner_insert_rssi(strongest, second, values)
-                        for strongest, second, values in zip(strongest_by_radio, second_by_radio, candidate_rssi)
-                    ]
-                    proposed_strongest = [pair[0] for pair in inserted]
-                    proposed_second = [pair[1] for pair in inserted]
-                    proposed_coverage_by_radio, proposed_secondary_by_radio, proposed_overall, proposed_handover = self._planner_top_rssi_masks(
-                        proposed_strongest, proposed_second, requirements, settings, len(samples)
-                    )
-                    proposed_coverage_deficit = self._planner_rssi_deficit(
-                        proposed_strongest, requirements, settings.coverage_mode
-                    )
-                    coverage_db_gain = float(np.sum(coverage_deficit - proposed_coverage_deficit))
-                    newly_covered = int(np.count_nonzero(proposed_overall & ~overall))
-
-                    proposed_handover_deficit = self._planner_rssi_deficit(
-                        proposed_second, requirements, settings.coverage_mode, settings.handover_margin_db
-                    )
-                    handover_db_gain = float(np.sum(handover_deficit - proposed_handover_deficit))
-                    newly_handover = int(np.count_nonzero(proposed_handover & ~handover_overall))
-
-                    if (coverage_needed or handover_needed) and coverage_db_gain <= 1e-6 and handover_db_gain <= 1e-6:
+                        progress.setValue(len(selected))
+                        QApplication.processEvents()
+                    candidate_ap, candidate_rssi = candidate_record(record_index)
+                    spacing_ok, min_distance = candidate_spacing_ok(candidate_ap)
+                    if not spacing_ok:
                         continue
-
-                    # The dominant terms are measured dB-deficit reductions.
-                    # Threshold crossings reward completing usable service and
-                    # dual-AP handover cells, while distance is only a tie-break.
-                    score = 0.0
-                    if coverage_needed:
-                        score += coverage_db_gain * 20.0 + newly_covered * 250.0
-                    else:
-                        score += coverage_db_gain * 2.0
-                    if handover_needed:
-                        score += handover_db_gain * 12.0 + newly_handover * 160.0
-                    elif settings.handover_enabled:
-                        score += handover_db_gain * 1.0
-                    if capacity_needed and not coverage_needed and not handover_needed:
-                        mean_margin = float(np.mean(np.maximum(0.0, proposed_strongest[0] - strongest_by_radio[0])))
-                        score += min_distance * 10.0 + mean_margin
-                    else:
-                        score += min_distance * 0.01
-
+                    score, state = score_candidate(candidate_ap, candidate_rssi, min_distance, coverage_needed, handover_needed, capacity_needed)
                     if score > best_score:
                         best_score = score
                         best_index = record_index
-                        best_state = (
-                            proposed_strongest, proposed_second,
-                            proposed_coverage_by_radio, proposed_secondary_by_radio,
-                            proposed_overall, proposed_handover,
-                            proposed_coverage_deficit, proposed_handover_deficit,
-                        )
+                        best_state = state
+                        best_record = (candidate_ap, candidate_rssi)
 
-                if best_index is None or best_state is None:
+                if best_index is None or best_state is None or best_record is None:
                     break
-                candidate_ap, candidate_rssi = candidate_records[best_index]
-                selected.append((candidate_ap, candidate_rssi))
-                positions.append((candidate_ap.x, candidate_ap.y))
-                (
-                    strongest_by_radio, second_by_radio, coverage_by_radio, secondary_by_radio,
-                    overall, handover_overall, coverage_deficit, handover_deficit,
-                ) = best_state
-                remaining.remove(best_index)
-                progress.setValue(len(candidate_specs) + len(selected))
+                candidate_ap, candidate_rssi = best_record
+                apply_selected(best_index, candidate_ap, candidate_rssi, best_state)
+                progress.setLabelText(
+                    f"Selected {len(selected)} AP(s): coverage {coverage_fraction_now() * 100.0:.1f}%"
+                )
+                progress.setValue(len(selected))
                 QApplication.processEvents()
 
             new_aps: List[AccessPoint] = []
@@ -4715,13 +6709,52 @@ class MainWindow(QMainWindow):
             }
             for boundary in self.planner_boundaries
         ]
+        inferred_spaces = []
+        user_spaces = []
+        selected_ap_spaces = []
+        for floor in self.floors.values():
+            for space in floor.spaces:
+                if space.ap_planning_selected:
+                    selected_ap_spaces.append({
+                        "source_file": space.source_file,
+                        "guid": space.guid,
+                        "floor": space.floor,
+                    })
+                if not (space.is_inferred or space.is_user_created):
+                    continue
+                item = {
+                    "guid": space.guid,
+                    "name": space.name,
+                    "floor": space.floor,
+                    "source_file": space.source_file,
+                    "polygon": [[float(x), float(y)] for x, y in space.polygon.exterior.coords],
+                    "z_min": space.z_min,
+                    "z_max": space.z_max,
+                    "source_storey": space.source_storey,
+                    "assumption_note": space.assumption_note,
+                    "ap_planning_selected": space.ap_planning_selected,
+                }
+                if space.is_user_created:
+                    user_spaces.append(item)
+                else:
+                    inferred_spaces.append(item)
         return {
-            "format": "rf-attenuation-plan", "version": 3,
+            "format": "rf-attenuation-plan", "version": 5,
             "ifc_paths": [str(path) for path in self.loaded_ifc_paths],
             "selected_floor": self.floor.name if self.floor else "", "view_rotation_deg": self.view_rotation_deg,
             "ifc_alignment": {"dx": self.ifc_alignment.dx, "dy": self.ifc_alignment.dy, "rotation_deg": self.ifc_alignment.rotation_deg, "scale": self.ifc_alignment.scale},
             "auto_planner_settings": self.auto_planner_settings.to_dict(),
             "planner_boundaries": planner_boundaries,
+            "excluded_ifc_elements": [
+                self._ifc_exclusion_record(
+                    item.get("kind", ""), item.get("source_file", ""), item.get("guid", ""), item.get("floor", "")
+                )
+                for item in getattr(self, "excluded_ifc_elements", [])
+                if isinstance(item, dict) and item.get("kind") and item.get("source_file") and item.get("guid")
+            ],
+            "selected_ap_spaces": selected_ap_spaces,
+            "user_spaces": user_spaces,
+            "inferred_spaces": inferred_spaces,
             "access_points": aps, "user_walls": user_walls, "wall_overrides": overrides,
         }
 
@@ -4764,9 +6797,10 @@ class MainWindow(QMainWindow):
             self.apply_ifc_alignment(target_alignment)
         except Exception:
             pass
-        # Remove prior user geometry before restoring the saved plan.
+        # Remove prior simulator-created geometry before restoring the saved plan.
         for floor in self.floors.values():
             floor.walls = [wall for wall in floor.walls if not wall.is_user_created]
+            floor.spaces = [space for space in floor.spaces if not space.is_inferred and not space.is_user_created]
             for wall in floor.walls:
                 if wall.rf_original_polygon is not None:
                     wall.polygon = wall.rf_original_polygon
@@ -4774,6 +6808,14 @@ class MainWindow(QMainWindow):
                 wall.rf_geometry_customised = False
                 wall.rf_customised = False; wall.rf_type_override = ""
                 wall.attenuation_by_band_db = self._profile_for_wall_from_settings(wall)
+        self.excluded_ifc_elements = [
+            self._ifc_exclusion_record(
+                item.get("kind", ""), item.get("source_file", ""), item.get("guid", ""), item.get("floor", "")
+            )
+            for item in data.get("excluded_ifc_elements", [])
+            if isinstance(item, dict) and item.get("kind") in {"wall", "space", "element"} and item.get("source_file") and item.get("guid")
+        ]
+        self._apply_ifc_exclusions()
         override_lookup_exact = {
             (str(item.get("source_file", "")), str(item.get("guid", "")), str(item.get("floor", ""))): item
             for item in data.get("wall_overrides", []) if isinstance(item, dict) and str(item.get("floor", ""))
@@ -4815,6 +6857,89 @@ class MainWindow(QMainWindow):
                 rf_type_override=str(item.get("rf_type_override", item.get("type_name", "partition"))),
                 rf_customised=True, is_user_created=True, user_wall_thickness_m=float(item.get("thickness_m", 0.15)),
             ))
+        for item in data.get("user_spaces", []):
+            if not isinstance(item, dict):
+                continue
+            floor = self.floors.get(str(item.get("floor", "")))
+            coords = item.get("polygon", [])
+            if floor is None or not isinstance(coords, list) or len(coords) < 3:
+                continue
+            try:
+                polygon = Polygon([(float(value[0]), float(value[1])) for value in coords])
+                if not polygon.is_valid:
+                    polygon = polygon.buffer(0)
+                if polygon.is_empty:
+                    continue
+                if polygon.geom_type != "Polygon":
+                    parts = list(getattr(polygon, "geoms", []))
+                    if not parts:
+                        continue
+                    polygon = max(parts, key=lambda value: float(value.area))
+                floor.spaces.append(Space2D(
+                    guid=str(item.get("guid", f"user-space-{uuid.uuid4().hex}")),
+                    name=str(item.get("name", "User Space")),
+                    floor=floor.name,
+                    source_file=str(item.get("source_file", "RF simulator user space")),
+                    polygon=polygon,
+                    z_min=float(item.get("z_min", floor.elevation)),
+                    z_max=float(item.get("z_max", floor.elevation + 3.0)),
+                    source_storey=str(item.get("source_storey", floor.name)),
+                    is_user_created=True,
+                    ap_planning_selected=bool(item.get("ap_planning_selected", False)),
+                    assumption_note=str(item.get("assumption_note", "Restored user-created space")),
+                ))
+            except Exception:
+                continue
+        for item in data.get("inferred_spaces", []):
+            if not isinstance(item, dict):
+                continue
+            floor = self.floors.get(str(item.get("floor", "")))
+            coords = item.get("polygon", [])
+            if floor is None or not isinstance(coords, list) or len(coords) < 3:
+                continue
+            try:
+                polygon = Polygon([(float(value[0]), float(value[1])) for value in coords])
+                if not polygon.is_valid:
+                    polygon = polygon.buffer(0)
+                if polygon.is_empty:
+                    continue
+                if polygon.geom_type != "Polygon":
+                    parts = list(getattr(polygon, "geoms", []))
+                    if not parts:
+                        continue
+                    polygon = max(parts, key=lambda value: float(value.area))
+                floor.spaces.append(Space2D(
+                    guid=str(item.get("guid", f"inferred-space-{uuid.uuid4().hex}")),
+                    name=str(item.get("name", "Inferred Space")),
+                    floor=floor.name,
+                    source_file=str(item.get("source_file", "RF simulator inferred space")),
+                    polygon=polygon,
+                    z_min=float(item.get("z_min", floor.elevation)),
+                    z_max=float(item.get("z_max", floor.elevation + 3.0)),
+                    source_storey=str(item.get("source_storey", floor.name)),
+                    is_inferred=True,
+                    ap_planning_selected=bool(item.get("ap_planning_selected", False)),
+                    assumption_note=str(item.get("assumption_note", "Restored inferred space")),
+                ))
+            except Exception:
+                continue
+
+        selected_refs = {
+            (
+                str(item.get("source_file", "")),
+                str(item.get("guid", "")),
+                str(item.get("floor", "")),
+            )
+            for item in data.get("selected_ap_spaces", [])
+            if isinstance(item, dict) and item.get("source_file") and item.get("guid")
+        }
+        if selected_refs:
+            for floor in self.floors.values():
+                for space in floor.spaces:
+                    ref = (str(space.source_file), str(space.guid), str(space.floor))
+                    if ref in selected_refs:
+                        space.ap_planning_selected = True
+
         self.planner_boundaries = []
         for item in data.get("planner_boundaries", []):
             if not isinstance(item, dict):
@@ -5367,6 +7492,8 @@ class MainWindow(QMainWindow):
                     wall.rf_original_polygon = affine_transform(wall.rf_original_polygon, delta)
             for space in floor.spaces:
                 space.polygon = affine_transform(space.polygon, delta)
+            for element in getattr(floor, "elements", []):
+                element.polygon = affine_transform(element.polygon, delta)
         for boundary in self.planner_boundaries:
             boundary.polygon = affine_transform(boundary.polygon, delta)
         for ap in self.aps:
@@ -5566,6 +7693,8 @@ class MainWindow(QMainWindow):
         if replace:
             if getattr(self, "wall_draw_mode", False) or getattr(self, "_wall_draw_start", None) is not None:
                 self.cancel_user_wall_drawing()
+            if getattr(self, "space_draw_mode", False) or bool(getattr(self, "_space_polygon_points", [])):
+                self.cancel_space_drawing()
             if (
                 getattr(self, "boundary_draw_mode", False)
                 or getattr(self, "_boundary_draw_start", None) is not None
@@ -5579,6 +7708,7 @@ class MainWindow(QMainWindow):
             self.ifc_origin_info = {}
             self.aps.clear()
             self.planner_boundaries.clear()
+            self.excluded_ifc_elements.clear()
             self.last_result = None
             self.ifc_alignment = AlignmentTransform()
         self.alignment_pick_mode: Optional[str] = None
@@ -5701,9 +7831,9 @@ class MainWindow(QMainWindow):
                                 f"Indexing {path.name} before chunked multiprocessing..."
                             )
                             QApplication.processEvents()
-                            path_str, storeys, wall_guids, space_guids, source_name, origin_info = _index_ifc_file_for_chunking(job)
+                            path_str, storeys, wall_guids, space_guids, element_guids, source_name, origin_info = _index_ifc_file_for_chunking(job)
                             self.ifc_origin_info[self._ifc_path_key(path)] = origin_info
-                            records = [("wall", g) for g in wall_guids] + [("space", g) for g in space_guids]
+                            records = [("wall", g) for g in wall_guids] + [("space", g) for g in space_guids] + [("element", g) for g in element_guids]
                             if not records:
                                 fut = self._ifc_process_executor.submit(_load_ifc_file_in_process, job)
                                 self._ifc_process_futures[fut] = (path, "file")
@@ -5717,9 +7847,10 @@ class MainWindow(QMainWindow):
                             for idx, chunk in enumerate(chunks, start=1):
                                 chunk_wall_guids = [g for kind, g in chunk if kind == "wall"]
                                 chunk_space_guids = [g for kind, g in chunk if kind == "space"]
+                                chunk_element_guids = [g for kind, g in chunk if kind == "element"]
                                 chunk_job = (
                                     path_str, job[1], job[2], job[3], job[4], job[5],
-                                    storeys, chunk_wall_guids, chunk_space_guids, idx, len(chunks),
+                                    storeys, chunk_wall_guids, chunk_space_guids, chunk_element_guids, idx, len(chunks),
                                 )
                                 fut = self._ifc_process_executor.submit(_load_ifc_geometry_chunk_in_process, chunk_job)
                                 self._ifc_process_futures[fut] = (path, "chunk")
@@ -5854,10 +7985,14 @@ class MainWindow(QMainWindow):
         self._set_loading_ui(False)
         self._close_ifc_load_progress()
         self._shutdown_ifc_process_executor()
+        closed_wall_count = close_imported_wall_endpoint_gaps(self.floors)
         self._refresh_floor_combo()
         total_walls = sum(len(f.walls) for f in self.floors.values())
         total_spaces = sum(len(f.spaces) for f in self.floors.values())
-        msg = f"Loaded {len(self.loaded_ifc_paths)} IFC file(s), {len(self.floors)} floor(s), {total_walls} wall(s), {total_spaces} space(s)"
+        total_elements = sum(len(getattr(f, "elements", [])) for f in self.floors.values())
+        msg = f"Loaded {len(self.loaded_ifc_paths)} IFC file(s), {len(self.floors)} floor(s), {total_walls} wall(s), {total_spaces} space(s), {total_elements} other element(s)"
+        if closed_wall_count:
+            msg += f". Closed small endpoint gaps on {closed_wall_count} wall(s)."
         if self._load_errors:
             QMessageBox.warning(self, "Some IFC files failed", "\n".join(self._load_errors))
             msg += f". {len(self._load_errors)} file(s) failed."
@@ -5908,8 +8043,9 @@ class MainWindow(QMainWindow):
         self.clear_ap_action.setEnabled(not loading)
         self.load_pattern_action.setEnabled(not loading)
         for action_name in (
-            "planner_settings_action", "predict_aps_action", "draw_wall_action",
-            "draw_boundary_action", "draw_polygon_boundary_action", "clear_boundaries_action", "ifc_origin_action",
+            "planner_settings_action", "predict_aps_action", "draw_wall_action", "draw_space_action", "select_ap_spaces_action",
+            "draw_boundary_action", "draw_polygon_boundary_action", "suggest_external_boundary_action",
+            "create_spaces_action", "clear_inferred_spaces_action", "clear_boundaries_action", "ifc_origin_action",
             "rotate_left_action", "rotate_right_action", "reset_rotation_action", "save_plan_action", "load_plan_action",
         ):
             action = getattr(self, action_name, None)
@@ -5920,6 +8056,8 @@ class MainWindow(QMainWindow):
     def select_floor(self, name: str):
         if getattr(self, "wall_draw_mode", False) or getattr(self, "_wall_draw_start", None) is not None:
             self.cancel_user_wall_drawing()
+        if getattr(self, "space_draw_mode", False) or bool(getattr(self, "_space_polygon_points", [])):
+            self.cancel_space_drawing()
         if (
             getattr(self, "boundary_draw_mode", False)
             or getattr(self, "_boundary_draw_start", None) is not None
@@ -6012,8 +8150,10 @@ class MainWindow(QMainWindow):
         scene.clear()
         self._ifc_snap_marker_items = []
         self._wall_preview_items = []
+        self._space_preview_items = []
         self._boundary_preview_items = []
         self._suggested_boundary_preview_items = []
+        self._suggested_space_preview_items = []
         if not self.floor:
             return
         # Draw heatmap first so the building geometry remains visible above it.
@@ -6027,21 +8167,67 @@ class MainWindow(QMainWindow):
         for space in self.floor.spaces:
             coords = list(space.polygon.exterior.coords)
             poly = QPolygonF([QPointF(x, y) for x, y in coords])
-            item = QGraphicsPolygonItem(poly)
-            pen = QPen(colours["space_pen"], 0.12)
+            if space.ap_planning_selected:
+                pen_colour = QColor("#F59E0B")
+                fill_colour = QColor("#FDE68A")
+            elif space.is_inferred:
+                pen_colour = QColor("#00A77B")
+                fill_colour = QColor("#7FE0C2")
+            elif space.is_user_created:
+                pen_colour = QColor("#2D9CDB")
+                fill_colour = QColor("#93C5FD")
+            else:
+                pen_colour = colours["space_pen"]
+                fill_colour = QColor(colours["space_fill"])
+            if space.ap_planning_selected:
+                fill_colour.setAlpha(115)
+            elif space.is_inferred:
+                fill_colour.setAlpha(70)
+            elif space.is_user_created:
+                fill_colour.setAlpha(65)
+            pen = QPen(pen_colour, 0.20 if space.ap_planning_selected else (0.16 if (space.is_inferred or space.is_user_created) else 0.12))
             pen.setCosmetic(True)
-            item.setPen(pen)
-            item.setBrush(QBrush(colours["space_fill"]))
-            item.setZValue(Z_IFC_SPACE_FILL)
+            if space.is_inferred:
+                pen.setStyle(Qt.DashLine)
+                item = InferredSpaceGraphicsItem(self, space, poly, pen, QBrush(fill_colour))
+            elif space.is_user_created:
+                pen.setStyle(Qt.DashLine)
+                item = SpaceGraphicsItem(self, space, poly, pen, QBrush(fill_colour))
+            else:
+                item = SpaceGraphicsItem(self, space, poly, pen, QBrush(fill_colour))
             scene.addItem(item)
 
             if space.name:
                 centroid = space.polygon.representative_point()
                 cx, cy = self._point_xy(centroid)
+                label = str(space.name)
+                if space.is_inferred:
+                    label += " (inferred)"
+                elif space.is_user_created:
+                    label += " (user)"
+                if space.ap_planning_selected:
+                    label += " [AP]"
                 self._add_upright_text(
-                    scene, str(space.name), cx, cy,
-                    colours["space_text"], self.heatmap_settings.space_label_font_size, Z_TEXT, bold=True
+                    scene, label, cx, cy,
+                    QColor("#B45309") if space.ap_planning_selected else (QColor("#007A5A") if space.is_inferred else (QColor("#1D4ED8") if space.is_user_created else colours["space_text"])),
+                    self.heatmap_settings.space_label_font_size, Z_TEXT, bold=True
                 )
+
+        element_pen_colour = QColor("#526D82") if not getattr(self, "dark_theme", False) else QColor("#88A6BC")
+        element_fill_colour = QColor("#B6C6D2") if not getattr(self, "dark_theme", False) else QColor("#364854")
+        element_fill_colour.setAlpha(80)
+        element_pen = QPen(element_pen_colour, 0.08)
+        element_pen.setCosmetic(True)
+        for element in getattr(self.floor, "elements", []):
+            try:
+                coords = list(element.polygon.exterior.coords)
+            except Exception:
+                continue
+            if len(coords) < 3:
+                continue
+            poly = QPolygonF([QPointF(float(x), float(y)) for x, y in coords])
+            item = IFCElementGraphicsItem(self, element, poly, element_pen, QBrush(element_fill_colour))
+            scene.addItem(item)
 
         for boundary in self.planner_boundaries:
             item = PlannerBoundaryGraphicsItem(self, boundary)
@@ -6659,42 +8845,37 @@ class MainWindow(QMainWindow):
             )
             return
 
-        original_radios = [(ap, list(ap.radios)) for ap in self.aps]
+        for i, freq in enumerate(active_freqs, start=1):
+            aps_for_freq: List[AccessPoint] = []
+            for ap in self.aps:
+                radios = [
+                    r for r in ap.active_radios()
+                    if getattr(r, "enabled", True)
+                    and abs(float(r.frequency_mhz) - freq) < 1e-6
+                ]
+                if radios:
+                    aps_for_freq.append(replace(ap, radios=radios))
 
-        try:
-            for i, freq in enumerate(active_freqs, start=1):
-                for ap in self.aps:
-                    ap.radios = [
-                        r
-                        for r in original_radios[[a for a, _ in original_radios].index(ap)][1]
-                        if getattr(r, "enabled", True)
-                        and abs(float(r.frequency_mhz) - freq) < 1e-6
-                    ]
+            if not aps_for_freq:
+                continue
 
-                if not any(ap.radios for ap in self.aps):
-                    continue
+            self.statusBar().showMessage(
+                f"Calculating RSSI for {freq:g} MHz ({i}/{len(active_freqs)})..."
+            )
 
-                self.statusBar().showMessage(
-                    f"Calculating RSSI for {freq:g} MHz ({i}/{len(active_freqs)})..."
-                )
+            result = RFEngine.simulate(
+                self.floor,
+                self.floors,
+                aps_for_freq,
+                self.resolution.value(),
+                self.antenna_patterns,
+                include_inter_floor=self.include_inter_floor.isChecked(),
+                heatmap_settings=self.heatmap_settings,
+                progress_callback=update_progress,
+            )
 
-                result = RFEngine.simulate(
-                    self.floor,
-                    self.floors,
-                    self.aps,
-                    self.resolution.value(),
-                    self.antenna_patterns,
-                    include_inter_floor=self.include_inter_floor.isChecked(),
-                    heatmap_settings=self.heatmap_settings,
-                    progress_callback=update_progress,
-                )
-
-                if result is not None:
-                    self.rssi_results_by_frequency[freq] = result
-
-        finally:
-            for ap, radios in original_radios:
-                ap.radios = radios
+            if result is not None:
+                self.rssi_results_by_frequency[freq] = result
 
         selected_freq = self._selected_rssi_view_frequency()
 

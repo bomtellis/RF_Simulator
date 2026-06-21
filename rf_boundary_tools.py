@@ -198,3 +198,231 @@ def suggest_external_boundary_polygons(
         "vertex_count": sum(max(0, len(polygon.exterior.coords) - 1) for polygon in suggestions),
         "warnings": warnings,
     }
+
+
+def estimate_space_gap_tolerance(wall_polygons: Iterable[Polygon]) -> float:
+    """Return a practical default gap bridge for room-space inference.
+
+    Ordinary door openings and small modelling gaps should not merge adjacent
+    rooms.  The value is therefore based on wall thickness but constrained to
+    the range normally required to bridge a single doorway.
+    """
+    thicknesses: List[float] = []
+    for geometry in wall_polygons:
+        for polygon in _normalise_polygon(geometry):
+            value = _estimate_polygon_thickness(polygon)
+            if 0.03 <= value <= 3.0:
+                thicknesses.append(value)
+    typical = median(thicknesses) if thicknesses else 0.20
+    return max(0.80, min(1.50, float(typical) * 5.0))
+
+
+def infer_space_polygons(
+    wall_polygons: Sequence[Polygon],
+    external_boundary_polygons: Optional[Sequence[Polygon]] = None,
+    gap_tolerance_m: Optional[float] = None,
+    minimum_area_m2: float = 2.0,
+    simplify_tolerance_m: Optional[float] = None,
+) -> Tuple[List[Polygon], dict]:
+    """Create room/space polygons from wall geometry and an exterior baseline.
+
+    The exterior baseline is treated as a virtual external wall.  This is
+    important for incomplete IFCs where facade walls are missing but a shared
+    planner boundary has already been accepted.  Internal wall and doorway
+    gaps up to ``gap_tolerance_m`` are closed morphologically before the free
+    floor area is split into discrete spaces.
+
+    When no exterior baseline is supplied, the same outer-wall tracing logic
+    used by the planner-boundary suggestion is applied first.  The returned
+    metadata identifies that assumption so the GUI can make it explicit before
+    the user accepts the result.
+    """
+    cleaned_walls: List[Polygon] = []
+    for geometry in wall_polygons:
+        cleaned_walls.extend(_normalise_polygon(geometry))
+    if not cleaned_walls:
+        return [], {
+            "wall_count": 0,
+            "warnings": ["No valid wall polygons were available."],
+            "used_suggested_external_boundary": False,
+        }
+
+    gap = (
+        estimate_space_gap_tolerance(cleaned_walls)
+        if gap_tolerance_m is None
+        else max(0.05, min(5.0, float(gap_tolerance_m)))
+    )
+    thicknesses = [
+        value
+        for value in (_estimate_polygon_thickness(polygon) for polygon in cleaned_walls)
+        if 0.03 <= value <= 3.0
+    ]
+    typical_thickness = float(median(thicknesses)) if thicknesses else 0.20
+    simplify = (
+        max(0.01, min(0.15, typical_thickness * 0.20))
+        if simplify_tolerance_m is None
+        else max(0.0, min(1.0, float(simplify_tolerance_m)))
+    )
+
+    boundary_parts: List[Polygon] = []
+    for geometry in external_boundary_polygons or []:
+        boundary_parts.extend(_normalise_polygon(geometry))
+    used_suggested_boundary = False
+    boundary_metadata = {}
+    if not boundary_parts:
+        boundary_parts, boundary_metadata = suggest_external_boundary_polygons(
+            cleaned_walls,
+            gap_tolerance_m=max(gap, estimate_outer_wall_gap_tolerance(cleaned_walls)),
+            minimum_area_m2=max(1.0, float(minimum_area_m2)),
+        )
+        used_suggested_boundary = bool(boundary_parts)
+
+    if not boundary_parts:
+        warnings = list(boundary_metadata.get("warnings", []) or [])
+        if not warnings:
+            warnings = ["No external baseline could be formed from the wall network."]
+        return [], {
+            "wall_count": len(cleaned_walls),
+            "gap_tolerance_m": gap,
+            "typical_wall_thickness_m": typical_thickness,
+            "warnings": warnings,
+            "used_suggested_external_boundary": used_suggested_boundary,
+            "external_boundaries": [],
+        }
+
+    try:
+        external_union = unary_union(boundary_parts)
+        if not external_union.is_valid:
+            external_union = external_union.buffer(0)
+        wall_union = unary_union(cleaned_walls)
+        if not wall_union.is_valid:
+            wall_union = wall_union.buffer(0)
+    except Exception as exc:
+        return [], {
+            "wall_count": len(cleaned_walls),
+            "gap_tolerance_m": gap,
+            "typical_wall_thickness_m": typical_thickness,
+            "warnings": [f"Could not combine wall and boundary geometry: {exc}"],
+            "used_suggested_external_boundary": used_suggested_boundary,
+            "external_boundaries": boundary_parts,
+        }
+
+    # Add the accepted/suggested baseline as a virtual wall.  The half-gap
+    # closing operation then bridges door openings, partition ends and small
+    # authoring omissions without inventing long diagonal separators.
+    close_radius = max(0.025, gap * 0.5)
+    boundary_barrier_width = max(0.025, typical_thickness * 0.5)
+    try:
+        boundary_barrier = external_union.boundary.buffer(
+            boundary_barrier_width, cap_style=2, join_style=2
+        )
+        barrier_seed = unary_union([wall_union, boundary_barrier])
+        closed_barriers = barrier_seed.buffer(
+            close_radius, cap_style=2, join_style=2
+        ).buffer(-close_radius, cap_style=2, join_style=2)
+        if not closed_barriers.is_valid:
+            closed_barriers = closed_barriers.buffer(0)
+        free_area = external_union.difference(closed_barriers)
+        if not free_area.is_valid:
+            free_area = free_area.buffer(0)
+    except Exception as exc:
+        return [], {
+            "wall_count": len(cleaned_walls),
+            "gap_tolerance_m": gap,
+            "typical_wall_thickness_m": typical_thickness,
+            "warnings": [f"Could not split the floor area into spaces: {exc}"],
+            "used_suggested_external_boundary": used_suggested_boundary,
+            "external_boundaries": boundary_parts,
+        }
+
+    minimum_area = max(0.05, float(minimum_area_m2))
+    spaces: List[Polygon] = []
+    discarded_small = 0
+    for polygon in _normalise_polygon(free_area):
+        if float(polygon.area) < minimum_area:
+            discarded_small += 1
+            continue
+        candidate = polygon
+        if simplify > 0.0:
+            try:
+                candidate = candidate.simplify(simplify, preserve_topology=True)
+            except Exception:
+                candidate = polygon
+        for part in _normalise_polygon(candidate):
+            if float(part.area) >= minimum_area:
+                spaces.append(part)
+
+    spaces.sort(key=lambda polygon: (round(float(polygon.centroid.y), 6), round(float(polygon.centroid.x), 6)))
+    warnings: List[str] = []
+    if used_suggested_boundary:
+        warnings.append(
+            "No accepted planner boundary was available, so the external baseline was inferred from the outermost wall chain."
+        )
+    if discarded_small:
+        warnings.append(
+            f"Discarded {discarded_small} enclosed fragment(s) smaller than {minimum_area:g} m²."
+        )
+    if len(spaces) == 1 and len(cleaned_walls) > 1:
+        warnings.append(
+            "Only one space was formed. Increase the gap bridge only for open doorways; reduce it if internal partitions have been merged."
+        )
+    if not spaces:
+        warnings.append("The walls and external baseline did not form any usable spaces.")
+
+    return spaces, {
+        "wall_count": len(cleaned_walls),
+        "gap_tolerance_m": gap,
+        "typical_wall_thickness_m": typical_thickness,
+        "space_count": len(spaces),
+        "total_area_m2": sum(float(polygon.area) for polygon in spaces),
+        "minimum_area_m2": minimum_area,
+        "used_suggested_external_boundary": used_suggested_boundary,
+        "external_boundaries": boundary_parts,
+        "external_boundary_count": len(boundary_parts),
+        "warnings": warnings,
+    }
+
+
+def missing_external_wall_polygons(
+    wall_polygons: Sequence[Polygon],
+    external_boundary_polygons: Sequence[Polygon],
+    wall_thickness_m: float = 0.20,
+    existing_wall_tolerance_m: float = 0.35,
+    minimum_segment_length_m: float = 0.30,
+) -> List[Polygon]:
+    """Return RF wall polygons for uncovered portions of an exterior baseline.
+
+    Existing IFC/RF walls close to the baseline are removed from the proposed
+    wall ring so attenuation is not doubled.  Remaining pieces represent facade
+    segments that are absent from the imported geometry.
+    """
+    cleaned_boundaries: List[Polygon] = []
+    for geometry in external_boundary_polygons:
+        cleaned_boundaries.extend(_normalise_polygon(geometry))
+    if not cleaned_boundaries:
+        return []
+    cleaned_walls: List[Polygon] = []
+    for geometry in wall_polygons:
+        cleaned_walls.extend(_normalise_polygon(geometry))
+
+    thickness = max(0.03, min(2.0, float(wall_thickness_m)))
+    tolerance = max(thickness * 0.5, min(5.0, float(existing_wall_tolerance_m)))
+    minimum_area = max(1e-4, thickness * max(0.05, float(minimum_segment_length_m)))
+    try:
+        boundary_union = unary_union(cleaned_boundaries)
+        proposed_ring = boundary_union.boundary.buffer(
+            thickness * 0.5, cap_style=2, join_style=2
+        )
+        if cleaned_walls:
+            existing = unary_union(cleaned_walls).buffer(
+                tolerance, cap_style=2, join_style=2
+            )
+            proposed_ring = proposed_ring.difference(existing)
+        if not proposed_ring.is_valid:
+            proposed_ring = proposed_ring.buffer(0)
+    except Exception:
+        return []
+
+    parts = [part for part in _normalise_polygon(proposed_ring) if float(part.area) >= minimum_area]
+    parts.sort(key=lambda polygon: float(polygon.area), reverse=True)
+    return parts
