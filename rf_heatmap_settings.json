@@ -279,7 +279,7 @@
     "exterior",
     "outer",
     "facade",
-    "façade",
+    "fa\u00e7ade",
     "curtain",
     "envelope",
     "perimeter"
@@ -307,6 +307,7 @@
   "reuse_rf_process_pool": true,
   "rf_worker_index_cache_entries": 1,
   "propagation_model": {
+    "ignore_results_outside_planner_boundaries": false,
     "enable_multipath_reflections": true,
     "max_reflection_order": 1,
     "max_reflection_surfaces": 6,
@@ -486,5 +487,31 @@
     "prefer_non_overlapping_handover_channels": true
   },
   "user_wall_default_type": "partition",
-  "user_wall_default_thickness_m": 0.15
+  "user_wall_default_thickness_m": 0.15,
+  "rf_performance": {
+    "calculation_profile": "balanced",
+    "enable_adaptive_grid": true,
+    "coarse_resolution_m": 3.0,
+    "gradient_threshold_db_per_m": 4.0,
+    "threshold_margin_db": 2.0,
+    "geometry_buffer_m": 1.5,
+    "ap_refine_radius_m": 6.0,
+    "enable_per_ap_cache": true,
+    "per_ap_cache_entries": 192,
+    "per_ap_cache_mb": 768,
+    "reuse_path_geometry_across_frequencies": true,
+    "precompute_reflection_candidates_per_tile": true,
+    "enable_tile_influence_pruning": true,
+    "tile_influence_margin_db": 8.0,
+    "enable_tile_local_geometry": true,
+    "multipath_relative_power_cutoff_db": 30.0,
+    "enable_numba_kernels": true,
+    "use_shared_memory_results": true,
+    "progressive_heatmap_updates": true,
+    "progressive_update_percent": 20,
+    "heatmap_render_mode": "raster_contours",
+    "interactive_preview_enabled": true,
+    "interactive_preview_delay_ms": 350,
+    "interactive_preview_resolution_m": 3.0
+  }
 }

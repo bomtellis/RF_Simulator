@@ -3,6 +3,7 @@ RF Attenuation Simulator - IFC Wi-Fi RSSI planning tool.
 
 Run:
     pip install PySide6 numpy ifcopenshell shapely contourpy
+    pip install numba  # optional compiled RF kernels
     python rf_simulator.py
 """
 from __future__ import annotations
@@ -33,19 +34,32 @@ from rf_propagation import (
     PathPower,
     ReflectionIndex,
     ReflectionSurface,
-    coherent_power_dbm,
     deterministic_spatial_fading_db,
-    generate_diffraction_paths,
-    generate_reflection_paths,
+    generate_diffraction_geometries,
+    generate_reflection_geometries,
+    precompute_reflection_sequences,
+    evaluate_diffraction_geometry,
+    evaluate_reflection_geometry,
     incoherent_power_dbm,
     propagation_phase_rad,
-    rms_delay_spread_ns,
     stable_link_key,
+)
+from rf_performance import (
+    BoundedLRU,
+    SharedArraySpec,
+    adaptive_refinement_mask,
+    attach_shared_array,
+    best_case_rssi_grid,
+    coherent_path_metrics,
+    create_shared_array,
+    nearest_resample_regular_grid,
+    resample_regular_grid,
+    stable_digest,
 )
 import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 try:
@@ -61,6 +75,7 @@ from PySide6.QtCore import QPointF, Qt, Slot, QTimer, QSize, QRectF, QMarginsF
 from PySide6.QtGui import (
     QAction, QColor, QBrush, QFont, QPen, QPolygonF, QPainterPath, QPalette,
     QTransform, QIcon, QKeySequence, QPainter, QPdfWriter, QPageSize, QPageLayout,
+    QImage, QPixmap,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -77,6 +92,7 @@ from PySide6.QtWidgets import (
     QGraphicsEllipseItem,
     QGraphicsItem,
     QGraphicsPathItem,
+    QGraphicsPixmapItem,
     QGraphicsPolygonItem,
     QGraphicsRectItem,
     QGraphicsScene,
@@ -122,6 +138,11 @@ try:
     from shapely.geometry import LineString, Point, Polygon, box
     from shapely.ops import nearest_points, unary_union
     from shapely.affinity import affine_transform, rotate as shapely_rotate
+    from shapely.prepared import prep as prepare_geometry
+    try:
+        from shapely import intersects_xy as shapely_intersects_xy
+    except Exception:  # Shapely < 2.0
+        shapely_intersects_xy = None
     try:
         from shapely import concave_hull as shapely_concave_hull
     except Exception:  # Shapely < 2.0
@@ -137,6 +158,10 @@ _RF_PROCESS_EXECUTOR_WORKERS = 0
 _RF_PROCESS_EXECUTOR_LOCK = threading.Lock()
 _RF_WORKER_CONTEXT_CACHE: Dict[str, tuple] = {}
 _RF_WORKER_CONTEXT_ORDER: List[str] = []
+_RF_CONTEXT_FILE_CACHE: Dict[str, str] = {}
+_RF_CONTEXT_FILE_ORDER: List[str] = []
+_RF_CONTEXT_FILE_LOCK = threading.Lock()
+_RF_AP_FIELD_CACHE = BoundedLRU(maximum_items=192, maximum_bytes=768 * 1024 * 1024)
 
 
 def _shutdown_rf_process_executor(wait: bool = False) -> None:
@@ -151,6 +176,15 @@ def _shutdown_rf_process_executor(wait: bool = False) -> None:
             executor.shutdown(wait=wait, cancel_futures=True)
         except TypeError:
             executor.shutdown(wait=wait)
+        except Exception:
+            pass
+    with _RF_CONTEXT_FILE_LOCK:
+        paths = list(_RF_CONTEXT_FILE_CACHE.values())
+        _RF_CONTEXT_FILE_CACHE.clear()
+        _RF_CONTEXT_FILE_ORDER.clear()
+    for path in paths:
+        try:
+            os.unlink(path)
         except Exception:
             pass
 
@@ -712,10 +746,19 @@ class SimulationResult:
     rssi: np.ndarray
     delay_spread_ns: Optional[np.ndarray] = None
     path_count: Optional[np.ndarray] = None
+    valid_mask: Optional[np.ndarray] = None
+    boundary_geometry: object = field(default=None, repr=False, compare=False)
+    ignored_point_count: int = 0
     execution_mode: str = "single-process"
     worker_processes: int = 1
     elapsed_seconds: float = 0.0
     performance_note: str = ""
+    progressive_fraction: float = 1.0
+    approximate_points: int = 0
+    exact_points: int = 0
+    cache_hits: int = 0
+    cache_misses: int = 0
+    render_mode_override: str = ""
     render_cache: Dict[object, object] = field(default_factory=dict, repr=False, compare=False)
 
 
@@ -882,7 +925,35 @@ class HeatmapSettings:
     rf_tile_rows: int = 16
     rf_tiles_per_worker: int = 2
     reuse_rf_process_pool: bool = True
-    rf_worker_index_cache_entries: int = 1
+    rf_worker_index_cache_entries: int = 2
+    # Calculation profiles and adaptive/incremental RF acceleration.
+    rf_calculation_profile: str = "balanced"  # fast, balanced, detailed
+    enable_adaptive_rf_grid: bool = True
+    adaptive_coarse_resolution_m: float = 3.0
+    adaptive_gradient_threshold_db_per_m: float = 4.0
+    adaptive_threshold_margin_db: float = 2.0
+    adaptive_geometry_buffer_m: float = 1.5
+    adaptive_ap_refine_radius_m: float = 6.0
+    enable_per_ap_heatmap_cache: bool = True
+    per_ap_heatmap_cache_entries: int = 192
+    per_ap_heatmap_cache_mb: int = 768
+    reuse_path_geometry_across_frequencies: bool = True
+    precompute_reflection_candidates_per_tile: bool = True
+    enable_tile_influence_pruning: bool = True
+    tile_influence_margin_db: float = 8.0
+    enable_tile_local_geometry: bool = True
+    multipath_relative_power_cutoff_db: float = 30.0
+    enable_numba_rf_kernels: bool = True
+    use_shared_memory_rf_results: bool = True
+    progressive_heatmap_updates: bool = True
+    progressive_update_percent: int = 20
+    heatmap_render_mode: str = "raster_contours"  # raster, raster_contours, contours
+    interactive_preview_enabled: bool = True
+    interactive_preview_delay_ms: int = 350
+    interactive_preview_resolution_m: float = 3.0
+    # When enabled and one or more shared planner boundaries exist, RSSI grid
+    # points outside their union are not calculated, displayed or exported.
+    ignore_results_outside_planner_boundaries: bool = False
 
     # Advanced propagation model. Reflections use a bounded image-source model
     # on the active floor. Higher-order rays are available by increasing
@@ -1117,9 +1188,44 @@ class HeatmapSettings:
         settings.rf_tiles_per_worker = max(1, min(8, int(data.get("rf_tiles_per_worker", 2))))
         settings.reuse_rf_process_pool = bool(data.get("reuse_rf_process_pool", True))
         settings.rf_worker_index_cache_entries = max(1, min(8, int(data.get("rf_worker_index_cache_entries", 2))))
+        performance = data.get("rf_performance", data.get("performance", {}))
+        if not isinstance(performance, dict):
+            performance = {}
+        profile = str(performance.get("calculation_profile", data.get("rf_calculation_profile", settings.rf_calculation_profile))).strip().lower()
+        settings.rf_calculation_profile = profile if profile in {"fast", "balanced", "detailed"} else "balanced"
+        settings.enable_adaptive_rf_grid = bool(performance.get("enable_adaptive_grid", data.get("enable_adaptive_rf_grid", settings.enable_adaptive_rf_grid)))
+        settings.adaptive_coarse_resolution_m = max(0.25, float(performance.get("coarse_resolution_m", data.get("adaptive_coarse_resolution_m", settings.adaptive_coarse_resolution_m))))
+        settings.adaptive_gradient_threshold_db_per_m = max(0.05, float(performance.get("gradient_threshold_db_per_m", settings.adaptive_gradient_threshold_db_per_m)))
+        settings.adaptive_threshold_margin_db = max(0.1, float(performance.get("threshold_margin_db", settings.adaptive_threshold_margin_db)))
+        settings.adaptive_geometry_buffer_m = max(0.0, float(performance.get("geometry_buffer_m", settings.adaptive_geometry_buffer_m)))
+        settings.adaptive_ap_refine_radius_m = max(0.5, float(performance.get("ap_refine_radius_m", settings.adaptive_ap_refine_radius_m)))
+        settings.enable_per_ap_heatmap_cache = bool(performance.get("enable_per_ap_cache", settings.enable_per_ap_heatmap_cache))
+        settings.per_ap_heatmap_cache_entries = max(1, int(performance.get("per_ap_cache_entries", settings.per_ap_heatmap_cache_entries)))
+        settings.per_ap_heatmap_cache_mb = max(32, int(performance.get("per_ap_cache_mb", settings.per_ap_heatmap_cache_mb)))
+        settings.reuse_path_geometry_across_frequencies = bool(performance.get("reuse_path_geometry_across_frequencies", settings.reuse_path_geometry_across_frequencies))
+        settings.precompute_reflection_candidates_per_tile = bool(performance.get("precompute_reflection_candidates_per_tile", settings.precompute_reflection_candidates_per_tile))
+        settings.enable_tile_influence_pruning = bool(performance.get("enable_tile_influence_pruning", settings.enable_tile_influence_pruning))
+        settings.tile_influence_margin_db = max(0.0, float(performance.get("tile_influence_margin_db", settings.tile_influence_margin_db)))
+        settings.enable_tile_local_geometry = bool(performance.get("enable_tile_local_geometry", settings.enable_tile_local_geometry))
+        settings.multipath_relative_power_cutoff_db = max(0.0, min(80.0, float(performance.get("multipath_relative_power_cutoff_db", settings.multipath_relative_power_cutoff_db))))
+        settings.enable_numba_rf_kernels = bool(performance.get("enable_numba_kernels", settings.enable_numba_rf_kernels))
+        settings.use_shared_memory_rf_results = bool(performance.get("use_shared_memory_results", settings.use_shared_memory_rf_results))
+        settings.progressive_heatmap_updates = bool(performance.get("progressive_heatmap_updates", settings.progressive_heatmap_updates))
+        settings.progressive_update_percent = max(5, min(100, int(performance.get("progressive_update_percent", settings.progressive_update_percent))))
+        render_mode = str(performance.get("heatmap_render_mode", settings.heatmap_render_mode)).strip().lower()
+        settings.heatmap_render_mode = render_mode if render_mode in {"raster", "raster_contours", "contours"} else "raster_contours"
+        settings.interactive_preview_enabled = bool(performance.get("interactive_preview_enabled", settings.interactive_preview_enabled))
+        settings.interactive_preview_delay_ms = max(50, int(performance.get("interactive_preview_delay_ms", settings.interactive_preview_delay_ms)))
+        settings.interactive_preview_resolution_m = max(0.25, float(performance.get("interactive_preview_resolution_m", settings.interactive_preview_resolution_m)))
         propagation = data.get("propagation_model", data.get("advanced_propagation", {}))
         if not isinstance(propagation, dict):
             propagation = {}
+        settings.ignore_results_outside_planner_boundaries = bool(
+            propagation.get(
+                "ignore_results_outside_planner_boundaries",
+                data.get("ignore_results_outside_planner_boundaries", settings.ignore_results_outside_planner_boundaries),
+            )
+        )
         settings.enable_multipath_reflections = bool(propagation.get("enable_multipath_reflections", data.get("enable_multipath_reflections", settings.enable_multipath_reflections)))
         settings.max_reflection_order = max(0, min(3, int(propagation.get("max_reflection_order", data.get("max_reflection_order", settings.max_reflection_order)))))
         settings.max_reflection_surfaces = max(1, min(24, int(propagation.get("max_reflection_surfaces", settings.max_reflection_surfaces))))
@@ -1196,8 +1302,37 @@ class HeatmapSettings:
         settings.ensure_disconnect_zone()
         return settings
 
+    def performance_model_dict(self) -> Dict[str, object]:
+        return {
+            "calculation_profile": str(self.rf_calculation_profile),
+            "enable_adaptive_grid": bool(self.enable_adaptive_rf_grid),
+            "coarse_resolution_m": float(self.adaptive_coarse_resolution_m),
+            "gradient_threshold_db_per_m": float(self.adaptive_gradient_threshold_db_per_m),
+            "threshold_margin_db": float(self.adaptive_threshold_margin_db),
+            "geometry_buffer_m": float(self.adaptive_geometry_buffer_m),
+            "ap_refine_radius_m": float(self.adaptive_ap_refine_radius_m),
+            "enable_per_ap_cache": bool(self.enable_per_ap_heatmap_cache),
+            "per_ap_cache_entries": int(self.per_ap_heatmap_cache_entries),
+            "per_ap_cache_mb": int(self.per_ap_heatmap_cache_mb),
+            "reuse_path_geometry_across_frequencies": bool(self.reuse_path_geometry_across_frequencies),
+            "precompute_reflection_candidates_per_tile": bool(self.precompute_reflection_candidates_per_tile),
+            "enable_tile_influence_pruning": bool(self.enable_tile_influence_pruning),
+            "tile_influence_margin_db": float(self.tile_influence_margin_db),
+            "enable_tile_local_geometry": bool(self.enable_tile_local_geometry),
+            "multipath_relative_power_cutoff_db": float(self.multipath_relative_power_cutoff_db),
+            "enable_numba_kernels": bool(self.enable_numba_rf_kernels),
+            "use_shared_memory_results": bool(self.use_shared_memory_rf_results),
+            "progressive_heatmap_updates": bool(self.progressive_heatmap_updates),
+            "progressive_update_percent": int(self.progressive_update_percent),
+            "heatmap_render_mode": str(self.heatmap_render_mode),
+            "interactive_preview_enabled": bool(self.interactive_preview_enabled),
+            "interactive_preview_delay_ms": int(self.interactive_preview_delay_ms),
+            "interactive_preview_resolution_m": float(self.interactive_preview_resolution_m),
+        }
+
     def propagation_model_dict(self) -> Dict[str, object]:
         return {
+            "ignore_results_outside_planner_boundaries": bool(self.ignore_results_outside_planner_boundaries),
             "enable_multipath_reflections": bool(self.enable_multipath_reflections),
             "max_reflection_order": int(self.max_reflection_order),
             "max_reflection_surfaces": int(self.max_reflection_surfaces),
@@ -1222,9 +1357,42 @@ class HeatmapSettings:
             },
         }
 
+    def apply_performance_model_dict(self, data: Optional[Dict[str, object]]):
+        if not isinstance(data, dict):
+            return
+        profile = str(data.get("calculation_profile", self.rf_calculation_profile)).strip().lower()
+        self.rf_calculation_profile = profile if profile in {"fast", "balanced", "detailed"} else "balanced"
+        self.enable_adaptive_rf_grid = bool(data.get("enable_adaptive_grid", self.enable_adaptive_rf_grid))
+        self.adaptive_coarse_resolution_m = max(0.25, float(data.get("coarse_resolution_m", self.adaptive_coarse_resolution_m)))
+        self.adaptive_gradient_threshold_db_per_m = max(0.05, float(data.get("gradient_threshold_db_per_m", self.adaptive_gradient_threshold_db_per_m)))
+        self.adaptive_threshold_margin_db = max(0.1, float(data.get("threshold_margin_db", self.adaptive_threshold_margin_db)))
+        self.adaptive_geometry_buffer_m = max(0.0, float(data.get("geometry_buffer_m", self.adaptive_geometry_buffer_m)))
+        self.adaptive_ap_refine_radius_m = max(0.5, float(data.get("ap_refine_radius_m", self.adaptive_ap_refine_radius_m)))
+        self.enable_per_ap_heatmap_cache = bool(data.get("enable_per_ap_cache", self.enable_per_ap_heatmap_cache))
+        self.per_ap_heatmap_cache_entries = max(1, int(data.get("per_ap_cache_entries", self.per_ap_heatmap_cache_entries)))
+        self.per_ap_heatmap_cache_mb = max(32, int(data.get("per_ap_cache_mb", self.per_ap_heatmap_cache_mb)))
+        self.reuse_path_geometry_across_frequencies = bool(data.get("reuse_path_geometry_across_frequencies", self.reuse_path_geometry_across_frequencies))
+        self.precompute_reflection_candidates_per_tile = bool(data.get("precompute_reflection_candidates_per_tile", self.precompute_reflection_candidates_per_tile))
+        self.enable_tile_influence_pruning = bool(data.get("enable_tile_influence_pruning", self.enable_tile_influence_pruning))
+        self.tile_influence_margin_db = max(0.0, float(data.get("tile_influence_margin_db", self.tile_influence_margin_db)))
+        self.enable_tile_local_geometry = bool(data.get("enable_tile_local_geometry", self.enable_tile_local_geometry))
+        self.multipath_relative_power_cutoff_db = max(0.0, min(80.0, float(data.get("multipath_relative_power_cutoff_db", self.multipath_relative_power_cutoff_db))))
+        self.enable_numba_rf_kernels = bool(data.get("enable_numba_kernels", self.enable_numba_rf_kernels))
+        self.use_shared_memory_rf_results = bool(data.get("use_shared_memory_results", self.use_shared_memory_rf_results))
+        self.progressive_heatmap_updates = bool(data.get("progressive_heatmap_updates", self.progressive_heatmap_updates))
+        self.progressive_update_percent = max(5, min(100, int(data.get("progressive_update_percent", self.progressive_update_percent))))
+        render_mode = str(data.get("heatmap_render_mode", self.heatmap_render_mode)).strip().lower()
+        self.heatmap_render_mode = render_mode if render_mode in {"raster", "raster_contours", "contours"} else "raster_contours"
+        self.interactive_preview_enabled = bool(data.get("interactive_preview_enabled", self.interactive_preview_enabled))
+        self.interactive_preview_delay_ms = max(50, int(data.get("interactive_preview_delay_ms", self.interactive_preview_delay_ms)))
+        self.interactive_preview_resolution_m = max(0.25, float(data.get("interactive_preview_resolution_m", self.interactive_preview_resolution_m)))
+
     def apply_propagation_model_dict(self, data: Optional[Dict[str, object]]):
         if not isinstance(data, dict):
             return
+        self.ignore_results_outside_planner_boundaries = bool(
+            data.get("ignore_results_outside_planner_boundaries", self.ignore_results_outside_planner_boundaries)
+        )
         self.enable_multipath_reflections = bool(data.get("enable_multipath_reflections", self.enable_multipath_reflections))
         self.max_reflection_order = max(0, min(3, int(data.get("max_reflection_order", self.max_reflection_order))))
         self.max_reflection_surfaces = max(1, min(24, int(data.get("max_reflection_surfaces", self.max_reflection_surfaces))))
@@ -2185,6 +2353,84 @@ class RFEngine:
         return d_3d <= radius
 
     @staticmethod
+    def _link_geometry_key(x: float, y: float, receiver_floor: FloorModel, ap: AccessPoint) -> tuple:
+        return (
+            str(ap.name), str(ap.floor), round(float(ap.x), 6), round(float(ap.y), 6),
+            round(float(ap.mount_height_m), 4), round(float(ap.rx_height_m), 4),
+            round(float(ap.azimuth_deg), 3), round(float(ap.downtilt_deg), 3),
+            str(receiver_floor.name), round(float(x), 6), round(float(y), 6),
+        )
+
+    @staticmethod
+    def _direct_link_geometry(
+        x: float,
+        y: float,
+        receiver_floor: FloorModel,
+        ap: AccessPoint,
+        floors: Dict[str, FloorModel],
+        include_inter_floor: bool,
+        wall_indexes=None,
+        opening_indexes=None,
+        geometry_cache: Optional[Dict[object, object]] = None,
+    ) -> Optional[Dict[str, object]]:
+        key = ("direct",) + RFEngine._link_geometry_key(x, y, receiver_floor, ap)
+        if geometry_cache is not None and key in geometry_cache:
+            return geometry_cache[key]
+        ap_floor = floors.get(ap.floor)
+        if ap_floor is None or (ap.floor != receiver_floor.name and not include_inter_floor):
+            return None
+        horizontal_d = max(math.hypot(float(x) - ap.x, float(y) - ap.y), 0.1)
+        ap_z = float(ap_floor.elevation) + float(ap.mount_height_m)
+        rx_z = float(receiver_floor.elevation) + float(ap.rx_height_m)
+        d_3d = max(math.hypot(horizontal_d, ap_z - rx_z), 1.0)
+        bearing = math.degrees(math.atan2(float(y) - ap.y, float(x) - ap.x))
+        elev_angle = math.degrees(math.atan2(rx_z - ap_z, horizontal_d))
+        line = LineString([(ap.x, ap.y), (float(x), float(y))])
+        crossed_walls: List[Wall2D] = []
+        crossed_elements: List[IFCElement2D] = []
+        crossed_slabs: List[IFCElement2D] = []
+        checked_walls = set(); checked_elements = set()
+        for path_floor in RFEngine.floors_between_inclusive(receiver_floor, ap_floor, floors):
+            active_openings: List[IFCElement2D] = []
+            for element in RFEngine._openings_intersecting_line(path_floor, line, opening_indexes):
+                element_key = RFEngine._element_identity(element)
+                if element_key in checked_elements or not element.polygon.intersects(line):
+                    continue
+                if not RFEngine._element_intersects_3d_path(element, line, ap_z, rx_z):
+                    continue
+                checked_elements.add(element_key)
+                category = str(getattr(element, "rf_category", "other") or "other").lower()
+                if category in {"door", "window"}:
+                    active_openings.append(element); crossed_elements.append(element)
+                elif category in {"slab", "roof"}:
+                    crossed_slabs.append(element)
+                else:
+                    crossed_elements.append(element)
+            for wall in RFEngine._walls_intersecting_line(path_floor, line, wall_indexes):
+                wall_key = RFEngine._wall_identity(wall)
+                if wall_key in checked_walls or not wall.polygon.intersects(line):
+                    continue
+                if any(RFEngine._opening_replaces_wall(opening, wall) for opening in active_openings):
+                    continue
+                crossed_walls.append(wall); checked_walls.add(wall_key)
+        geometry = {
+            "ap_floor": ap_floor,
+            "horizontal_d": horizontal_d,
+            "ap_z": ap_z,
+            "rx_z": rx_z,
+            "distance_3d": d_3d,
+            "bearing": bearing,
+            "elevation": elev_angle,
+            "line": line,
+            "walls": tuple(crossed_walls),
+            "elements": tuple(crossed_elements),
+            "slabs": tuple(crossed_slabs),
+        }
+        if geometry_cache is not None:
+            geometry_cache[key] = geometry
+        return geometry
+
+    @staticmethod
     def rssi_at(
         x: float,
         y: float,
@@ -2195,86 +2441,39 @@ class RFEngine:
         radio: Optional[APRadio] = None,
         include_inter_floor: bool = True,
         heatmap_settings: Optional[HeatmapSettings] = None,
-        wall_indexes: Optional[Dict[str, Tuple[object, List[Wall2D], Dict[int, Wall2D]]]] = None,
-        opening_indexes: Optional[Dict[str, Tuple[object, List[IFCElement2D], Dict[int, IFCElement2D]]]] = None,
+        wall_indexes=None,
+        opening_indexes=None,
+        geometry_cache: Optional[Dict[object, object]] = None,
     ) -> float:
-        """Calculate RSSI at a receiver point on receiver_floor.
-
-        This is a 3D link-budget approximation. For same-floor links it behaves
-        like the original model. For inter-floor links it adds:
-        - vertical separation between AP mounting height and receiver height;
-        - floor/slab penetration loss for every storey boundary crossed;
-        - wall intersections on both the AP floor and receiver floor.
-        """
+        """Calculate direct 3D RSSI while reusing frequency-independent link geometry."""
         radio = radio or ap.active_radios()[0]
-        ap_floor = floors.get(ap.floor)
-        if ap_floor is None:
-            return -120.0
         disconnected = float(getattr(heatmap_settings, "disconnected_rssi_dbm", -120.0) if heatmap_settings else -120.0)
-        if ap.floor != receiver_floor.name and not include_inter_floor:
-            return disconnected
         if not RFEngine.point_is_inside_radio_cutoff(x, y, receiver_floor, ap, floors, radio, heatmap_settings):
             return disconnected
-
-        horizontal_d = max(math.hypot(x - ap.x, y - ap.y), 0.1)
-        ap_z = float(ap_floor.elevation) + float(ap.mount_height_m)
-        rx_z = float(receiver_floor.elevation) + float(ap.rx_height_m)
-        dz = ap_z - rx_z
-        d_3d = max(math.hypot(horizontal_d, dz), 1.0)
+        geometry = RFEngine._direct_link_geometry(
+            x, y, receiver_floor, ap, floors, include_inter_floor,
+            wall_indexes, opening_indexes, geometry_cache,
+        )
+        if geometry is None:
+            return disconnected
         reference_loss = RFEngine.free_space_loss_db_at_1m(radio.frequency_mhz)
-        path_loss = reference_loss + 10.0 * ap.path_loss_exponent * math.log10(d_3d)
-
-        bearing = math.degrees(math.atan2(y - ap.y, x - ap.x))
-        az_rel = AntennaPattern._wrap_deg(bearing - ap.azimuth_deg)
-        elev_angle = math.degrees(math.atan2((rx_z - ap_z), horizontal_d))
-        elev_rel = elev_angle + ap.downtilt_deg
+        path_loss = reference_loss + 10.0 * ap.path_loss_exponent * math.log10(float(geometry["distance_3d"]))
+        az_rel = AntennaPattern._wrap_deg(float(geometry["bearing"]) - ap.azimuth_deg)
+        elev_rel = float(geometry["elevation"]) + ap.downtilt_deg
         pattern_gain = 0.0
         if patterns:
             pattern = patterns.get(radio.antenna_pattern)
             if pattern:
                 pattern_gain = pattern.gain_dbi(az_rel, elev_rel)
-
-        line = LineString([(ap.x, ap.y), (x, y)])
-        wall_loss = 0.0
-        element_loss = 0.0
-        checked_wall_guids = set()
-        checked_element_guids = set()
-        crossed_slabs: List[IFCElement2D] = []
-        # Include walls and every active IFC barrier on each floor crossed by the
-        # 3D path. Doors/windows replace their host wall. Other elements add loss
-        # only when the path height intersects their actual vertical extent.
-        for path_floor in RFEngine.floors_between_inclusive(receiver_floor, ap_floor, floors):
-            active_openings: List[IFCElement2D] = []
-            for element in RFEngine._openings_intersecting_line(path_floor, line, opening_indexes):
-                element_key = element.guid or f"{element.source_file}:{element.name}:{element.z_min:.3f}:{element.z_max:.3f}"
-                if element_key in checked_element_guids:
-                    continue
-                if not element.polygon.intersects(line):
-                    continue
-                if not RFEngine._element_intersects_3d_path(element, line, ap_z, rx_z):
-                    continue
-                checked_element_guids.add(element_key)
-                if element.rf_category in {"door", "window"}:
-                    active_openings.append(element)
-                    element_loss += element.attenuation_db_for_frequency(radio.frequency_mhz)
-                elif element.rf_category in {"slab", "roof"}:
-                    crossed_slabs.append(element)
-                else:
-                    element_loss += element.attenuation_db_for_frequency(radio.frequency_mhz)
-
-            for wall in RFEngine._walls_intersecting_line(path_floor, line, wall_indexes):
-                wall_key = wall.guid or f"{wall.source_file}:{wall.name}:{wall.z_min:.3f}:{wall.z_max:.3f}"
-                if wall_key in checked_wall_guids or not wall.polygon.intersects(line):
-                    continue
-                if any(RFEngine._opening_replaces_wall(opening, wall) for opening in active_openings):
-                    continue
-                wall_loss += wall.attenuation_db_for_frequency(radio.frequency_mhz)
-                checked_wall_guids.add(wall_key)
-
+        wall_loss = sum(wall.attenuation_db_for_frequency(radio.frequency_mhz) for wall in geometry["walls"])
+        element_loss = sum(element.attenuation_db_for_frequency(radio.frequency_mhz) for element in geometry["elements"])
         floor_loss = RFEngine.floor_penetration_loss_db(
-            receiver_floor, ap_floor, floors, radio.frequency_mhz, crossed_slabs
+            receiver_floor, geometry["ap_floor"], floors, radio.frequency_mhz, list(geometry["slabs"])
         )
-        return radio.tx_power_dbm + pattern_gain + float(getattr(radio, "antenna_gain_dbi", 0.0) or 0.0) - path_loss - wall_loss - element_loss - floor_loss
+        return (
+            radio.tx_power_dbm + pattern_gain + float(getattr(radio, "antenna_gain_dbi", 0.0) or 0.0)
+            - path_loss - wall_loss - element_loss - floor_loss
+        )
 
     @staticmethod
     def _wall_identity(wall: Wall2D) -> str:
@@ -2506,6 +2705,9 @@ class RFEngine:
         wall_indexes: Optional[Dict[str, Tuple[object, List[Wall2D], Dict[int, Wall2D]]]] = None,
         opening_indexes: Optional[Dict[str, Tuple[object, List[IFCElement2D], Dict[int, IFCElement2D]]]] = None,
         reflection_indexes: Optional[Dict[str, ReflectionIndex]] = None,
+        geometry_cache: Optional[Dict[object, object]] = None,
+        reflection_index_override: Optional[ReflectionIndex] = None,
+        reflection_sequences_override: Optional[Sequence[Sequence[ReflectionSurface]]] = None,
     ) -> PropagationSample:
         radio = radio or ap.active_radios()[0]
         disconnected = float(getattr(heatmap_settings, "disconnected_rssi_dbm", -120.0) if heatmap_settings else -120.0)
@@ -2530,6 +2732,7 @@ class RFEngine:
             heatmap_settings,
             wall_indexes,
             opening_indexes,
+            geometry_cache,
         )
         source = (float(ap.x), float(ap.y))
         receiver = (float(x), float(y))
@@ -2545,24 +2748,40 @@ class RFEngine:
         )]
 
         same_floor = ap_floor.name == receiver_floor.name
-        index = (reflection_indexes or {}).get(receiver_floor.name)
+        index = reflection_index_override or (reflection_indexes or {}).get(receiver_floor.name)
         material_profiles = getattr(heatmap_settings, "reflection_material_properties", {}) or {}
         reference_loss = RFEngine.free_space_loss_db_at_1m(float(radio.frequency_mhz))
         radio_gain = float(getattr(radio, "antenna_gain_dbi", 0.0) or 0.0)
         if same_floor and index is not None and heatmap_settings is not None:
             if bool(getattr(heatmap_settings, "enable_multipath_reflections", False)):
-                reflected_paths = generate_reflection_paths(
-                    source,
-                    receiver,
-                    index,
-                    radio.frequency_mhz,
-                    material_profiles,
+                geometry_key = (
+                    "reflections", id(index), id(reflection_sequences_override),
                     int(getattr(heatmap_settings, "max_reflection_order", 1)),
                     int(getattr(heatmap_settings, "max_reflection_surfaces", 6)),
                     int(getattr(heatmap_settings, "max_reflection_paths", 8)),
-                    float(getattr(heatmap_settings, "reflection_search_radius_m", 18.0)),
-                    float(getattr(heatmap_settings, "minimum_reflection_coefficient", 0.025)),
-                )
+                    round(float(getattr(heatmap_settings, "reflection_search_radius_m", 18.0)), 3),
+                ) + RFEngine._link_geometry_key(x, y, receiver_floor, ap)
+                reflected_geometries = geometry_cache.get(geometry_key) if geometry_cache is not None else None
+                if reflected_geometries is None:
+                    reflected_geometries = generate_reflection_geometries(
+                        source, receiver, index,
+                        int(getattr(heatmap_settings, "max_reflection_order", 1)),
+                        int(getattr(heatmap_settings, "max_reflection_surfaces", 6)),
+                        int(getattr(heatmap_settings, "max_reflection_paths", 8)),
+                        float(getattr(heatmap_settings, "reflection_search_radius_m", 18.0)),
+                        reflection_sequences_override,
+                    )
+                    if geometry_cache is not None:
+                        geometry_cache[geometry_key] = reflected_geometries
+                reflected_paths = [
+                    ray for ray in (
+                        evaluate_reflection_geometry(
+                            geometry, radio.frequency_mhz, material_profiles,
+                            float(getattr(heatmap_settings, "minimum_reflection_coefficient", 0.025)),
+                        )
+                        for geometry in reflected_geometries
+                    ) if ray is not None
+                ]
                 for ray in reflected_paths:
                     horizontal_length = max(0.1, float(ray.length_m))
                     distance_3d = max(1.0, math.hypot(horizontal_length, ap_z - rx_z))
@@ -2606,20 +2825,39 @@ class RFEngine:
                     ))
 
             if bool(getattr(heatmap_settings, "enable_corner_diffraction", False)):
-                blocked_ids = RFEngine._direct_blocking_object_ids(
-                    source, receiver, receiver_floor, ap_z, rx_z, wall_indexes
-                )
-                if blocked_ids:
-                    diffracted_paths = generate_diffraction_paths(
-                        source,
-                        receiver,
-                        index,
-                        radio.frequency_mhz,
-                        int(getattr(heatmap_settings, "max_diffraction_paths", 3)),
-                        float(getattr(heatmap_settings, "diffraction_search_radius_m", 5.0)),
-                        float(getattr(heatmap_settings, "minimum_diffraction_loss_db", 6.0)),
-                        blocked_ids,
+                blocked_key = (
+                    "direct_blockers", id(wall_indexes),
+                ) + RFEngine._link_geometry_key(x, y, receiver_floor, ap)
+                blocked_ids = geometry_cache.get(blocked_key) if geometry_cache is not None else None
+                if blocked_ids is None:
+                    blocked_ids = RFEngine._direct_blocking_object_ids(
+                        source, receiver, receiver_floor, ap_z, rx_z, wall_indexes
                     )
+                    if geometry_cache is not None:
+                        geometry_cache[blocked_key] = blocked_ids
+                if blocked_ids:
+                    diffraction_key = (
+                        "diffraction", id(index), tuple(sorted(blocked_ids)),
+                        int(getattr(heatmap_settings, "max_diffraction_paths", 3)),
+                        round(float(getattr(heatmap_settings, "diffraction_search_radius_m", 5.0)), 3),
+                    ) + RFEngine._link_geometry_key(x, y, receiver_floor, ap)
+                    diffraction_geometries = geometry_cache.get(diffraction_key) if geometry_cache is not None else None
+                    if diffraction_geometries is None:
+                        diffraction_geometries = generate_diffraction_geometries(
+                            source, receiver, index,
+                            int(getattr(heatmap_settings, "max_diffraction_paths", 3)),
+                            float(getattr(heatmap_settings, "diffraction_search_radius_m", 5.0)),
+                            blocked_ids,
+                        )
+                        if geometry_cache is not None:
+                            geometry_cache[diffraction_key] = diffraction_geometries
+                    diffracted_paths = [
+                        evaluate_diffraction_geometry(
+                            geometry, radio.frequency_mhz,
+                            float(getattr(heatmap_settings, "minimum_diffraction_loss_db", 6.0)),
+                        )
+                        for geometry in diffraction_geometries
+                    ]
                     for ray in diffracted_paths:
                         horizontal_length = max(0.1, float(ray.length_m))
                         distance_3d = max(1.0, math.hypot(horizontal_length, ap_z - rx_z))
@@ -2659,11 +2897,23 @@ class RFEngine:
                             kind=ray.kind,
                         ))
 
-        combined_rssi = (
-            float(path_powers[0].power_dbm)
-            if len(path_powers) == 1
-            else coherent_power_dbm(path_powers, disconnected)
-        )
+        relative_cutoff = float(getattr(heatmap_settings, "multipath_relative_power_cutoff_db", 30.0) or 30.0) if heatmap_settings is not None else 30.0
+        if len(path_powers) > 1 and relative_cutoff >= 0.0:
+            strongest_power = max(path.power_dbm for path in path_powers)
+            retained = [path for path in path_powers if path.kind == "direct" or path.power_dbm >= strongest_power - relative_cutoff]
+            path_powers = sorted(retained, key=lambda path: path.power_dbm, reverse=True)[: max(1, int(getattr(heatmap_settings, "max_reflection_paths", 8)) + int(getattr(heatmap_settings, "max_diffraction_paths", 3)) + 1)]
+
+        if len(path_powers) == 1:
+            combined_rssi = float(path_powers[0].power_dbm)
+            compiled_delay_spread = 0.0
+        else:
+            combined_rssi, compiled_delay_spread = coherent_path_metrics(
+                [path.power_dbm for path in path_powers],
+                [path.phase_rad for path in path_powers],
+                [path.length_m for path in path_powers],
+                disconnected,
+                bool(getattr(heatmap_settings, "enable_numba_rf_kernels", True)) if heatmap_settings is not None else True,
+            )
         if heatmap_settings is not None and bool(getattr(heatmap_settings, "enable_small_scale_fading", False)):
             combined_rssi += deterministic_spatial_fading_db(
                 x,
@@ -2675,7 +2925,7 @@ class RFEngine:
             )
         combined_rssi = max(disconnected, float(combined_rssi))
         delay_spread = (
-            rms_delay_spread_ns(path_powers)
+            compiled_delay_spread
             if heatmap_settings is not None and bool(getattr(heatmap_settings, "calculate_delay_spread", True))
             else 0.0
         )
@@ -2936,6 +3186,50 @@ class RFEngine:
             return False
 
     @staticmethod
+    def _boundary_mask(
+        xs: np.ndarray,
+        ys: np.ndarray,
+        boundary_geometry,
+    ) -> Optional[np.ndarray]:
+        """Return a boolean grid mask for points covered by the calculation boundary."""
+        if boundary_geometry is None:
+            return None
+        try:
+            geometry = boundary_geometry
+            if geometry.is_empty:
+                return None
+            if not geometry.is_valid:
+                geometry = geometry.buffer(0)
+            if geometry.is_empty:
+                return None
+            xs_array = np.asarray(xs, dtype=float)
+            ys_array = np.asarray(ys, dtype=float)
+            if shapely_intersects_xy is not None:
+                try:
+                    xx, yy = np.meshgrid(xs_array, ys_array)
+                    return np.asarray(shapely_intersects_xy(geometry, xx, yy), dtype=bool)
+                except Exception:
+                    pass
+
+            mask = np.zeros((len(ys_array), len(xs_array)), dtype=bool)
+            prepared = prepare_geometry(geometry)
+            minx, miny, maxx, maxy = geometry.bounds
+            x_candidates = [
+                (index, float(value)) for index, value in enumerate(xs_array)
+                if minx - 1e-9 <= float(value) <= maxx + 1e-9
+            ]
+            for iy, y_value in enumerate(ys_array):
+                y_float = float(y_value)
+                if y_float < miny - 1e-9 or y_float > maxy + 1e-9:
+                    continue
+                for ix, x_float in x_candidates:
+                    if prepared.covers(Point(x_float, y_float)):
+                        mask[iy, ix] = True
+            return mask
+        except Exception:
+            return None
+
+    @staticmethod
     def _adaptive_rf_tile_rows(
         row_count: int,
         process_count: int,
@@ -2948,12 +3242,651 @@ class RFEngine:
         tiles_per_worker = max(1, int(getattr(heatmap_settings, "rf_tiles_per_worker", 2) or 2))
         desired_jobs = min(row_count, process_count * tiles_per_worker)
         adaptive = max(1, int(math.ceil(row_count / max(1, desired_jobs))))
-        # Large models benefit from the configured minimum strip size because
-        # each job serialises the model once. Small models still create enough
-        # jobs to engage every available worker.
         if row_count >= process_count * preferred:
             return max(preferred, adaptive)
         return max(1, int(math.ceil(row_count / process_count)))
+
+    @staticmethod
+    def _profiled_settings(
+        settings: Optional[HeatmapSettings],
+        profile_override: Optional[str] = None,
+    ) -> Optional[HeatmapSettings]:
+        if settings is None:
+            return None
+        profiled = replace(settings)
+        profile = str(profile_override or getattr(settings, "rf_calculation_profile", "balanced")).strip().lower()
+        if profile not in {"fast", "balanced", "detailed"}:
+            profile = "balanced"
+        profiled.rf_calculation_profile = profile
+        if profile == "fast":
+            profiled.enable_adaptive_rf_grid = True
+            profiled.max_reflection_order = min(1, int(profiled.max_reflection_order))
+            profiled.max_reflection_surfaces = min(4, int(profiled.max_reflection_surfaces))
+            profiled.max_reflection_paths = min(4, int(profiled.max_reflection_paths))
+            profiled.max_diffraction_paths = min(1, int(profiled.max_diffraction_paths))
+            profiled.adaptive_ap_refine_radius_m = min(4.0, float(profiled.adaptive_ap_refine_radius_m))
+            profiled.adaptive_geometry_buffer_m = min(0.5, float(profiled.adaptive_geometry_buffer_m))
+            profiled.adaptive_threshold_margin_db = min(1.5, float(profiled.adaptive_threshold_margin_db))
+            profiled.adaptive_gradient_threshold_db_per_m = max(6.0, float(profiled.adaptive_gradient_threshold_db_per_m))
+            profiled.enable_small_scale_fading = False
+            profiled.calculate_delay_spread = False
+            profiled.multipath_relative_power_cutoff_db = min(20.0, float(profiled.multipath_relative_power_cutoff_db))
+            profiled.heatmap_render_mode = "raster"
+        elif profile == "balanced":
+            profiled.max_reflection_order = min(2, int(profiled.max_reflection_order))
+            profiled.max_diffraction_paths = min(2, int(profiled.max_diffraction_paths))
+            profiled.multipath_relative_power_cutoff_db = min(30.0, float(profiled.multipath_relative_power_cutoff_db))
+        else:
+            # Detailed mode deliberately evaluates the complete uniform grid.
+            profiled.enable_adaptive_rf_grid = False
+        return profiled
+
+    @staticmethod
+    def _grid_for_floor(
+        floor: FloorModel,
+        aps: List[AccessPoint],
+        resolution_m: float,
+        calculation_boundary=None,
+    ) -> Tuple[np.ndarray, np.ndarray, object]:
+        minx, miny, maxx, maxy = RFEngine._floor_bounds(floor, aps)
+        boundary = calculation_boundary
+        if boundary is not None:
+            try:
+                if not boundary.is_valid:
+                    boundary = boundary.buffer(0)
+                if boundary.is_empty:
+                    boundary = None
+                else:
+                    minx, miny, maxx, maxy = boundary.bounds
+            except Exception:
+                boundary = None
+        resolution = max(0.05, float(resolution_m))
+        xs = np.arange(minx, maxx + resolution * 0.5, resolution, dtype=float)
+        ys = np.arange(miny, maxy + resolution * 0.5, resolution, dtype=float)
+        if len(xs) < 2:
+            xs = np.asarray([minx, max(maxx, minx + resolution)], dtype=float)
+        if len(ys) < 2:
+            ys = np.asarray([miny, max(maxy, miny + resolution)], dtype=float)
+        return xs, ys, boundary
+
+    @staticmethod
+    def _geometry_revision(floors: Dict[str, FloorModel]) -> str:
+        records = []
+        for floor_name, model in sorted(floors.items()):
+            objects = []
+            for category, collection in (
+                ("w", getattr(model, "walls", []) or []),
+                ("s", getattr(model, "spaces", []) or []),
+                ("e", getattr(model, "elements", []) or []),
+            ):
+                for obj in collection:
+                    polygon = getattr(obj, "polygon", None)
+                    try:
+                        bounds = tuple(round(float(value), 4) for value in polygon.bounds)
+                        area = round(float(polygon.area), 4)
+                    except Exception:
+                        bounds = (); area = 0.0
+                    attenuation = tuple(sorted(
+                        (round(float(key), 3), round(float(value), 4))
+                        for key, value in dict(getattr(obj, "attenuation_by_band_db", {}) or {}).items()
+                    ))
+                    objects.append((
+                        category, str(getattr(obj, "guid", "")), str(getattr(obj, "rf_type_override", "")),
+                        bounds, area, round(float(getattr(obj, "z_min", 0.0)), 3),
+                        round(float(getattr(obj, "z_max", 0.0)), 3), attenuation,
+                    ))
+            records.append((floor_name, round(float(model.elevation), 4), tuple(objects), tuple(sorted(model.slab_attenuation_by_band_db.items()))))
+        return stable_digest(records)
+
+    @staticmethod
+    def _settings_revision(settings: Optional[HeatmapSettings]) -> str:
+        if settings is None:
+            return "none"
+        return stable_digest({
+            "profile": getattr(settings, "rf_calculation_profile", "balanced"),
+            "cutoff": [getattr(settings, "enable_ap_cutoff_zones", True), getattr(settings, "ap_cutoff_radius_by_frequency_m", {})],
+            "reflection": [
+                settings.enable_multipath_reflections, settings.max_reflection_order,
+                settings.max_reflection_surfaces, settings.max_reflection_paths,
+                settings.reflection_search_radius_m, settings.minimum_reflection_coefficient,
+                settings.reflection_material_properties,
+            ],
+            "diffraction": [settings.enable_corner_diffraction, settings.max_diffraction_paths,
+                            settings.diffraction_search_radius_m, settings.minimum_diffraction_loss_db],
+            "fading": [settings.enable_small_scale_fading, settings.small_scale_fading_sigma_db,
+                       settings.fading_correlation_distance_m, settings.fading_seed],
+            "delay": settings.calculate_delay_spread,
+            "combined_ap_mode": getattr(settings, "combined_ap_mode", "strongest"),
+            "disconnected": getattr(settings, "disconnected_rssi_dbm", -120.0),
+            "path_cutoff": getattr(settings, "multipath_relative_power_cutoff_db", 30.0),
+            "adaptive": [
+                getattr(settings, "enable_adaptive_rf_grid", True),
+                getattr(settings, "adaptive_coarse_resolution_m", 3.0),
+                getattr(settings, "adaptive_gradient_threshold_db_per_m", 3.0),
+                getattr(settings, "adaptive_threshold_margin_db", 5.0),
+                getattr(settings, "adaptive_geometry_buffer_m", 1.25),
+                getattr(settings, "adaptive_ap_refine_radius_m", 10.0),
+                getattr(settings, "minimum_client_rssi_dbm", -82.0),
+                getattr(settings, "auto_planner_settings", {}),
+            ],
+            "attenuation_defaults": [
+                getattr(settings, "default_wall_attenuation_by_material_db", {}),
+                getattr(settings, "default_door_attenuation_by_material_db", {}),
+                getattr(settings, "default_window_attenuation_by_material_db", {}),
+                getattr(settings, "default_ifc_element_attenuation_by_type_db", {}),
+                getattr(settings, "default_floor_attenuation_by_frequency_db", {}),
+            ],
+        })
+
+    @staticmethod
+    def _pattern_revision(patterns: Optional[Dict[str, AntennaPattern]]) -> str:
+        records = []
+        for name, pattern in sorted((patterns or {}).items()):
+            records.append((
+                str(name), round(float(getattr(pattern, "peak_gain_dbi", 0.0)), 6),
+                tuple((round(float(a), 6), round(float(g), 6)) for a, g in getattr(pattern, "azimuth_points", []) or []),
+                tuple((round(float(a), 6), round(float(g), 6)) for a, g in getattr(pattern, "elevation_points", []) or []),
+            ))
+        return stable_digest(records)
+
+    @staticmethod
+    def _ap_revision(ap: AccessPoint) -> str:
+        radios = []
+        for radio in ap.active_radios():
+            radios.append((
+                str(radio.name), round(float(radio.frequency_mhz), 6), round(float(radio.tx_power_dbm), 4),
+                round(float(getattr(radio, "antenna_gain_dbi", 0.0) or 0.0), 4), str(radio.antenna_pattern),
+                str(getattr(radio, "channel", "")), round(float(getattr(radio, "cutoff_radius_m", 0.0) or 0.0), 3),
+            ))
+        return stable_digest((
+            ap.name, ap.floor, round(float(ap.x), 5), round(float(ap.y), 5),
+            round(float(ap.mount_height_m), 4), round(float(ap.rx_height_m), 4),
+            round(float(ap.path_loss_exponent), 5), round(float(ap.azimuth_deg), 4),
+            round(float(ap.downtilt_deg), 4), tuple(radios),
+        ))
+
+    @staticmethod
+    def _boundary_revision(boundary) -> str:
+        if boundary is None:
+            return "none"
+        try:
+            return stable_digest((tuple(round(float(v), 5) for v in boundary.bounds), boundary.wkb_hex))
+        except Exception:
+            return stable_digest(str(boundary))
+
+    @staticmethod
+    def _tile_local_indexes(
+        wall_indexes,
+        opening_indexes,
+        floor_names: Iterable[str],
+        envelope,
+    ):
+        """Build compact STRtrees containing only objects in an AP-to-tile envelope."""
+        local_walls = {}
+        local_openings = {}
+        for floor_name in floor_names:
+            indexed = (wall_indexes or {}).get(floor_name)
+            if indexed is not None:
+                tree, walls, by_id = indexed
+                subset = []
+                try:
+                    hits = tree.query(envelope)
+                    for hit in hits:
+                        if isinstance(hit, (int, np.integer)):
+                            idx = int(hit)
+                            if 0 <= idx < len(walls): subset.append(walls[idx])
+                        else:
+                            obj = by_id.get(id(hit))
+                            if obj is not None: subset.append(obj)
+                except Exception:
+                    subset = list(walls)
+                if subset:
+                    polygons = [obj.polygon for obj in subset]
+                    try:
+                        local_walls[floor_name] = (STRtree(polygons), subset, {id(obj.polygon): obj for obj in subset})
+                    except Exception:
+                        pass
+            indexed = (opening_indexes or {}).get(floor_name)
+            if indexed is not None:
+                tree, openings, by_id = indexed
+                subset = []
+                try:
+                    hits = tree.query(envelope)
+                    for hit in hits:
+                        if isinstance(hit, (int, np.integer)):
+                            idx = int(hit)
+                            if 0 <= idx < len(openings): subset.append(openings[idx])
+                        else:
+                            obj = by_id.get(id(hit))
+                            if obj is not None: subset.append(obj)
+                except Exception:
+                    subset = list(openings)
+                if subset:
+                    polygons = [obj.polygon for obj in subset]
+                    try:
+                        local_openings[floor_name] = (STRtree(polygons), subset, {id(obj.polygon): obj for obj in subset})
+                    except Exception:
+                        pass
+        return local_walls or wall_indexes, local_openings or opening_indexes
+
+    @staticmethod
+    def _combine_ap_field_results(
+        fields: List[SimulationResult],
+        settings: Optional[HeatmapSettings],
+        disconnected: float,
+        elapsed: float,
+        cache_hits: int,
+        cache_misses: int,
+    ) -> Optional[SimulationResult]:
+        if not fields:
+            return None
+        stack = np.stack([result.rssi for result in fields], axis=0)
+        finite_stack = np.where(np.isfinite(stack), stack, -np.inf)
+        strongest_index = np.argmax(finite_stack, axis=0)
+        strongest = np.take_along_axis(finite_stack, strongest_index[None, :, :], axis=0)[0]
+        all_invalid = ~np.any(np.isfinite(stack), axis=0)
+        mode = str(getattr(settings, "combined_ap_mode", "strongest") or "strongest").lower()
+        if mode == "power_sum":
+            powers = np.where(np.isfinite(stack), np.power(10.0, stack / 10.0), 0.0)
+            total_power = np.sum(powers, axis=0)
+            rssi = np.full_like(strongest, float(disconnected), dtype=float)
+            positive = total_power > 0.0
+            rssi[positive] = 10.0 * np.log10(total_power[positive])
+        else:
+            rssi = strongest
+        rssi[all_invalid] = np.nan
+        delay_stack = np.stack([
+            result.delay_spread_ns if result.delay_spread_ns is not None else np.zeros_like(result.rssi)
+            for result in fields
+        ], axis=0)
+        delay = np.take_along_axis(delay_stack, strongest_index[None, :, :], axis=0)[0]
+        delay[all_invalid] = np.nan
+        count_stack = np.stack([
+            result.path_count if result.path_count is not None else np.ones_like(result.rssi, dtype=np.int16)
+            for result in fields
+        ], axis=0)
+        if mode == "power_sum":
+            count = np.sum(count_stack.astype(np.int32), axis=0).clip(0, 32767).astype(np.int16)
+        else:
+            count = np.take_along_axis(count_stack, strongest_index[None, :, :], axis=0)[0].astype(np.int16)
+        count[all_invalid] = 0
+        first = fields[0]
+        worker_count = max(int(result.worker_processes) for result in fields)
+        execution_modes = {result.execution_mode for result in fields}
+        execution_mode = "cache" if cache_misses == 0 else ("multiprocess" if "multiprocess" in execution_modes else next(iter(execution_modes)))
+        return SimulationResult(
+            xs=first.xs.copy(), ys=first.ys.copy(), rssi=rssi,
+            delay_spread_ns=delay, path_count=count,
+            valid_mask=None if first.valid_mask is None else first.valid_mask.copy(),
+            boundary_geometry=first.boundary_geometry,
+            ignored_point_count=first.ignored_point_count,
+            execution_mode=execution_mode,
+            worker_processes=worker_count,
+            elapsed_seconds=float(elapsed),
+            performance_note=(
+                f"combined {len(fields)} independently cached AP field(s); "
+                f"{cache_hits} cache hit(s), {cache_misses} recalculated field(s)"
+            ),
+            approximate_points=max(int(result.approximate_points) for result in fields),
+            exact_points=max(int(result.exact_points) for result in fields),
+            cache_hits=cache_hits,
+            cache_misses=cache_misses,
+        )
+
+    @staticmethod
+    def _simulate_groups_uniform(
+        floor: FloorModel,
+        floors: Dict[str, FloorModel],
+        group_aps: Dict[object, List[AccessPoint]],
+        resolution_m: float = 2.0,
+        patterns: Optional[Dict[str, AntennaPattern]] = None,
+        include_inter_floor: bool = True,
+        heatmap_settings: Optional[HeatmapSettings] = None,
+        progress_callback=None,
+        calculation_boundary=None,
+        evaluation_mask: Optional[np.ndarray] = None,
+        grid_override: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+        progressive_callback=None,
+    ) -> Dict[object, SimulationResult]:
+        """Uniform-grid exact evaluator with resident model and shared-memory workers."""
+        started = time.perf_counter()
+        if not floor.walls and not floor.spaces and not getattr(floor, "elements", []):
+            return {}
+        group_aps = {key: list(value) for key, value in group_aps.items() if value}
+        if not group_aps:
+            return {}
+        all_aps = []
+        seen = set()
+        for aps in group_aps.values():
+            for ap in aps:
+                identity = (ap.name, ap.floor, float(ap.x), float(ap.y))
+                if identity not in seen:
+                    seen.add(identity); all_aps.append(ap)
+        if not all_aps:
+            return {}
+        if grid_override is None:
+            xs, ys, calculation_boundary = RFEngine._grid_for_floor(floor, all_aps, resolution_m, calculation_boundary)
+        else:
+            xs = np.asarray(grid_override[0], dtype=float); ys = np.asarray(grid_override[1], dtype=float)
+        boundary_mask = RFEngine._boundary_mask(xs, ys, calculation_boundary)
+        if boundary_mask is not None and not np.any(boundary_mask):
+            return {}
+        if evaluation_mask is None:
+            work_mask = None if boundary_mask is None else boundary_mask.copy()
+        else:
+            work_mask = np.asarray(evaluation_mask, dtype=bool)
+            if work_mask.shape != (len(ys), len(xs)):
+                raise ValueError("Adaptive evaluation mask does not match RF grid")
+            if boundary_mask is not None:
+                work_mask &= boundary_mask
+        disconnected = float(getattr(heatmap_settings, "disconnected_rssi_dbm", -120.0) if heatmap_settings else -120.0)
+        radio_links_by_group = {
+            key: RFEngine._active_radio_links(floor, aps, include_inter_floor)
+            for key, aps in group_aps.items()
+        }
+        radio_links_by_group = {key: links for key, links in radio_links_by_group.items() if links}
+        if not radio_links_by_group:
+            return {}
+        group_aps = {key: group_aps[key] for key in radio_links_by_group}
+        group_order = list(group_aps.keys())
+        rows, cols = len(ys), len(xs)
+        if boundary_mask is None:
+            initial_rssi = np.full((rows, cols), disconnected, dtype=float)
+            initial_delay = np.zeros((rows, cols), dtype=float)
+            ignored = 0
+        else:
+            initial_rssi = np.full((rows, cols), np.nan, dtype=float); initial_rssi[boundary_mask] = disconnected
+            initial_delay = np.full((rows, cols), np.nan, dtype=float); initial_delay[boundary_mask] = 0.0
+            ignored = int(boundary_mask.size - np.count_nonzero(boundary_mask))
+        grids = {key: initial_rssi.copy() for key in group_order}
+        delays = {key: initial_delay.copy() for key in group_order}
+        counts = {key: np.zeros((rows, cols), dtype=np.int16) for key in group_order}
+        exact_point_count = int(np.count_nonzero(work_mask)) if work_mask is not None else rows * cols
+        total_links = sum(len(links) for links in radio_links_by_group.values())
+        work_units = exact_point_count * max(1, total_links)
+        use_mp = bool(getattr(heatmap_settings, "enable_rf_multiprocessing", False)) if heatmap_settings else False
+        threshold = int(getattr(heatmap_settings, "rf_multiprocessing_min_points", 5000) if heatmap_settings else 5000)
+        fallback_note = ""
+
+        if use_mp and work_units >= threshold and rows > 1:
+            requested = int(getattr(heatmap_settings, "max_rf_worker_processes", 0) or 0)
+            process_count = min(_logical_process_count(requested), rows)
+            tile_rows = RFEngine._adaptive_rf_tile_rows(rows, process_count, heatmap_settings)
+            model_key = stable_digest((
+                floor.name, RFEngine._geometry_revision(floors), RFEngine._settings_revision(heatmap_settings),
+                bool(include_inter_floor), RFEngine._pattern_revision(patterns),
+            ))
+            context_path = _rf_get_worker_context_file(
+                model_key, floor, floors, patterns, include_inter_floor, heatmap_settings,
+                max(2, int(getattr(heatmap_settings, "rf_worker_index_cache_entries", 2) or 2)),
+            )
+            worker_cache_entries = max(1, int(getattr(heatmap_settings, "rf_worker_index_cache_entries", 2) or 2))
+            use_shared = bool(getattr(heatmap_settings, "use_shared_memory_rf_results", True))
+            shared_handles = []
+            shared_specs = None
+            try:
+                if use_shared:
+                    rssi_mem, rssi_stack, rssi_spec = create_shared_array((len(group_order), rows, cols), np.float64, np.nan)
+                    delay_mem, delay_stack, delay_spec = create_shared_array((len(group_order), rows, cols), np.float64, np.nan)
+                    count_mem, count_stack, count_spec = create_shared_array((len(group_order), rows, cols), np.int16, 0)
+                    shared_handles = [rssi_mem, delay_mem, count_mem]
+                    shared_specs = (rssi_spec, delay_spec, count_spec)
+                    for group_index in range(len(group_order)):
+                        rssi_stack[group_index, :, :] = initial_rssi
+                        delay_stack[group_index, :, :] = initial_delay
+                else:
+                    rssi_stack = delay_stack = count_stack = None
+                jobs = []
+                for start_index in range(0, rows, tile_rows):
+                    jobs.append((
+                        model_key, context_path, xs, ys[start_index:start_index + tile_rows],
+                        None if work_mask is None else work_mask[start_index:start_index + tile_rows, :],
+                        start_index, disconnected, worker_cache_entries, group_aps, group_order, shared_specs,
+                    ))
+                process_count = min(process_count, max(1, len(jobs)))
+                executor, owned = _get_rf_process_executor(
+                    process_count, bool(getattr(heatmap_settings, "reuse_rf_process_pool", True))
+                )
+                futures = [executor.submit(_rf_grid_multi_tile_worker, job) for job in jobs]
+                completed_rows = 0
+                next_progressive = max(5, int(getattr(heatmap_settings, "progressive_update_percent", 20)))
+                for future in concurrent.futures.as_completed(futures):
+                    start_index, row_count, tile_results = future.result()
+                    if not use_shared and tile_results is not None:
+                        for key, (tile, delay_tile, count_tile) in tile_results.items():
+                            grids[key][start_index:start_index + row_count, :] = tile
+                            delays[key][start_index:start_index + row_count, :] = delay_tile
+                            counts[key][start_index:start_index + row_count, :] = count_tile
+                    completed_rows += int(row_count)
+                    if progress_callback:
+                        progress_callback(min(completed_rows, rows), rows)
+                    percent = int(100.0 * completed_rows / max(1, rows))
+                    if progressive_callback and bool(getattr(heatmap_settings, "progressive_heatmap_updates", True)) and percent >= next_progressive:
+                        if use_shared:
+                            preview = {
+                                key: SimulationResult(
+                                    xs=xs, ys=ys, rssi=rssi_stack[index].copy(),
+                                    delay_spread_ns=delay_stack[index].copy(), path_count=count_stack[index].copy(),
+                                    valid_mask=None if boundary_mask is None else boundary_mask.copy(),
+                                    boundary_geometry=calculation_boundary, ignored_point_count=ignored,
+                                    execution_mode="multiprocess-progressive", worker_processes=process_count,
+                                    progressive_fraction=min(0.99, completed_rows / max(1, rows)),
+                                ) for index, key in enumerate(group_order)
+                            }
+                        else:
+                            preview = {
+                                key: SimulationResult(
+                                    xs=xs, ys=ys, rssi=grids[key].copy(), delay_spread_ns=delays[key].copy(),
+                                    path_count=counts[key].copy(), valid_mask=None if boundary_mask is None else boundary_mask.copy(),
+                                    boundary_geometry=calculation_boundary, ignored_point_count=ignored,
+                                    execution_mode="multiprocess-progressive", worker_processes=process_count,
+                                    progressive_fraction=min(0.99, completed_rows / max(1, rows)),
+                                ) for key in group_order
+                            }
+                        progressive_callback(preview, completed_rows / max(1, rows))
+                        next_progressive += max(5, int(getattr(heatmap_settings, "progressive_update_percent", 20)))
+                if use_shared:
+                    for index, key in enumerate(group_order):
+                        grids[key] = rssi_stack[index].copy()
+                        delays[key] = delay_stack[index].copy()
+                        counts[key] = count_stack[index].copy()
+                elapsed = time.perf_counter() - started
+                note = (
+                    f"resident static model; {len(jobs)} adaptive tile(s); shared-memory outputs "
+                    f"{'enabled' if use_shared else 'disabled'}; frequency-independent path geometry reused"
+                )
+                return {
+                    key: SimulationResult(
+                        xs=xs, ys=ys, rssi=grids[key], delay_spread_ns=delays[key], path_count=counts[key],
+                        valid_mask=None if boundary_mask is None else boundary_mask.copy(),
+                        boundary_geometry=calculation_boundary, ignored_point_count=ignored,
+                        execution_mode="multiprocess", worker_processes=process_count,
+                        elapsed_seconds=elapsed, performance_note=note,
+                        exact_points=exact_point_count,
+                    ) for key in group_order
+                }
+            except Exception as exc:
+                if "cancel" in str(exc).lower():
+                    raise
+                _shutdown_rf_process_executor(wait=False)
+                fallback_note = f"RF multiprocessing failed ({type(exc).__name__}: {exc}); used single-process fallback."
+            finally:
+                for memory in shared_handles:
+                    try: memory.close()
+                    except Exception: pass
+                    try: memory.unlink()
+                    except Exception: pass
+                if 'owned' in locals() and owned and 'executor' in locals():
+                    try: executor.shutdown(wait=True)
+                    except Exception: pass
+
+        wall_indexes = RFEngine._build_wall_indexes(floors)
+        opening_indexes = RFEngine._build_opening_indexes(floors)
+        reflection_indexes = RFEngine._build_reflection_indexes(floors, heatmap_settings)
+        if progress_callback:
+            progress_callback(0, rows)
+        for iy, yy in enumerate(ys):
+            for ix, xx in enumerate(xs):
+                if work_mask is not None and not bool(work_mask[iy, ix]):
+                    continue
+                geometry_cache = {} if bool(getattr(heatmap_settings, "reuse_path_geometry_across_frequencies", True)) else None
+                for key in group_order:
+                    samples = []
+                    for ap, radio in radio_links_by_group[key]:
+                        if RFEngine.point_is_inside_radio_cutoff(xx, yy, floor, ap, floors, radio, heatmap_settings):
+                            samples.append(RFEngine.propagation_at(
+                                float(xx), float(yy), floor, ap, floors, patterns, radio,
+                                include_inter_floor, heatmap_settings, wall_indexes, opening_indexes,
+                                reflection_indexes, geometry_cache,
+                            ))
+                    combined = RFEngine.combine_ap_samples(samples, heatmap_settings, disconnected)
+                    grids[key][iy, ix] = combined.rssi_dbm
+                    delays[key][iy, ix] = combined.delay_spread_ns
+                    counts[key][iy, ix] = max(0, min(32767, int(combined.path_count)))
+            if progress_callback:
+                progress_callback(iy + 1, rows)
+            if progressive_callback and bool(getattr(heatmap_settings, "progressive_heatmap_updates", True)):
+                step = max(1, int(rows * max(5, int(getattr(heatmap_settings, "progressive_update_percent", 20))) / 100.0))
+                if (iy + 1) % step == 0 and iy + 1 < rows:
+                    progressive_callback({
+                        key: SimulationResult(
+                            xs=xs, ys=ys, rssi=grids[key].copy(), delay_spread_ns=delays[key].copy(),
+                            path_count=counts[key].copy(), valid_mask=None if boundary_mask is None else boundary_mask.copy(),
+                            boundary_geometry=calculation_boundary, ignored_point_count=ignored,
+                            execution_mode="single-process-progressive", progressive_fraction=(iy + 1) / rows,
+                        ) for key in group_order
+                    }, (iy + 1) / rows)
+        elapsed = time.perf_counter() - started
+        note = fallback_note or "single-process exact grid; resident geometry and cross-frequency path cache enabled"
+        return {
+            key: SimulationResult(
+                xs=xs, ys=ys, rssi=grids[key], delay_spread_ns=delays[key], path_count=counts[key],
+                valid_mask=None if boundary_mask is None else boundary_mask.copy(),
+                boundary_geometry=calculation_boundary, ignored_point_count=ignored,
+                execution_mode="single-process-fallback" if fallback_note else "single-process",
+                worker_processes=1, elapsed_seconds=elapsed, performance_note=note,
+                exact_points=exact_point_count,
+            ) for key in group_order
+        }
+
+    @staticmethod
+    def _simulate_groups_adaptive(
+        floor: FloorModel,
+        floors: Dict[str, FloorModel],
+        group_aps: Dict[object, List[AccessPoint]],
+        resolution_m: float,
+        patterns,
+        include_inter_floor: bool,
+        heatmap_settings: Optional[HeatmapSettings],
+        progress_callback,
+        calculation_boundary,
+        progressive_callback=None,
+    ) -> Dict[object, SimulationResult]:
+        settings = heatmap_settings
+        coarse_resolution = max(float(resolution_m) * 2.0, float(getattr(settings, "adaptive_coarse_resolution_m", 3.0)))
+        if not bool(getattr(settings, "enable_adaptive_rf_grid", True)) or coarse_resolution <= float(resolution_m) * 1.15:
+            return RFEngine._simulate_groups_uniform(
+                floor, floors, group_aps, resolution_m, patterns, include_inter_floor,
+                settings, progress_callback, calculation_boundary, progressive_callback=progressive_callback,
+            )
+
+        def coarse_progress(done, total):
+            if progress_callback:
+                progress_callback(int(250 * float(done) / max(1, float(total))), 1000)
+        coarse = RFEngine._simulate_groups_uniform(
+            floor, floors, group_aps, coarse_resolution, patterns, include_inter_floor,
+            settings, coarse_progress, calculation_boundary,
+        )
+        if not coarse:
+            return {}
+        all_aps = [ap for aps in group_aps.values() for ap in aps]
+        fine_xs, fine_ys, calculation_boundary = RFEngine._grid_for_floor(floor, all_aps, resolution_m, calculation_boundary)
+        fine_valid = RFEngine._boundary_mask(fine_xs, fine_ys, calculation_boundary)
+        interpolated = {}
+        for key, result in coarse.items():
+            interpolated[key] = SimulationResult(
+                xs=fine_xs, ys=fine_ys,
+                rssi=resample_regular_grid(result.xs, result.ys, result.rssi, fine_xs, fine_ys),
+                delay_spread_ns=resample_regular_grid(result.xs, result.ys, result.delay_spread_ns, fine_xs, fine_ys) if result.delay_spread_ns is not None else None,
+                path_count=nearest_resample_regular_grid(result.xs, result.ys, result.path_count, fine_xs, fine_ys).astype(np.int16) if result.path_count is not None else None,
+                valid_mask=None if fine_valid is None else fine_valid.copy(),
+                boundary_geometry=calculation_boundary, ignored_point_count=0 if fine_valid is None else int(fine_valid.size - np.count_nonzero(fine_valid)),
+                execution_mode="adaptive-coarse", worker_processes=result.worker_processes,
+                progressive_fraction=0.25,
+            )
+        if fine_valid is not None:
+            for result in interpolated.values():
+                result.rssi[~fine_valid] = np.nan
+                if result.delay_spread_ns is not None:
+                    result.delay_spread_ns[~fine_valid] = np.nan
+                if result.path_count is not None:
+                    result.path_count[~fine_valid] = 0
+        if progressive_callback:
+            progressive_callback(interpolated, 0.25)
+        geometry_boxes = []
+        for obj in list(getattr(floor, "walls", []) or []) + list(getattr(floor, "elements", []) or []):
+            try: geometry_boxes.append(tuple(float(v) for v in obj.polygon.bounds))
+            except Exception: pass
+        ap_points = []
+        for ap in all_aps:
+            radii = [RFEngine.cutoff_radius_m_for_radio(radio, settings) for radio in ap.active_radios()]
+            ap_points.append((ap.x, ap.y, max(radii or [0.0])))
+        client_threshold = float(getattr(settings, "minimum_client_rssi_dbm", -82.0))
+        planner_threshold = client_threshold
+        try:
+            planner_threshold = float((getattr(settings, "auto_planner_settings", {}) or {}).get("minimum_rssi_dbm", client_threshold))
+        except Exception:
+            planner_threshold = client_threshold
+        # Adaptive sampling protects engineering decision thresholds rather than every
+        # cosmetic isoline. Detailed/report mode uses the full uniform grid.
+        thresholds = sorted({client_threshold, planner_threshold})
+        stride = max(2, int(round(coarse_resolution / max(float(resolution_m), 1e-6))))
+        refine_mask = adaptive_refinement_mask(
+            fine_xs, fine_ys, [result.rssi for result in interpolated.values()], fine_valid,
+            thresholds, stride,
+            float(getattr(settings, "adaptive_gradient_threshold_db_per_m", 3.0)),
+            float(getattr(settings, "adaptive_threshold_margin_db", 5.0)),
+            geometry_boxes, float(getattr(settings, "adaptive_geometry_buffer_m", 1.25)),
+            ap_points, float(getattr(settings, "adaptive_ap_refine_radius_m", 10.0)),
+        )
+        total_valid = int(np.count_nonzero(fine_valid)) if fine_valid is not None else refine_mask.size
+        exact_points = int(np.count_nonzero(refine_mask))
+
+        def fine_progress(done, total):
+            if progress_callback:
+                progress_callback(250 + int(750 * float(done) / max(1, float(total))), 1000)
+        exact = RFEngine._simulate_groups_uniform(
+            floor, floors, group_aps, resolution_m, patterns, include_inter_floor,
+            settings, fine_progress, calculation_boundary, refine_mask, (fine_xs, fine_ys),
+            progressive_callback=None,
+        )
+        final = {}
+        for key, base in interpolated.items():
+            detailed = exact.get(key)
+            if detailed is None:
+                final[key] = base; continue
+            rssi = base.rssi.copy(); rssi[refine_mask] = detailed.rssi[refine_mask]
+            delay = base.delay_spread_ns.copy() if base.delay_spread_ns is not None else np.zeros_like(rssi)
+            if detailed.delay_spread_ns is not None: delay[refine_mask] = detailed.delay_spread_ns[refine_mask]
+            count = base.path_count.copy() if base.path_count is not None else np.zeros_like(rssi, dtype=np.int16)
+            if detailed.path_count is not None: count[refine_mask] = detailed.path_count[refine_mask]
+            if fine_valid is not None:
+                rssi[~fine_valid] = np.nan; delay[~fine_valid] = np.nan; count[~fine_valid] = 0
+            final[key] = SimulationResult(
+                xs=fine_xs, ys=fine_ys, rssi=rssi, delay_spread_ns=delay, path_count=count,
+                valid_mask=None if fine_valid is None else fine_valid.copy(), boundary_geometry=calculation_boundary,
+                ignored_point_count=base.ignored_point_count,
+                execution_mode=f"adaptive-{detailed.execution_mode}", worker_processes=detailed.worker_processes,
+                elapsed_seconds=float(base.elapsed_seconds) + float(detailed.elapsed_seconds),
+                performance_note=(
+                    f"adaptive coarse-to-fine grid: {exact_points:,} exact of {total_valid:,} valid points; "
+                    f"{max(0, total_valid - exact_points):,} points interpolated from the coarse pass"
+                ),
+                approximate_points=max(0, total_valid - exact_points), exact_points=exact_points,
+            )
+        if progressive_callback:
+            progressive_callback(final, 1.0)
+        return final
 
     @staticmethod
     def _simulate_groups(
@@ -2965,209 +3898,95 @@ class RFEngine:
         include_inter_floor: bool = True,
         heatmap_settings: Optional[HeatmapSettings] = None,
         progress_callback=None,
+        calculation_boundary=None,
+        progressive_callback=None,
+        profile_override: Optional[str] = None,
     ) -> Dict[object, SimulationResult]:
-        """Calculate one or more radio groups with shared worker setup."""
+        """Incremental per-AP cache around adaptive/exact RF field evaluation."""
         started = time.perf_counter()
-        if not floor.walls and not floor.spaces and not getattr(floor, "elements", []):
-            return {}
-        group_aps = {key: list(value) for key, value in group_aps.items() if value}
+        settings = RFEngine._profiled_settings(heatmap_settings, profile_override)
+        group_aps = {key: list(aps) for key, aps in group_aps.items() if aps}
         if not group_aps:
             return {}
-        all_aps: List[AccessPoint] = []
-        seen_ap_positions = set()
-        for aps in group_aps.values():
-            for ap in aps:
-                identity = (ap.name, ap.floor, float(ap.x), float(ap.y))
-                if identity not in seen_ap_positions:
-                    seen_ap_positions.add(identity)
-                    all_aps.append(ap)
-        if not all_aps:
-            return {}
-
-        bounds = RFEngine._floor_bounds(floor, all_aps)
-        minx, miny, maxx, maxy = bounds
-        resolution_m = max(0.05, float(resolution_m))
-        xs = np.arange(minx, maxx + resolution_m, resolution_m)
-        ys = np.arange(miny, maxy + resolution_m, resolution_m)
-        disconnected = float(getattr(heatmap_settings, "disconnected_rssi_dbm", -120.0) if heatmap_settings else -120.0)
-
-        radio_links_by_group = {
-            key: RFEngine._active_radio_links(floor, aps, include_inter_floor)
-            for key, aps in group_aps.items()
-        }
-        radio_links_by_group = {key: value for key, value in radio_links_by_group.items() if value}
-        if not radio_links_by_group:
-            return {}
-        group_aps = {key: group_aps[key] for key in radio_links_by_group}
-
-        grids = {key: np.full((len(ys), len(xs)), disconnected, dtype=float) for key in group_aps}
-        delay_grids = {key: np.zeros((len(ys), len(xs)), dtype=float) for key in group_aps}
-        path_count_grids = {key: np.zeros((len(ys), len(xs)), dtype=np.int16) for key in group_aps}
-
-        total_points = int(len(xs) * len(ys))
-        total_radio_links = sum(len(value) for value in radio_links_by_group.values())
-        total_work_units = total_points * max(1, total_radio_links)
-        use_mp = bool(getattr(heatmap_settings, "enable_rf_multiprocessing", False)) if heatmap_settings else False
-        min_points = int(getattr(heatmap_settings, "rf_multiprocessing_min_points", 5000) if heatmap_settings else 5000)
-        fallback_note = ""
-
-        if use_mp and total_work_units >= min_points and len(ys) > 1:
-            requested = int(getattr(heatmap_settings, "max_rf_worker_processes", 0) or 0)
-            process_count = min(_logical_process_count(requested), max(1, len(ys)))
-            tile_rows = RFEngine._adaptive_rf_tile_rows(len(ys), process_count, heatmap_settings)
-            context_key = uuid.uuid4().hex
-            context_path = None
-            jobs = []
-            reuse_pool = bool(getattr(heatmap_settings, "reuse_rf_process_pool", True)) if heatmap_settings else True
-            executor = None
-            owned_executor = False
-            futures = []
-            try:
-                context_path = _rf_write_worker_context_file(
-                    floor, floors, group_aps, patterns, include_inter_floor, heatmap_settings
-                )
-                worker_cache_entries = max(1, int(
-                    getattr(heatmap_settings, "rf_worker_index_cache_entries", 1) or 1
-                ))
-                for start_index in range(0, len(ys), tile_rows):
-                    jobs.append((
-                        context_key,
-                        context_path,
-                        xs,
-                        ys[start_index:start_index + tile_rows],
-                        start_index,
-                        disconnected,
-                        worker_cache_entries,
-                    ))
-                process_count = min(process_count, max(1, len(jobs)))
-                executor, owned_executor = _get_rf_process_executor(process_count, reuse_pool)
-                futures = [executor.submit(_rf_grid_multi_tile_worker, job) for job in jobs]
-                completed_units = 0
-                total_progress_units = max(1, len(ys) * len(group_aps))
-                for future in concurrent.futures.as_completed(futures):
-                    start_index, tile_results = future.result()
-                    first_tile = next(iter(tile_results.values()))
-                    row_count = int(first_tile[0].shape[0])
-                    for key, (tile, delay_tile, count_tile) in tile_results.items():
-                        grids[key][start_index:start_index + row_count, :] = tile
-                        delay_grids[key][start_index:start_index + row_count, :] = delay_tile
-                        path_count_grids[key][start_index:start_index + row_count, :] = count_tile
-                    completed_units += row_count * len(group_aps)
-                    if progress_callback:
-                        progress_callback(min(completed_units, total_progress_units), total_progress_units)
-                elapsed = time.perf_counter() - started
-                note = (
-                    f"batched {len(group_aps)} radio group(s) into {len(jobs)} adaptive tile(s); "
-                    f"the model was serialised once and worker geometry indexes were cached per process"
-                )
-                return {
-                    key: SimulationResult(
-                        xs=xs,
-                        ys=ys,
-                        rssi=grids[key],
-                        delay_spread_ns=delay_grids[key],
-                        path_count=path_count_grids[key],
-                        execution_mode="multiprocess",
-                        worker_processes=process_count,
-                        elapsed_seconds=elapsed,
-                        performance_note=note,
-                    )
-                    for key in group_aps
-                }
-            except Exception as exc:
-                for future in futures:
-                    try:
-                        future.cancel()
-                    except Exception:
-                        pass
-                cancelled = "cancel" in str(exc).lower()
-                if owned_executor and executor is not None:
-                    try:
-                        executor.shutdown(wait=False, cancel_futures=True)
-                    except TypeError:
-                        executor.shutdown(wait=False)
-                    except Exception:
-                        pass
-                elif executor is not None:
-                    _shutdown_rf_process_executor(wait=False)
-                if cancelled:
-                    raise
-                fallback_note = (
-                    f"RF multiprocessing failed ({type(exc).__name__}: {exc}). "
-                    "The calculation completed in single-process fallback mode."
-                )
-            finally:
-                if owned_executor and executor is not None:
-                    try:
-                        executor.shutdown(wait=True, cancel_futures=False)
-                    except TypeError:
-                        executor.shutdown(wait=True)
-                    except Exception:
-                        pass
-                if context_path:
-                    try:
-                        os.unlink(context_path)
-                    except Exception:
-                        pass
-
-        if progress_callback:
-            progress_callback(0, max(1, len(ys) * len(group_aps)))
-
-        wall_indexes = RFEngine._build_wall_indexes(floors)
-        opening_indexes = RFEngine._build_opening_indexes(floors)
-        reflection_indexes = RFEngine._build_reflection_indexes(floors, heatmap_settings)
-        completed_units = 0
-        total_progress_units = max(1, len(ys) * len(group_aps))
-        for key, radio_links in radio_links_by_group.items():
-            grid = grids[key]
-            delay_grid = delay_grids[key]
-            path_count_grid = path_count_grids[key]
-            for iy, yy in enumerate(ys):
-                for ix, xx in enumerate(xs):
-                    samples: List[PropagationSample] = []
-                    for ap, radio in radio_links:
-                        if RFEngine.point_is_inside_radio_cutoff(xx, yy, floor, ap, floors, radio, heatmap_settings):
-                            samples.append(RFEngine.propagation_at(
-                                float(xx),
-                                float(yy),
-                                floor,
-                                ap,
-                                floors,
-                                patterns,
-                                radio,
-                                include_inter_floor,
-                                heatmap_settings,
-                                wall_indexes,
-                                opening_indexes,
-                                reflection_indexes,
-                            ))
-                    combined = RFEngine.combine_ap_samples(samples, heatmap_settings, disconnected)
-                    grid[iy, ix] = combined.rssi_dbm
-                    delay_grid[iy, ix] = combined.delay_spread_ns
-                    path_count_grid[iy, ix] = max(0, min(32767, int(combined.path_count)))
-                completed_units += 1
-                if progress_callback:
-                    progress_callback(min(completed_units, total_progress_units), total_progress_units)
-
-        elapsed = time.perf_counter() - started
-        serial_note = fallback_note or (
-            "single-process mode selected because the grid was below the multiprocessing threshold "
-            "or RF multiprocessing was disabled"
-        )
-        return {
-            key: SimulationResult(
-                xs=xs,
-                ys=ys,
-                rssi=grids[key],
-                delay_spread_ns=delay_grids[key],
-                path_count=path_count_grids[key],
-                execution_mode="single-process-fallback" if fallback_note else "single-process",
-                worker_processes=1,
-                elapsed_seconds=elapsed,
-                performance_note=serial_note,
+        use_cache = bool(getattr(settings, "enable_per_ap_heatmap_cache", True))
+        if not use_cache:
+            return RFEngine._simulate_groups_adaptive(
+                floor, floors, group_aps, resolution_m, patterns, include_inter_floor,
+                settings, progress_callback, calculation_boundary, progressive_callback,
             )
-            for key in group_aps
-        }
+        _RF_AP_FIELD_CACHE.configure(
+            int(getattr(settings, "per_ap_heatmap_cache_entries", 192)),
+            int(getattr(settings, "per_ap_heatmap_cache_mb", 768)) * 1024 * 1024,
+        )
+        model_revision = RFEngine._geometry_revision(floors)
+        settings_revision = RFEngine._settings_revision(settings)
+        pattern_revision = RFEngine._pattern_revision(patterns)
+        boundary_revision = RFEngine._boundary_revision(calculation_boundary)
+        cached_by_group: Dict[object, List[SimulationResult]] = {key: [] for key in group_aps}
+        missing_groups = {}
+        missing_cache_keys = {}
+        hits = 0; misses = 0
+        for group_key, aps in group_aps.items():
+            for index, ap in enumerate(aps):
+                cache_key = (
+                    floor.name, model_revision, settings_revision, pattern_revision, boundary_revision,
+                    bool(include_inter_floor), round(float(resolution_m), 5), RFEngine._ap_revision(ap),
+                )
+                cached = _RF_AP_FIELD_CACHE.get(cache_key)
+                if cached is not None:
+                    cached_by_group[group_key].append(cached); hits += 1
+                else:
+                    field_key = ("ap_field", group_key, index, RFEngine._ap_revision(ap))
+                    missing_groups[field_key] = [ap]
+                    missing_cache_keys[field_key] = (group_key, cache_key)
+                    misses += 1
+        if missing_groups:
+            def missing_progress(partial_fields, fraction):
+                if progressive_callback is None or not partial_fields:
+                    return
+                preview_by_group: Dict[object, List[SimulationResult]] = {
+                    key: list(values) for key, values in cached_by_group.items()
+                }
+                for field_key, partial_result in partial_fields.items():
+                    record = missing_cache_keys.get(field_key)
+                    if record is None:
+                        continue
+                    preview_by_group[record[0]].append(partial_result)
+                preview_combined = {}
+                preview_elapsed = time.perf_counter() - started
+                for preview_key, preview_values in preview_by_group.items():
+                    preview_result = RFEngine._combine_ap_field_results(
+                        preview_values, settings,
+                        float(getattr(settings, "disconnected_rssi_dbm", -120.0)),
+                        preview_elapsed, hits, misses,
+                    )
+                    if preview_result is not None:
+                        preview_result.progressive_fraction = float(fraction)
+                        preview_combined[preview_key] = preview_result
+                if preview_combined:
+                    progressive_callback(preview_combined, float(fraction))
+
+            missing_results = RFEngine._simulate_groups_adaptive(
+                floor, floors, missing_groups, resolution_m, patterns, include_inter_floor,
+                settings, progress_callback, calculation_boundary,
+                progressive_callback=missing_progress if progressive_callback is not None else None,
+            )
+            for field_key, result in missing_results.items():
+                group_key, cache_key = missing_cache_keys[field_key]
+                _RF_AP_FIELD_CACHE.put(cache_key, result)
+                cached_by_group[group_key].append(result)
+        elif progress_callback:
+            progress_callback(1, 1)
+        disconnected = float(getattr(settings, "disconnected_rssi_dbm", -120.0))
+        elapsed = time.perf_counter() - started
+        combined = {}
+        for group_key, fields in cached_by_group.items():
+            result = RFEngine._combine_ap_field_results(fields, settings, disconnected, elapsed, hits, misses)
+            if result is not None:
+                combined[group_key] = result
+        if progressive_callback and combined:
+            progressive_callback(combined, 1.0)
+        return combined
 
     @staticmethod
     def simulate_frequencies(
@@ -3180,6 +3999,9 @@ class RFEngine:
         include_inter_floor: bool = True,
         heatmap_settings: Optional[HeatmapSettings] = None,
         progress_callback=None,
+        calculation_boundary=None,
+        progressive_callback=None,
+        profile_override: Optional[str] = None,
     ) -> Dict[float, SimulationResult]:
         """Calculate all requested frequencies in one shared process-pool pass."""
         requested = (
@@ -3209,7 +4031,14 @@ class RFEngine:
             include_inter_floor,
             heatmap_settings,
             progress_callback,
+            calculation_boundary,
+            progressive_callback,
+            profile_override,
         )
+        effective_settings = RFEngine._profiled_settings(heatmap_settings, profile_override)
+        render_override = str(getattr(effective_settings, "heatmap_render_mode", "") or "")
+        for value in results.values():
+            value.render_mode_override = render_override
         return {float(key): value for key, value in results.items()}
 
     @staticmethod
@@ -3222,6 +4051,9 @@ class RFEngine:
         include_inter_floor: bool = True,
         heatmap_settings: Optional[HeatmapSettings] = None,
         progress_callback=None,
+        calculation_boundary=None,
+        progressive_callback=None,
+        profile_override: Optional[str] = None,
     ) -> Optional[SimulationResult]:
         """Compatibility wrapper preserving the original combined-radio result."""
         results = RFEngine._simulate_groups(
@@ -3233,8 +4065,15 @@ class RFEngine:
             include_inter_floor,
             heatmap_settings,
             progress_callback,
+            calculation_boundary,
+            progressive_callback,
+            profile_override,
         )
-        return results.get("combined")
+        result = results.get("combined")
+        if result is not None:
+            effective_settings = RFEngine._profiled_settings(heatmap_settings, profile_override)
+            result.render_mode_override = str(getattr(effective_settings, "heatmap_render_mode", "") or "")
+        return result
 
     @staticmethod
     def _floor_bounds(floor: FloorModel, aps: List[AccessPoint]) -> Tuple[float, float, float, float]:
@@ -3855,18 +4694,17 @@ def _load_ifc_geometry_chunk_in_process(args):
 def _rf_write_worker_context_file(
     floor: FloorModel,
     floors: Dict[str, FloorModel],
-    group_aps: Dict[object, List[AccessPoint]],
     patterns: Optional[Dict[str, AntennaPattern]],
     include_inter_floor: bool,
     heatmap_settings: Optional[HeatmapSettings],
 ) -> str:
-    """Serialise one RF model snapshot for all worker tiles in a run."""
+    """Serialise static model geometry once; AP/radio groups travel separately."""
     handle = tempfile.NamedTemporaryFile(prefix="rf_sim_context_", suffix=".pickle", delete=False)
     path = handle.name
     try:
         with handle:
             pickle.dump(
-                (floor, floors, group_aps, patterns, include_inter_floor, heatmap_settings),
+                (floor, floors, patterns, include_inter_floor, heatmap_settings),
                 handle,
                 protocol=pickle.HIGHEST_PROTOCOL,
             )
@@ -3879,31 +4717,57 @@ def _rf_write_worker_context_file(
     return path
 
 
+def _rf_get_worker_context_file(
+    context_key: str,
+    floor: FloorModel,
+    floors: Dict[str, FloorModel],
+    patterns: Optional[Dict[str, AntennaPattern]],
+    include_inter_floor: bool,
+    heatmap_settings: Optional[HeatmapSettings],
+    maximum_entries: int = 2,
+) -> str:
+    """Keep static floor snapshots available for workers between AP edits."""
+    key = str(context_key)
+    with _RF_CONTEXT_FILE_LOCK:
+        existing = _RF_CONTEXT_FILE_CACHE.get(key)
+        if existing and os.path.exists(existing):
+            if key in _RF_CONTEXT_FILE_ORDER:
+                _RF_CONTEXT_FILE_ORDER.remove(key)
+            _RF_CONTEXT_FILE_ORDER.append(key)
+            return existing
+        path = _rf_write_worker_context_file(floor, floors, patterns, include_inter_floor, heatmap_settings)
+        _RF_CONTEXT_FILE_CACHE[key] = path
+        _RF_CONTEXT_FILE_ORDER.append(key)
+        maximum = max(1, int(maximum_entries or 2))
+        while len(_RF_CONTEXT_FILE_ORDER) > maximum:
+            stale = _RF_CONTEXT_FILE_ORDER.pop(0)
+            stale_path = _RF_CONTEXT_FILE_CACHE.pop(stale, None)
+            if stale_path:
+                try:
+                    os.unlink(stale_path)
+                except Exception:
+                    pass
+        return path
+
+
 def _rf_worker_context(context_key: str, context_path: str, maximum_entries: int = 1):
-    """Load a model snapshot and build spatial indexes once per worker."""
+    """Load a static model and build spatial indexes once per worker process."""
     key = str(context_key)
     cached = _RF_WORKER_CONTEXT_CACHE.get(key)
     if cached is not None:
         return cached
-    # Drop stale project snapshots before unpickling the next one. Large IFC
-    # models can otherwise briefly consume twice their normal worker memory.
     maximum = max(1, int(maximum_entries or 1))
     while len(_RF_WORKER_CONTEXT_ORDER) >= maximum:
         stale = _RF_WORKER_CONTEXT_ORDER.pop(0)
         _RF_WORKER_CONTEXT_CACHE.pop(stale, None)
     with open(context_path, "rb") as handle:
-        floor, floors, group_aps, patterns, include_inter_floor, heatmap_settings = pickle.load(handle)
-    radio_links_by_group = {
-        key: RFEngine._active_radio_links(floor, aps, include_inter_floor)
-        for key, aps in group_aps.items()
-    }
+        floor, floors, patterns, include_inter_floor, heatmap_settings = pickle.load(handle)
     context = (
         floor,
         floors,
         patterns,
         include_inter_floor,
         heatmap_settings,
-        radio_links_by_group,
         RFEngine._build_wall_indexes(floors),
         RFEngine._build_opening_indexes(floors),
         RFEngine._build_reflection_indexes(floors, heatmap_settings),
@@ -3914,15 +4778,19 @@ def _rf_worker_context(context_key: str, context_path: str, maximum_entries: int
 
 
 def _rf_grid_multi_tile_worker(args):
-    """Calculate one strip for every requested RF group in a worker process."""
+    """Calculate one strip for every RF group, optionally writing shared arrays."""
     (
         context_key,
         context_path,
         xs,
         ys_slice,
+        valid_mask_slice,
         start_index,
         disconnected,
         worker_cache_entries,
+        group_aps,
+        group_order,
+        shared_specs,
     ) = args
     (
         floor,
@@ -3930,47 +4798,171 @@ def _rf_grid_multi_tile_worker(args):
         patterns,
         include_inter_floor,
         heatmap_settings,
-        radio_links_by_group,
         wall_indexes,
         opening_indexes,
         reflection_indexes,
     ) = _rf_worker_context(context_key, context_path, worker_cache_entries)
     xs = np.asarray(xs, dtype=float)
     ys_slice = np.asarray(ys_slice, dtype=float)
-    tile_results = {}
-    for key, radio_links in radio_links_by_group.items():
-        tile = np.full((len(ys_slice), len(xs)), float(disconnected), dtype=float)
-        delay_tile = np.zeros((len(ys_slice), len(xs)), dtype=float)
-        count_tile = np.zeros((len(ys_slice), len(xs)), dtype=np.int16)
+    valid_mask_slice = None if valid_mask_slice is None else np.asarray(valid_mask_slice, dtype=bool)
+    radio_links_by_group = {
+        key: RFEngine._active_radio_links(floor, group_aps.get(key, []), include_inter_floor)
+        for key in group_order
+    }
+
+    shared_handles = []
+    if shared_specs:
+        rssi_handle, rssi_stack = attach_shared_array(shared_specs[0]); shared_handles.append(rssi_handle)
+        delay_handle, delay_stack = attach_shared_array(shared_specs[1]); shared_handles.append(delay_handle)
+        count_handle, count_stack = attach_shared_array(shared_specs[2]); shared_handles.append(count_handle)
+        tile_results = None
+    else:
+        tile_results = {}
+        rssi_stack = delay_stack = count_stack = None
+        for group_index, key in enumerate(group_order):
+            if valid_mask_slice is None:
+                tile = np.full((len(ys_slice), len(xs)), float(disconnected), dtype=float)
+                delay_tile = np.zeros((len(ys_slice), len(xs)), dtype=float)
+            else:
+                tile = np.full((len(ys_slice), len(xs)), np.nan, dtype=float)
+                tile[valid_mask_slice] = float(disconnected)
+                delay_tile = np.full((len(ys_slice), len(xs)), np.nan, dtype=float)
+                delay_tile[valid_mask_slice] = 0.0
+            tile_results[key] = (tile, delay_tile, np.zeros((len(ys_slice), len(xs)), dtype=np.int16))
+
+    # Vectorised unobstructed upper-bound masks remove AP/radio links that cannot
+    # contribute even before any Shapely intersection or ray work starts.
+    influence_masks: Dict[Tuple[int, int], np.ndarray] = {}
+    if bool(getattr(heatmap_settings, "enable_tile_influence_pruning", True)):
+        for group_index, key in enumerate(group_order):
+            for link_index, (ap, radio) in enumerate(radio_links_by_group.get(key, [])):
+                ap_floor = floors.get(ap.floor)
+                if ap_floor is None:
+                    continue
+                dz = (float(ap_floor.elevation) + float(ap.mount_height_m)) - (float(floor.elevation) + float(ap.rx_height_m))
+                eirp = float(radio.tx_power_dbm) + float(getattr(radio, "antenna_gain_dbi", 0.0) or 0.0) + 12.0
+                upper = best_case_rssi_grid(
+                    xs, ys_slice, ap.x, ap.y, dz,
+                    RFEngine.free_space_loss_db_at_1m(radio.frequency_mhz),
+                    ap.path_loss_exponent, eirp,
+                    bool(getattr(heatmap_settings, "enable_numba_rf_kernels", True)),
+                )
+                cutoff = float(disconnected) + float(getattr(heatmap_settings, "tile_influence_margin_db", 8.0) or 8.0)
+                mask = upper >= cutoff
+                radius = RFEngine.cutoff_radius_m_for_radio(radio, heatmap_settings)
+                if radius > 0.0:
+                    xx, yy = np.meshgrid(xs, ys_slice)
+                    mask &= ((xx - ap.x) ** 2 + (yy - ap.y) ** 2 + dz * dz) <= radius * radius
+                influence_masks[(group_index, link_index)] = mask
+
+    tile_bounds = (
+        float(xs[0]) if len(xs) else 0.0,
+        float(ys_slice[0]) if len(ys_slice) else 0.0,
+        float(xs[-1]) if len(xs) else 0.0,
+        float(ys_slice[-1]) if len(ys_slice) else 0.0,
+    )
+    local_indexes_by_ap: Dict[Tuple[str, float, float], Tuple[dict, dict]] = {}
+    if bool(getattr(heatmap_settings, "enable_tile_local_geometry", True)) and len(xs) and len(ys_slice):
+        search_pad = max(
+            1.0,
+            float(getattr(heatmap_settings, "reflection_search_radius_m", 18.0)),
+            float(getattr(heatmap_settings, "diffraction_search_radius_m", 5.0)),
+        )
+        for key in group_order:
+            for ap, _radio in radio_links_by_group.get(key, []):
+                ap_key = (str(ap.name), round(float(ap.x), 5), round(float(ap.y), 5))
+                if ap_key in local_indexes_by_ap:
+                    continue
+                envelope = box(
+                    min(tile_bounds[0], float(ap.x)) - search_pad,
+                    min(tile_bounds[1], float(ap.y)) - search_pad,
+                    max(tile_bounds[2], float(ap.x)) + search_pad,
+                    max(tile_bounds[3], float(ap.y)) + search_pad,
+                )
+                local_indexes_by_ap[ap_key] = RFEngine._tile_local_indexes(
+                    wall_indexes, opening_indexes, floors.keys(), envelope
+                )
+
+    reflection_subsets: Dict[Tuple[str, float, float], ReflectionIndex] = {}
+    if bool(getattr(heatmap_settings, "precompute_reflection_candidates_per_tile", True)):
+        base_index = reflection_indexes.get(floor.name)
+        if base_index is not None:
+            maximum = max(4, int(getattr(heatmap_settings, "max_reflection_surfaces", 6)) * 4)
+            radius = float(getattr(heatmap_settings, "reflection_search_radius_m", 18.0))
+            for key in group_order:
+                for ap, _radio in radio_links_by_group.get(key, []):
+                    ap_key = (str(ap.name), round(float(ap.x), 5), round(float(ap.y), 5))
+                    if ap_key not in reflection_subsets:
+                        reflection_subsets[ap_key] = base_index.subset_for_source_tile(
+                            (float(ap.x), float(ap.y)), tile_bounds, radius, maximum
+                        )
+
+    reflection_sequences_by_ap: Dict[Tuple[str, float, float], Tuple[Tuple[ReflectionSurface, ...], ...]] = {}
+    if bool(getattr(heatmap_settings, "precompute_reflection_candidates_per_tile", True)):
+        tile_centre = ((tile_bounds[0] + tile_bounds[2]) * 0.5, (tile_bounds[1] + tile_bounds[3]) * 0.5)
+        for key in group_order:
+            for ap, _radio in radio_links_by_group.get(key, []):
+                ap_key = (str(ap.name), round(float(ap.x), 5), round(float(ap.y), 5))
+                if ap_key in reflection_sequences_by_ap:
+                    continue
+                sequences = precompute_reflection_sequences(
+                    (float(ap.x), float(ap.y)), tile_centre, reflection_subsets.get(ap_key),
+                    int(getattr(heatmap_settings, "max_reflection_order", 1)),
+                    int(getattr(heatmap_settings, "max_reflection_surfaces", 6)),
+                    float(getattr(heatmap_settings, "reflection_search_radius_m", 18.0)),
+                )
+                if sequences:
+                    reflection_sequences_by_ap[ap_key] = sequences
+
+    try:
         for iy, yy in enumerate(ys_slice):
+            global_iy = int(start_index) + iy
             yy_value = float(yy)
             for ix, xx in enumerate(xs):
+                if valid_mask_slice is not None and not bool(valid_mask_slice[iy, ix]):
+                    continue
                 xx_value = float(xx)
-                samples: List[PropagationSample] = []
-                for ap, radio in radio_links:
-                    if RFEngine.point_is_inside_radio_cutoff(
-                        xx_value, yy_value, floor, ap, floors, radio, heatmap_settings
-                    ):
+                geometry_cache: Optional[Dict[object, object]] = {} if bool(
+                    getattr(heatmap_settings, "reuse_path_geometry_across_frequencies", True)
+                ) else None
+                for group_index, key in enumerate(group_order):
+                    samples: List[PropagationSample] = []
+                    for link_index, (ap, radio) in enumerate(radio_links_by_group.get(key, [])):
+                        influence = influence_masks.get((group_index, link_index))
+                        if influence is not None and not bool(influence[iy, ix]):
+                            continue
+                        if not RFEngine.point_is_inside_radio_cutoff(
+                            xx_value, yy_value, floor, ap, floors, radio, heatmap_settings
+                        ):
+                            continue
+                        ap_key = (str(ap.name), round(float(ap.x), 5), round(float(ap.y), 5))
+                        local_wall_indexes, local_opening_indexes = local_indexes_by_ap.get(
+                            ap_key, (wall_indexes, opening_indexes)
+                        )
                         samples.append(RFEngine.propagation_at(
-                            xx_value,
-                            yy_value,
-                            floor,
-                            ap,
-                            floors,
-                            patterns,
-                            radio,
-                            include_inter_floor,
-                            heatmap_settings,
-                            wall_indexes,
-                            opening_indexes,
-                            reflection_indexes,
+                            xx_value, yy_value, floor, ap, floors, patterns, radio,
+                            include_inter_floor, heatmap_settings, local_wall_indexes,
+                            local_opening_indexes, reflection_indexes, geometry_cache,
+                            reflection_subsets.get(ap_key),
+                            reflection_sequences_by_ap.get(ap_key),
                         ))
-                combined = RFEngine.combine_ap_samples(samples, heatmap_settings, float(disconnected))
-                tile[iy, ix] = combined.rssi_dbm
-                delay_tile[iy, ix] = combined.delay_spread_ns
-                count_tile[iy, ix] = max(0, min(32767, int(combined.path_count)))
-        tile_results[key] = (tile, delay_tile, count_tile)
-    return int(start_index), tile_results
+                    combined = RFEngine.combine_ap_samples(samples, heatmap_settings, float(disconnected))
+                    if shared_specs:
+                        rssi_stack[group_index, global_iy, ix] = combined.rssi_dbm
+                        delay_stack[group_index, global_iy, ix] = combined.delay_spread_ns
+                        count_stack[group_index, global_iy, ix] = max(0, min(32767, int(combined.path_count)))
+                    else:
+                        tile, delay_tile, count_tile = tile_results[key]
+                        tile[iy, ix] = combined.rssi_dbm
+                        delay_tile[iy, ix] = combined.delay_spread_ns
+                        count_tile[iy, ix] = max(0, min(32767, int(combined.path_count)))
+        return int(start_index), int(len(ys_slice)), tile_results
+    finally:
+        for handle in shared_handles:
+            try:
+                handle.close()
+            except Exception:
+                pass
 
 
 # ----------------------------- Process-based IFC loading -----------------------------
@@ -4677,6 +5669,68 @@ class PropagationSettingsDialog(QDialog):
         layout.addWidget(intro)
 
         form = QFormLayout()
+
+        self.calculation_profile = QComboBox()
+        self.calculation_profile.addItem("Fast preview", "fast")
+        self.calculation_profile.addItem("Balanced", "balanced")
+        self.calculation_profile.addItem("Detailed / report", "detailed")
+        profile_index = self.calculation_profile.findData(str(settings.rf_calculation_profile))
+        self.calculation_profile.setCurrentIndex(max(0, profile_index))
+        self.calculation_profile.setToolTip(
+            "Fast uses a coarser adaptive pass and lighter multipath; Balanced retains normal study detail; "
+            "Detailed uses the requested grid and full configured propagation options."
+        )
+        form.addRow("Calculation profile", self.calculation_profile)
+
+        self.adaptive_grid = QCheckBox("Use adaptive coarse-to-fine RF sampling")
+        self.adaptive_grid.setChecked(bool(settings.enable_adaptive_rf_grid))
+        form.addRow(self.adaptive_grid)
+
+        self.coarse_resolution = QDoubleSpinBox()
+        self.coarse_resolution.setRange(0.25, 20.0)
+        self.coarse_resolution.setDecimals(2)
+        self.coarse_resolution.setValue(float(settings.adaptive_coarse_resolution_m))
+        self.coarse_resolution.setSuffix(" m")
+        form.addRow("Adaptive coarse spacing", self.coarse_resolution)
+
+        self.per_ap_cache = QCheckBox("Cache each AP field for incremental recalculation")
+        self.per_ap_cache.setChecked(bool(settings.enable_per_ap_heatmap_cache))
+        form.addRow(self.per_ap_cache)
+
+        self.shared_memory = QCheckBox("Use shared-memory worker output arrays")
+        self.shared_memory.setChecked(bool(settings.use_shared_memory_rf_results))
+        form.addRow(self.shared_memory)
+
+        self.numba_kernels = QCheckBox("Use optional compiled numerical kernels when Numba is installed")
+        self.numba_kernels.setChecked(bool(settings.enable_numba_rf_kernels))
+        form.addRow(self.numba_kernels)
+
+        self.progressive_updates = QCheckBox("Show progressive coarse/fine heatmap updates")
+        self.progressive_updates.setChecked(bool(settings.progressive_heatmap_updates))
+        form.addRow(self.progressive_updates)
+
+        self.render_mode = QComboBox()
+        self.render_mode.addItem("Raster heatmap with contour lines", "raster_contours")
+        self.render_mode.addItem("Raster heatmap only (fastest)", "raster")
+        self.render_mode.addItem("Filled contour polygons", "contours")
+        render_index = self.render_mode.findData(str(settings.heatmap_render_mode))
+        self.render_mode.setCurrentIndex(max(0, render_index))
+        form.addRow("Heatmap rendering", self.render_mode)
+
+        self.relative_path_cutoff = QDoubleSpinBox()
+        self.relative_path_cutoff.setRange(0.0, 80.0)
+        self.relative_path_cutoff.setDecimals(1)
+        self.relative_path_cutoff.setValue(float(settings.multipath_relative_power_cutoff_db))
+        self.relative_path_cutoff.setSuffix(" dB")
+        self.relative_path_cutoff.setToolTip(
+            "Discard reflected/diffracted paths this far below the strongest path before coherent summation."
+        )
+        form.addRow("Multipath power pruning", self.relative_path_cutoff)
+
+        self.interactive_preview = QCheckBox("Recalculate a fast preview after AP movement")
+        self.interactive_preview.setChecked(bool(settings.interactive_preview_enabled))
+        form.addRow(self.interactive_preview)
+
         self.reflections = QCheckBox("Enable wall and IFC-element reflections")
         self.reflections.setChecked(bool(settings.enable_multipath_reflections))
         form.addRow(self.reflections)
@@ -4763,6 +5817,13 @@ class PropagationSettingsDialog(QDialog):
         self.ap_combination.setCurrentIndex(max(0, index))
         form.addRow("Multiple-AP combination", self.ap_combination)
 
+        self.boundary_filter = QCheckBox("Ignore RSSI results outside shared planner boundaries")
+        self.boundary_filter.setChecked(bool(settings.ignore_results_outside_planner_boundaries))
+        self.boundary_filter.setToolTip(
+            "When shared rectangular or polygon boundaries exist, points outside their union are skipped during calculation and omitted from heatmaps, hover results, statistics, CSV and PDF output."
+        )
+        form.addRow(self.boundary_filter)
+
         form_widget = QWidget()
         form_widget.setLayout(form)
         scroll = QScrollArea()
@@ -4806,6 +5867,16 @@ class PropagationSettingsDialog(QDialog):
             widget.setEnabled(fading_enabled)
 
     def apply_to(self, settings: HeatmapSettings):
+        settings.rf_calculation_profile = str(self.calculation_profile.currentData() or "balanced")
+        settings.enable_adaptive_rf_grid = self.adaptive_grid.isChecked()
+        settings.adaptive_coarse_resolution_m = float(self.coarse_resolution.value())
+        settings.enable_per_ap_heatmap_cache = self.per_ap_cache.isChecked()
+        settings.use_shared_memory_rf_results = self.shared_memory.isChecked()
+        settings.enable_numba_rf_kernels = self.numba_kernels.isChecked()
+        settings.progressive_heatmap_updates = self.progressive_updates.isChecked()
+        settings.heatmap_render_mode = str(self.render_mode.currentData() or "raster_contours")
+        settings.multipath_relative_power_cutoff_db = float(self.relative_path_cutoff.value())
+        settings.interactive_preview_enabled = self.interactive_preview.isChecked()
         settings.enable_multipath_reflections = self.reflections.isChecked()
         settings.max_reflection_order = int(self.reflection_order.value())
         settings.max_reflection_surfaces = int(self.reflection_surfaces.value())
@@ -4822,6 +5893,7 @@ class PropagationSettingsDialog(QDialog):
         settings.fading_seed = int(self.fading_seed.value())
         settings.calculate_delay_spread = self.delay_spread.isChecked()
         settings.combined_ap_mode = str(self.ap_combination.currentData() or "strongest")
+        settings.ignore_results_outside_planner_boundaries = self.boundary_filter.isChecked()
 
 
 class IFCOriginDialog(QDialog):
@@ -5727,6 +6799,10 @@ class MainWindow(QMainWindow):
         self._loading_replace = False
         self._loading_active = False
         self.heatmap_settings = HeatmapSettings.default()
+        self._interactive_preview_running = False
+        self._interactive_preview_timer = QTimer(self)
+        self._interactive_preview_timer.setSingleShot(True)
+        self._interactive_preview_timer.timeout.connect(self._run_interactive_rf_preview)
         self.auto_planner_settings = AutoPlannerSettings.from_dict(self.heatmap_settings.auto_planner_settings)
         self.heatmap_settings_path: Optional[Path] = None
         self.ifc_origin_info: Dict[str, Dict[str, object]] = {}
@@ -6005,6 +7081,12 @@ class MainWindow(QMainWindow):
         self.load_heatmap_settings_action.triggered.connect(self.load_heatmap_settings)
         self.propagation_settings_action = QAction("Propagation model", self)
         self.propagation_settings_action.triggered.connect(self.show_propagation_settings)
+        self.boundary_result_filter_action = QAction("Limit RSSI to boundaries", self)
+        self.boundary_result_filter_action.setCheckable(True)
+        self.boundary_result_filter_action.setChecked(
+            bool(self.heatmap_settings.ignore_results_outside_planner_boundaries)
+        )
+        self.boundary_result_filter_action.toggled.connect(self.toggle_boundary_result_filter)
         self.planner_settings_action = QAction("Planner settings", self)
         self.planner_settings_action.triggered.connect(self.show_auto_planner_settings)
         self.predict_aps_action = QAction("Predict AP locations", self)
@@ -6372,6 +7454,10 @@ class MainWindow(QMainWindow):
                 "Propagation model", "Configure coherent reflections, higher-order rays, corner diffraction, small-scale fading, delay spread and multiple-AP power combination.",
                 "SP_FileDialogDetailedView", "Ctrl+Alt+M"
             ),
+            "boundary_result_filter_action": (
+                "Limit RSSI to boundaries", "Skip and hide RSSI samples outside the union of accepted shared planner boundaries. The filter also applies to hover values, CSV statistics and floor PDF exports.",
+                "SP_DialogApplyButton", "Ctrl+Alt+L"
+            ),
             "planner_settings_action": (
                 "Planner settings", "Configure coverage targets, radios, client capacity, channels and spectrum occupancy.",
                 "SP_FileDialogDetailedView", ""
@@ -6546,7 +7632,7 @@ class MainWindow(QMainWindow):
         ]), "Walls and boundaries")
         ribbon.addTab(self._make_ribbon_page([
             ("Antenna data", ["load_pattern_action"]),
-            ("Propagation and display", ["propagation_settings_action", "load_heatmap_settings_action"]),
+            ("Propagation and display", ["propagation_settings_action", "boundary_result_filter_action", "load_heatmap_settings_action"]),
             ("Analysis", ["sim_action", "export_action", "export_pdf_action"]),
         ]), "Radio and analysis")
         return ribbon
@@ -7234,6 +8320,49 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Moved {len(unique)} access point(s) by ΔX {float(delta.x()):.2f} m, ΔY {float(delta.y()):.2f} m"
         )
+        self._schedule_interactive_rf_preview()
+
+    def _schedule_interactive_rf_preview(self):
+        if not bool(getattr(self.heatmap_settings, "interactive_preview_enabled", True)):
+            return
+        if self.floor is None or not self.aps or self._interactive_preview_running:
+            return
+        delay = max(50, int(getattr(self.heatmap_settings, "interactive_preview_delay_ms", 350)))
+        self._interactive_preview_timer.start(delay)
+
+    def _run_interactive_rf_preview(self):
+        if self._interactive_preview_running or self.floor is None or not self.aps:
+            return
+        active_freqs = sorted({float(radio.frequency_mhz) for ap in self.aps for radio in ap.active_radios()})
+        if not active_freqs:
+            return
+        self._interactive_preview_running = True
+        try:
+            resolution = max(
+                float(self.resolution.value()),
+                float(getattr(self.heatmap_settings, "interactive_preview_resolution_m", 3.0)),
+            )
+            self.statusBar().showMessage("Updating fast RSSI preview for the moved AP field...")
+            results = RFEngine.simulate_frequencies(
+                self.floor, self.floors, self.aps, active_freqs, resolution, self.antenna_patterns,
+                include_inter_floor=self.include_inter_floor.isChecked(),
+                heatmap_settings=self.heatmap_settings,
+                calculation_boundary=self._rssi_calculation_boundary(),
+                profile_override="fast",
+            )
+            if results:
+                self.rssi_results_by_frequency = results
+                selected = self._selected_rssi_view_frequency()
+                self.last_result = results.get(selected) or results[sorted(results)[0]]
+                self._preserve_view_on_redraw = True
+                self.draw_floor()
+                self.statusBar().showMessage(
+                    "Fast RSSI preview updated. Run Calculate RSSI for the configured study profile."
+                )
+        except Exception as exc:
+            self.statusBar().showMessage(f"Fast RSSI preview skipped: {exc}")
+        finally:
+            self._interactive_preview_running = False
 
     def focus_ap_in_table(self, ap: AccessPoint):
         self.inspector_tabs.setCurrentIndex(1)
@@ -7712,7 +8841,7 @@ class MainWindow(QMainWindow):
         self.planner_boundaries.append(boundary)
         self._boundary_draw_start = None
         self._clear_boundary_preview()
-        self.last_result = None
+        self._clear_rssi_results()
         self.draw_floor()
         self.statusBar().showMessage(
             f"Created {boundary.name}; it now constrains AP planning on all IFC floors. "
@@ -7743,7 +8872,7 @@ class MainWindow(QMainWindow):
         self.planner_boundaries.append(boundary)
         self._boundary_polygon_points = []
         self._clear_boundary_preview()
-        self.last_result = None
+        self._clear_rssi_results()
         self.draw_floor()
         self.statusBar().showMessage(
             f"Created {boundary.name} with {len(coordinates)} vertices; it constrains AP planning on all IFC floors. "
@@ -8029,7 +9158,7 @@ class MainWindow(QMainWindow):
                 shape_type="polygon",
             ))
 
-        self.last_result = None
+        self._clear_rssi_results()
         self.draw_floor()
         created = len(current_polygons)
         self.statusBar().showMessage(
@@ -8433,7 +9562,7 @@ class MainWindow(QMainWindow):
                 assumption_note=assumption_note,
             ))
 
-        self.last_result = None
+        self._clear_rssi_results()
         self.draw_floor()
         created = len(current_spaces)
         wall_message = (
@@ -8501,7 +9630,7 @@ class MainWindow(QMainWindow):
         self.planner_boundaries = [
             candidate for candidate in self.planner_boundaries if candidate is not boundary
         ]
-        self.last_result = None
+        self._clear_rssi_results()
         self.draw_floor()
         self.statusBar().showMessage("Deleted shared planner boundary")
 
@@ -8519,7 +9648,7 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.Yes:
             return
         self.planner_boundaries.clear()
-        self.last_result = None
+        self._clear_rssi_results()
         self.draw_floor()
         self.statusBar().showMessage("Cleared all shared planner boundaries")
 
@@ -9372,13 +10501,42 @@ class MainWindow(QMainWindow):
 
     # ----------------------------- Predictive AP planning -----------------------------
 
+    def _rssi_calculation_boundary(self):
+        if not bool(self.heatmap_settings.ignore_results_outside_planner_boundaries):
+            return None
+        return self._planner_boundary_area()
+
+    def _clear_rssi_results(self):
+        self.last_result = None
+        self.rssi_results_by_frequency = {}
+
+    def toggle_boundary_result_filter(self, enabled: bool):
+        self.heatmap_settings.ignore_results_outside_planner_boundaries = bool(enabled)
+        self._clear_rssi_results()
+        self._update_rssi_legend()
+        self.draw_floor()
+        if enabled and not self.planner_boundaries:
+            self.statusBar().showMessage(
+                "Boundary RSSI filter enabled; create or accept a shared planner boundary for it to take effect."
+            )
+        elif enabled:
+            self.statusBar().showMessage(
+                "Boundary RSSI filter enabled: samples outside the shared planner-boundary union will be ignored."
+            )
+        else:
+            self.statusBar().showMessage("Boundary RSSI filter disabled")
+
     def show_propagation_settings(self):
         dialog = PropagationSettingsDialog(self, self.heatmap_settings)
         if dialog.exec() != QDialog.Accepted:
             return
         dialog.apply_to(self.heatmap_settings)
-        self.last_result = None
-        self.rssi_results_by_frequency = {}
+        self.boundary_result_filter_action.blockSignals(True)
+        self.boundary_result_filter_action.setChecked(
+            bool(self.heatmap_settings.ignore_results_outside_planner_boundaries)
+        )
+        self.boundary_result_filter_action.blockSignals(False)
+        self._clear_rssi_results()
         self._update_rssi_legend()
         self.draw_floor()
         order = int(self.heatmap_settings.max_reflection_order)
@@ -10394,6 +11552,7 @@ class MainWindow(QMainWindow):
             "ifc_alignment": {"dx": self.ifc_alignment.dx, "dy": self.ifc_alignment.dy, "rotation_deg": self.ifc_alignment.rotation_deg, "scale": self.ifc_alignment.scale},
             "auto_planner_settings": self.auto_planner_settings.to_dict(),
             "propagation_model": self.heatmap_settings.propagation_model_dict(),
+            "rf_performance": self.heatmap_settings.performance_model_dict(),
             "planner_boundaries": planner_boundaries,
             "excluded_ifc_elements": [
                 self._ifc_exclusion_record(
@@ -10665,6 +11824,12 @@ class MainWindow(QMainWindow):
             ))
         self.auto_planner_settings = AutoPlannerSettings.from_dict(data.get("auto_planner_settings", {}))
         self.heatmap_settings.apply_propagation_model_dict(data.get("propagation_model", {}))
+        self.heatmap_settings.apply_performance_model_dict(data.get("rf_performance", {}))
+        self.boundary_result_filter_action.blockSignals(True)
+        self.boundary_result_filter_action.setChecked(
+            bool(self.heatmap_settings.ignore_results_outside_planner_boundaries)
+        )
+        self.boundary_result_filter_action.blockSignals(False)
         selected_floor = str(data.get("selected_floor", ""))
         if selected_floor in self.floors:
             self.floor_combo.setCurrentText(selected_floor)
@@ -10759,6 +11924,13 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _bilinear_heatmap_value(result: SimulationResult, x: float, y: float) -> Optional[float]:
+        boundary = getattr(result, "boundary_geometry", None)
+        if boundary is not None:
+            try:
+                if not boundary.covers(Point(float(x), float(y))):
+                    return None
+            except Exception:
+                pass
         return MainWindow._bilinear_grid_value(result, result.rssi, x, y)
 
     @staticmethod
@@ -10780,27 +11952,44 @@ class MainWindow(QMainWindow):
         fine_xs = np.linspace(float(xs[0]), float(xs[-1]), (len(xs) - 1) * factor + 1)
         fine_ys = np.linspace(float(ys[0]), float(ys[-1]), (len(ys) - 1) * factor + 1)
         # The source grid is regular, so bilinear subdivision can be performed
-        # entirely with NumPy. This matches coordinate-aware interpolation while
-        # avoiding thousands of Python-level np.interp calls during redraws.
+        # entirely with NumPy. Boundary-filtered grids carry NaNs outside the
+        # permitted area; interpolate finite values and then apply an exact mask
+        # at the finer coordinates so contours never leak beyond the boundary.
         t = np.arange(factor, dtype=float) / float(factor)
-        x_segments = (
-            grid[:, :-1, None] * (1.0 - t)[None, None, :]
-            + grid[:, 1:, None] * t[None, None, :]
-        )
-        x_interpolated = np.concatenate(
-            [x_segments.reshape(grid.shape[0], -1), grid[:, -1:]], axis=1
-        )
-        y_segments = (
-            x_interpolated[:-1, :, None] * (1.0 - t)[None, None, :]
-            + x_interpolated[1:, :, None] * t[None, None, :]
-        )
-        z = np.concatenate(
-            [
-                y_segments.transpose(0, 2, 1).reshape(-1, x_interpolated.shape[1]),
-                x_interpolated[-1:, :],
-            ],
-            axis=0,
-        )
+
+        def interpolate(source: np.ndarray) -> np.ndarray:
+            x_segments = (
+                source[:, :-1, None] * (1.0 - t)[None, None, :]
+                + source[:, 1:, None] * t[None, None, :]
+            )
+            x_interpolated = np.concatenate(
+                [x_segments.reshape(source.shape[0], -1), source[:, -1:]], axis=1
+            )
+            y_segments = (
+                x_interpolated[:-1, :, None] * (1.0 - t)[None, None, :]
+                + x_interpolated[1:, :, None] * t[None, None, :]
+            )
+            return np.concatenate(
+                [
+                    y_segments.transpose(0, 2, 1).reshape(-1, x_interpolated.shape[1]),
+                    x_interpolated[-1:, :],
+                ],
+                axis=0,
+            )
+
+        finite_source = np.isfinite(grid)
+        if np.all(finite_source):
+            z = interpolate(grid)
+        else:
+            weights = interpolate(finite_source.astype(float))
+            values = interpolate(np.where(finite_source, grid, 0.0))
+            with np.errstate(divide="ignore", invalid="ignore"):
+                z = np.where(weights > 1e-12, values / weights, np.nan)
+            fine_mask = RFEngine._boundary_mask(
+                fine_xs, fine_ys, getattr(result, "boundary_geometry", None)
+            )
+            if fine_mask is not None:
+                z = np.where(fine_mask, z, np.nan)
         value = (fine_xs, fine_ys, z)
         result.render_cache[cache_key] = value
         return value
@@ -12178,15 +13367,102 @@ class MainWindow(QMainWindow):
             self.view.fitInView(scene.sceneRect(), Qt.KeepAspectRatio)
             self._view_has_been_fitted = True
 
+    @staticmethod
+    def _geometry_to_qpath(geometry) -> QPainterPath:
+        path = QPainterPath()
+        path.setFillRule(Qt.OddEvenFill)
+        if geometry is None:
+            return path
+        polygons = [geometry] if getattr(geometry, "geom_type", "") == "Polygon" else list(getattr(geometry, "geoms", []))
+        for polygon in polygons:
+            if getattr(polygon, "geom_type", "") != "Polygon":
+                continue
+            for ring in [polygon.exterior, *list(polygon.interiors)]:
+                coords = list(ring.coords)
+                if len(coords) < 3:
+                    continue
+                path.moveTo(QPointF(float(coords[0][0]), float(coords[0][1])))
+                for x_value, y_value in coords[1:]:
+                    path.lineTo(QPointF(float(x_value), float(y_value)))
+                path.closeSubpath()
+        return path
+
+    def _draw_heatmap_raster(self, result: SimulationResult, xs: np.ndarray, ys: np.ndarray, z: np.ndarray):
+        """Render the heatmap as one RGBA pixmap instead of thousands of fill polygons."""
+        if len(xs) < 2 or len(ys) < 2 or z.size == 0:
+            return
+        cache_key = (
+            "heatmap_raster", tuple((zone.name, zone.min_dbm, zone.max_dbm, zone.colour, zone.alpha) for zone in self.heatmap_settings.zones),
+            tuple(z.shape), bool(getattr(self, "dark_theme", False)),
+        )
+        image = result.render_cache.get(cache_key)
+        if image is None:
+            rgba = np.zeros((z.shape[0], z.shape[1], 4), dtype=np.uint8)
+            finite = np.isfinite(z)
+            for zone in self.heatmap_settings.zones:
+                mask = finite & (z >= float(zone.min_dbm)) & (z < float(zone.max_dbm))
+                if not np.any(mask):
+                    continue
+                colour = QColor(zone.colour)
+                if not colour.isValid():
+                    colour = QColor("#555555")
+                rgba[mask, 0] = int(colour.red())
+                rgba[mask, 1] = int(colour.green())
+                rgba[mask, 2] = int(colour.blue())
+                rgba[mask, 3] = max(0, min(255, int(zone.alpha)))
+            # Cover values above/below the explicitly bounded zones using the configured end colours.
+            if np.any(finite):
+                uncovered = finite & (rgba[:, :, 3] == 0)
+                if np.any(uncovered):
+                    high = max(self.heatmap_settings.zones, key=lambda zone: zone.max_dbm)
+                    low = min(self.heatmap_settings.zones, key=lambda zone: zone.min_dbm)
+                    high_mask = uncovered & (z >= float(high.max_dbm))
+                    low_mask = uncovered & ~high_mask
+                    for mask, zone in ((high_mask, high), (low_mask, low)):
+                        if not np.any(mask):
+                            continue
+                        colour = QColor(zone.colour)
+                        if not colour.isValid():
+                            colour = QColor("#555555")
+                        rgba[mask, 0] = int(colour.red())
+                        rgba[mask, 1] = int(colour.green())
+                        rgba[mask, 2] = int(colour.blue())
+                        rgba[mask, 3] = max(0, min(255, int(zone.alpha)))
+            image_format = getattr(QImage, "Format_RGBA8888", None)
+            if image_format is None:
+                image_format = QImage.Format.Format_RGBA8888
+            image = QImage(rgba.data, rgba.shape[1], rgba.shape[0], rgba.strides[0], image_format).copy()
+            result.render_cache[cache_key] = image
+        pixmap = QPixmap.fromImage(image)
+        item = QGraphicsPixmapItem(pixmap)
+        cell_x = abs(float(xs[-1] - xs[0])) / max(1, len(xs) - 1)
+        cell_y = abs(float(ys[-1] - ys[0])) / max(1, len(ys) - 1)
+        item.setTransform(QTransform.fromScale(max(cell_x, 1e-9), max(cell_y, 1e-9)))
+        item.setPos(float(xs[0]) - cell_x * 0.5, float(ys[0]) - cell_y * 0.5)
+        item.setZValue(Z_HEATMAP_FILL)
+        try:
+            item.setTransformationMode(Qt.SmoothTransformation)
+        except Exception:
+            pass
+        item.setAcceptedMouseButtons(Qt.NoButton)
+        self.view.scene().addItem(item)
+
     def _draw_heatmap(self, result: SimulationResult):
-        """Draw cached smooth RSSI contours, isolines and sampled values."""
+        """Draw a cached raster heatmap and optional isolines/sample annotations."""
         scene = self.view.scene()
         colours = self._theme_colours()
         if len(result.xs) < 2 or len(result.ys) < 2:
             return
-        if contourpy is None:
-            QMessageBox.warning(self, "Missing dependency", "contourpy is required for smooth filled contours. Run: pip install contourpy")
-            return
+        render_mode = str(
+            getattr(result, "render_mode_override", "")
+            or getattr(self.heatmap_settings, "heatmap_render_mode", "raster_contours")
+            or "raster_contours"
+        ).lower()
+        if render_mode not in {"raster", "raster_contours", "contours"}:
+            render_mode = "raster_contours"
+        if render_mode != "raster" and contourpy is None:
+            QMessageBox.warning(self, "Missing dependency", "contourpy is required for contour lines. Run: pip install contourpy")
+            render_mode = "raster"
 
         grid = np.asarray(result.rssi, dtype=float)
         rows, cols = grid.shape
@@ -12194,6 +13470,12 @@ class MainWindow(QMainWindow):
             return
 
         factor = max(1, int(getattr(self.heatmap_settings, "contour_interpolation_factor", 4)))
+        if render_mode in {"raster", "raster_contours"}:
+            # The pixmap uses the native RF grid and lets Qt interpolate it on screen;
+            # only optional contour lines need the denser numerical display grid.
+            self._draw_heatmap_raster(result, np.asarray(result.xs), np.asarray(result.ys), grid)
+        if render_mode == "raster":
+            return
         xs, ys, z = self._interpolated_heatmap_grid(result, factor)
         levels = sorted({float(v) for v in self.heatmap_settings.isoline_bands_dbm}, reverse=True)
         if not levels:
@@ -12209,6 +13491,7 @@ class MainWindow(QMainWindow):
 
         contour_key = (
             "contour_geometry",
+            render_mode,
             factor,
             tuple(levels),
             round(data_min, 6),
@@ -12220,7 +13503,7 @@ class MainWindow(QMainWindow):
                 cg = contourpy.contour_generator(
                     x=xs,
                     y=ys,
-                    z=z,
+                    z=np.ma.masked_invalid(z),
                     name="serial",
                     line_type=contourpy.LineType.Separate,
                     fill_type=contourpy.FillType.OuterOffset,
@@ -12230,19 +13513,20 @@ class MainWindow(QMainWindow):
                 return
 
             filled_bands = []
-            bounds = [fill_low] + sorted(levels) + [fill_high]
-            for lower, upper in zip(bounds[:-1], bounds[1:]):
-                if upper <= data_min or lower >= data_max:
-                    continue
-                lower_c = max(lower, fill_low)
-                upper_c = min(upper, fill_high)
-                if upper_c <= lower_c:
-                    continue
-                try:
-                    polygons, offsets = cg.filled(lower_c, upper_c)
-                except Exception:
-                    continue
-                filled_bands.append((polygons, offsets, (lower + upper) / 2.0))
+            if render_mode == "contours":
+                bounds = [fill_low] + sorted(levels) + [fill_high]
+                for lower, upper in zip(bounds[:-1], bounds[1:]):
+                    if upper <= data_min or lower >= data_max:
+                        continue
+                    lower_c = max(lower, fill_low)
+                    upper_c = min(upper, fill_high)
+                    if upper_c <= lower_c:
+                        continue
+                    try:
+                        polygons, offsets = cg.filled(lower_c, upper_c)
+                    except Exception:
+                        continue
+                    filled_bands.append((polygons, offsets, (lower + upper) / 2.0))
 
             line_groups = {}
             for level in levels:
@@ -12256,6 +13540,7 @@ class MainWindow(QMainWindow):
             result.render_cache[contour_key] = contour_geometry
 
         filled_bands, line_groups = contour_geometry
+        boundary_clip_path = self._geometry_to_qpath(getattr(result, "boundary_geometry", None))
 
         def path_from_outer_offset(polygons, offsets) -> QPainterPath:
             path = QPainterPath()
@@ -12276,6 +13561,8 @@ class MainWindow(QMainWindow):
 
         for polygons, offsets, colour_ref in filled_bands:
             path = path_from_outer_offset(polygons, offsets)
+            if not boundary_clip_path.isEmpty():
+                path = path.intersected(boundary_clip_path)
             if path.isEmpty():
                 continue
             item = QGraphicsPathItem(path)
@@ -12350,6 +13637,9 @@ class MainWindow(QMainWindow):
                 item.setZValue(Z_CONTOUR_LINE)
                 scene.addItem(item)
 
+        if render_mode != "contours":
+            return
+
         stride_x = max(1, int(self.heatmap_settings.sample_stride_x))
         stride_y = max(1, int(self.heatmap_settings.sample_stride_y))
         sample_font_size = max(1, int(self.heatmap_settings.sample_label_font_size))
@@ -12406,11 +13696,16 @@ class MainWindow(QMainWindow):
         diffraction_text = "diffraction on" if self.heatmap_settings.enable_corner_diffraction else "diffraction off"
         fading_text = "fading on" if self.heatmap_settings.enable_small_scale_fading else "fading off"
         combination_text = "power sum" if self.heatmap_settings.combined_ap_mode == "power_sum" else "strongest AP"
+        boundary_text = (
+            "boundary filter on"
+            if self.heatmap_settings.ignore_results_outside_planner_boundaries
+            else "boundary filter off"
+        )
         pieces = [
             f"<b>RSSI isolines</b> &nbsp; "
             f"<span style='color:{legend_text};'>Bands: {band_text} dBm. "
             f"Clients disconnect below {self.heatmap_settings.minimum_client_rssi_dbm:.0f} dBm. <br/> "
-            f"Propagation: {reflection_text}, {diffraction_text}, {fading_text}, {combination_text}; "
+            f"Propagation: {reflection_text}, {diffraction_text}, {fading_text}, {combination_text}, {boundary_text}; "
             f"pattern files: {pattern_count}</span>"
         ]
         for zone in self.heatmap_settings.zones:
@@ -12444,6 +13739,12 @@ class MainWindow(QMainWindow):
             self.heatmap_settings = HeatmapSettings.from_json_file(Path(path))
             self.auto_planner_settings = AutoPlannerSettings.from_dict(self.heatmap_settings.auto_planner_settings)
             self.heatmap_settings_path = Path(path)
+            self.boundary_result_filter_action.blockSignals(True)
+            self.boundary_result_filter_action.setChecked(
+                bool(self.heatmap_settings.ignore_results_outside_planner_boundaries)
+            )
+            self.boundary_result_filter_action.blockSignals(False)
+            self._clear_rssi_results()
             self.min_client_rssi.blockSignals(True)
             self.min_client_rssi.setValue(self.heatmap_settings.minimum_client_rssi_dbm)
             self.min_client_rssi.blockSignals(False)
@@ -12788,6 +14089,28 @@ class MainWindow(QMainWindow):
             if progress.wasCanceled():
                 raise RuntimeError("RSSI calculation cancelled")
 
+        progressive_state = {"fraction": 0.0}
+
+        def update_progressive_heatmap(partial_results, fraction):
+            if not bool(getattr(self.heatmap_settings, "progressive_heatmap_updates", True)):
+                return
+            fraction = max(0.0, min(1.0, float(fraction)))
+            if fraction < 1.0 and fraction - progressive_state["fraction"] < 0.10:
+                return
+            progressive_state["fraction"] = fraction
+            converted = {float(key): value for key, value in partial_results.items()}
+            if not converted:
+                return
+            for value in converted.values():
+                value.render_mode_override = "raster"
+            self.rssi_results_by_frequency = converted
+            selected = self._selected_rssi_view_frequency()
+            self.last_result = converted.get(selected) or converted[sorted(converted)[0]]
+            self._preserve_view_on_redraw = True
+            self.draw_floor()
+            progress.setLabelText(f"Calculating RSSI heatmap... {int(fraction * 100)}% field available")
+            QApplication.processEvents()
+
         self.rssi_results_by_frequency = {}
 
         active_freqs = sorted(
@@ -12817,6 +14140,8 @@ class MainWindow(QMainWindow):
                 include_inter_floor=self.include_inter_floor.isChecked(),
                 heatmap_settings=self.heatmap_settings,
                 progress_callback=update_progress,
+                calculation_boundary=self._rssi_calculation_boundary(),
+                progressive_callback=update_progressive_heatmap,
             )
         except Exception as exc:
             progress.close()
@@ -12852,10 +14177,28 @@ class MainWindow(QMainWindow):
             mode = self.last_result.execution_mode
             workers = max(1, int(self.last_result.worker_processes))
             elapsed = max(float(result.elapsed_seconds) for result in self.rssi_results_by_frequency.values())
+            ignored = max(int(result.ignored_point_count) for result in self.rssi_results_by_frequency.values())
+            boundary_text = (
+                f" {ignored} grid point{'s' if ignored != 1 else ''} outside the shared boundary were ignored."
+                if ignored else ""
+            )
+            exact_points = max(int(result.exact_points) for result in self.rssi_results_by_frequency.values())
+            approximate_points = max(int(result.approximate_points) for result in self.rssi_results_by_frequency.values())
+            cache_hits = max(int(result.cache_hits) for result in self.rssi_results_by_frequency.values())
+            cache_misses = max(int(result.cache_misses) for result in self.rssi_results_by_frequency.values())
+            adaptive_text = (
+                f" {exact_points:,} exact and {approximate_points:,} interpolated points."
+                if approximate_points else ""
+            )
+            cache_text = (
+                f" AP-field cache: {cache_hits} hit(s), {cache_misses} recalculated."
+                if cache_hits or cache_misses else ""
+            )
             self.statusBar().showMessage(
                 f"RSSI calculation complete in {elapsed:.1f} s using {mode} "
-                f"({workers} worker{'s' if workers != 1 else ''}). "
-                "Hover over the heatmap to inspect RSSI, path count and RMS delay spread."
+                f"({workers} worker{'s' if workers != 1 else ''})."
+                f"{adaptive_text}{cache_text}{boundary_text} "
+                f"Hover over the heatmap to inspect RSSI, path count and RMS delay spread."
             )
             fallback = next((
                 result.performance_note for result in self.rssi_results_by_frequency.values()
@@ -12996,6 +14339,7 @@ class MainWindow(QMainWindow):
             f"Diffraction: {'on' if self.heatmap_settings.enable_corner_diffraction else 'off'}",
             f"Small-scale fading: {'on' if self.heatmap_settings.enable_small_scale_fading else 'off'}",
             f"AP combination: {'power sum' if self.heatmap_settings.combined_ap_mode == 'power_sum' else 'strongest AP'}",
+            f"Boundary result filter: {'applied' if result is not None and result.boundary_geometry is not None else 'not applied'}",
         ]
 
         if result is not None:
@@ -13117,6 +14461,7 @@ class MainWindow(QMainWindow):
                     include_inter_floor=self.include_inter_floor.isChecked(),
                     heatmap_settings=self.heatmap_settings,
                     progress_callback=update_progress,
+                    calculation_boundary=self._rssi_calculation_boundary(),
                 )
                 results_by_floor[floor_name] = floor_results.get(float(frequency_mhz))
                 progress.setValue((floor_index + 1) * 100)
@@ -13341,6 +14686,8 @@ class MainWindow(QMainWindow):
             for iy, y in enumerate(self.last_result.ys):
                 for ix, x in enumerate(self.last_result.xs):
                     rssi = float(self.last_result.rssi[iy, ix])
+                    if not math.isfinite(rssi):
+                        continue
                     zone = self.heatmap_settings.zone_for_rssi(rssi)
                     active_radios = [r for a in self.aps for r in a.active_radios()]
                     delay = float(self.last_result.delay_spread_ns[iy, ix]) if self.last_result.delay_spread_ns is not None else 0.0

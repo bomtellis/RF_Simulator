@@ -53,6 +53,28 @@ class RayPath:
 
 
 @dataclass(frozen=True)
+class ReflectionGeometryPath:
+    """Frequency-independent image-source path geometry."""
+
+    points: Tuple[Tuple[float, float], ...]
+    length_m: float
+    surfaces: Tuple[ReflectionSurface, ...]
+    incidence_angles_rad: Tuple[float, ...]
+    kind: str
+    interacted_object_ids: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class DiffractionGeometryPath:
+    """Frequency-independent corner-detour geometry."""
+
+    points: Tuple[Tuple[float, float], ...]
+    length_m: float
+    excess_path_m: float
+    object_id: str
+
+
+@dataclass(frozen=True)
 class PathPower:
     """A received path contribution used for coherent combination and delay spread."""
 
@@ -327,6 +349,194 @@ def image_source_path(
     )
 
 
+def image_source_geometry(
+    source: Tuple[float, float],
+    receiver: Tuple[float, float],
+    surfaces: Sequence[ReflectionSurface],
+) -> Optional[ReflectionGeometryPath]:
+    """Build image-source geometry once so it can be reused by all bands."""
+    if not surfaces or len({surface.object_id for surface in surfaces}) < len(surfaces):
+        return None
+    images: List[Tuple[float, float]] = [source]
+    current = source
+    for surface in surfaces:
+        current = _point_reflected_across_line(current, surface)
+        if current is None:
+            return None
+        images.append(current)
+    reversed_points: List[Tuple[float, float]] = []
+    target = receiver
+    current_image = images[-1]
+    for index in range(len(surfaces) - 1, -1, -1):
+        point = _line_intersection_with_surface(target, current_image, surfaces[index])
+        if point is None:
+            return None
+        reversed_points.append(point)
+        target = point
+        current_image = images[index]
+    reflection_points = list(reversed(reversed_points))
+    points: List[Tuple[float, float]] = [source] + reflection_points + [receiver]
+    if any(math.hypot(b[0] - a[0], b[1] - a[1]) <= 1e-4 for a, b in zip(points, points[1:])):
+        return None
+    for index, surface in enumerate(surfaces):
+        previous_point = points[index]
+        next_point = points[index + 2]
+        sx = surface.b[0] - surface.a[0]
+        sy = surface.b[1] - surface.a[1]
+        previous_side = sx * (previous_point[1] - surface.a[1]) - sy * (previous_point[0] - surface.a[0])
+        next_side = sx * (next_point[1] - surface.a[1]) - sy * (next_point[0] - surface.a[0])
+        if previous_side * next_side < -1e-8:
+            return None
+    angles: List[float] = []
+    previous = source
+    for point, surface in zip(reflection_points, surfaces):
+        angles.append(_surface_incidence_angle(previous, point, surface))
+        previous = point
+    return ReflectionGeometryPath(
+        points=tuple(points),
+        length_m=polyline_length(points),
+        surfaces=tuple(surfaces),
+        incidence_angles_rad=tuple(angles),
+        kind=f"reflection_{len(surfaces)}",
+        interacted_object_ids=tuple(surface.object_id for surface in surfaces),
+    )
+
+
+def evaluate_reflection_geometry(
+    geometry: ReflectionGeometryPath,
+    frequency_mhz: float,
+    material_profiles: Dict[str, Dict[str, float]],
+    minimum_coefficient: float = 0.015,
+) -> Optional[RayPath]:
+    coefficient = 1.0 + 0.0j
+    for surface, angle in zip(geometry.surfaces, geometry.incidence_angles_rad):
+        coefficient *= fresnel_reflection_coefficient(surface.material, angle, frequency_mhz, material_profiles)
+    if abs(coefficient) < max(0.0, float(minimum_coefficient)):
+        return None
+    return RayPath(
+        points=geometry.points,
+        length_m=geometry.length_m,
+        coefficient=coefficient,
+        extra_loss_db=0.0,
+        kind=geometry.kind,
+        interacted_object_ids=geometry.interacted_object_ids,
+    )
+
+
+def precompute_reflection_sequences(
+    source: Tuple[float, float],
+    receiver_hint: Tuple[float, float],
+    index: Optional["ReflectionIndex"],
+    maximum_order: int,
+    maximum_surfaces: int,
+    search_radius_m: float,
+) -> Tuple[Tuple[ReflectionSurface, ...], ...]:
+    """Precompute AP/tile reflection-surface orderings once per worker tile."""
+    if index is None or maximum_order <= 0 or maximum_surfaces <= 0:
+        return ()
+    # Keep every surface in the already-pruned AP/tile index so the receiver-specific
+    # top-N filter below remains numerically identical to the original point query.
+    candidates = list(index.surfaces)
+    if len(candidates) > 24 or (int(maximum_order) >= 3 and len(candidates) > 12):
+        # Avoid combinatorial sequence tables for deliberately extreme detailed settings.
+        return ()
+    sequences: List[Tuple[ReflectionSurface, ...]] = []
+    for order in range(1, max(1, int(maximum_order)) + 1):
+        sequences.extend(tuple(sequence) for sequence in itertools.permutations(candidates, order))
+    return tuple(sequences)
+
+
+def generate_reflection_geometries(
+    source: Tuple[float, float],
+    receiver: Tuple[float, float],
+    index: Optional["ReflectionIndex"],
+    maximum_order: int,
+    maximum_surfaces: int,
+    maximum_paths: int,
+    search_radius_m: float,
+    surface_sequences: Optional[Sequence[Sequence[ReflectionSurface]]] = None,
+) -> List[ReflectionGeometryPath]:
+    if index is None or maximum_order <= 0 or maximum_paths <= 0:
+        return []
+    if surface_sequences is None:
+        candidates = index.query_surfaces(source, receiver, search_radius_m, maximum_surfaces)
+        if not candidates:
+            return []
+        sequences: Iterable[Sequence[ReflectionSurface]] = (
+            sequence
+            for order in range(1, max(1, int(maximum_order)) + 1)
+            for sequence in itertools.permutations(candidates, order)
+        )
+    else:
+        candidates = index.query_surfaces(source, receiver, search_radius_m, maximum_surfaces)
+        candidate_ids = {id(surface) for surface in candidates}
+        sequences = (
+            sequence for sequence in surface_sequences
+            if all(id(surface) in candidate_ids for surface in sequence)
+        )
+    direct_length = math.hypot(receiver[0] - source[0], receiver[1] - source[1])
+    geometries: List[ReflectionGeometryPath] = []
+    for sequence in sequences:
+        geometry = image_source_geometry(source, receiver, sequence)
+        if geometry is None:
+            continue
+        if geometry.length_m > direct_length + 2.0 * max(1.0, float(search_radius_m)):
+            continue
+        geometries.append(geometry)
+    geometries.sort(key=lambda path: path.length_m)
+    unique: List[ReflectionGeometryPath] = []
+    signatures = set()
+    for path in geometries:
+        signature = tuple((round(x, 3), round(y, 3)) for x, y in path.points[1:-1])
+        if signature in signatures:
+            continue
+        signatures.add(signature)
+        unique.append(path)
+        if len(unique) >= int(maximum_paths):
+            break
+    return unique
+
+
+def generate_diffraction_geometries(
+    source: Tuple[float, float],
+    receiver: Tuple[float, float],
+    index: Optional["ReflectionIndex"],
+    maximum_paths: int,
+    search_radius_m: float,
+    preferred_object_ids: Optional[Sequence[str]] = None,
+) -> List[DiffractionGeometryPath]:
+    if index is None or maximum_paths <= 0:
+        return []
+    direct_length = math.hypot(receiver[0] - source[0], receiver[1] - source[1])
+    corners = index.query_corners(
+        source, receiver, search_radius_m, max(maximum_paths * 4, maximum_paths), preferred_object_ids
+    )
+    paths: List[DiffractionGeometryPath] = []
+    for x, y, object_id in corners:
+        points = (source, (x, y), receiver)
+        length = polyline_length(points)
+        if length <= direct_length + 1e-6:
+            continue
+        paths.append(DiffractionGeometryPath(points, length, length - direct_length, object_id))
+    paths.sort(key=lambda path: (path.excess_path_m, path.length_m))
+    return paths[:max(0, int(maximum_paths))]
+
+
+def evaluate_diffraction_geometry(
+    geometry: DiffractionGeometryPath,
+    frequency_mhz: float,
+    minimum_loss_db: float,
+) -> RayPath:
+    return RayPath(
+        points=geometry.points,
+        length_m=geometry.length_m,
+        coefficient=cmath.exp(-1j * math.pi / 4.0),
+        extra_loss_db=knife_edge_diffraction_loss_db(geometry.excess_path_m, frequency_mhz, minimum_loss_db),
+        kind="diffraction",
+        interacted_object_ids=(geometry.object_id,),
+    )
+
+
 class ReflectionIndex:
     """Spatial index for reflection faces and diffraction corners."""
 
@@ -395,13 +605,71 @@ class ReflectionIndex:
             except Exception:
                 distance = radius + 1.0
             if distance <= radius:
+                surface = self.surfaces[index]
+                edge_x = float(surface.b[0]) - float(surface.a[0])
+                edge_y = float(surface.b[1]) - float(surface.a[1])
+                side_source = edge_x * (float(source[1]) - float(surface.a[1])) - edge_y * (float(source[0]) - float(surface.a[0]))
+                side_receiver = edge_x * (float(receiver[1]) - float(surface.a[1])) - edge_y * (float(receiver[0]) - float(surface.a[0]))
+                # A specular reflection on an opaque finite face requires source and receiver
+                # to lie on the same side of its infinite support line. Rejecting the other
+                # half-space here avoids expensive image-source construction for impossible rays.
+                if side_source * side_receiver < -1e-8:
+                    continue
                 midpoint = line.interpolate(0.5, normalized=True)
-                path_hint = math.hypot(midpoint.x - source[0], midpoint.y - source[1]) + math.hypot(
-                    midpoint.x - receiver[0], midpoint.y - receiver[1]
-                )
+                source_leg = math.hypot(midpoint.x - source[0], midpoint.y - source[1])
+                receiver_leg = math.hypot(midpoint.x - receiver[0], midpoint.y - receiver[1])
+                path_hint = source_leg + receiver_leg
+                direct_length = math.hypot(receiver[0] - source[0], receiver[1] - source[1])
+                if path_hint > direct_length + 2.0 * radius:
+                    continue
                 ranked.append((path_hint + distance * 0.25, index))
         ranked.sort(key=lambda item: item[0])
         return [self.surfaces[index] for _, index in ranked[: max(1, int(maximum))]]
+
+    def subset_for_source_tile(
+        self,
+        source: Tuple[float, float],
+        tile_bounds: Tuple[float, float, float, float],
+        radius_m: float,
+        maximum: int,
+    ) -> "ReflectionIndex":
+        """Return a small reflection index relevant to one AP/tile envelope."""
+        if not self.surfaces:
+            return ReflectionIndex([])
+        minx, miny, maxx, maxy = (float(v) for v in tile_bounds)
+        radius = max(0.1, float(radius_m))
+        envelope = box(
+            min(minx, source[0]) - radius,
+            min(miny, source[1]) - radius,
+            max(maxx, source[0]) + radius,
+            max(maxy, source[1]) + radius,
+        )
+        indices: List[int] = []
+        if self._tree is not None:
+            try:
+                for hit in self._tree.query(envelope):
+                    if isinstance(hit, int) or getattr(hit, "dtype", None) is not None:
+                        indices.append(int(hit))
+                    else:
+                        index = self._line_by_id.get(id(hit))
+                        if index is not None:
+                            indices.append(index)
+            except Exception:
+                indices = []
+        if not indices:
+            indices = list(range(len(self.surfaces)))
+        ranked = []
+        centre = ((minx + maxx) * 0.5, (miny + maxy) * 0.5)
+        for index in set(indices):
+            if not (0 <= index < len(self.surfaces)):
+                continue
+            surface = self.surfaces[index]
+            midpoint = ((surface.a[0] + surface.b[0]) * 0.5, (surface.a[1] + surface.b[1]) * 0.5)
+            score = math.hypot(midpoint[0] - source[0], midpoint[1] - source[1]) + math.hypot(midpoint[0] - centre[0], midpoint[1] - centre[1])
+            ranked.append((score, surface))
+        ranked.sort(key=lambda item: item[0])
+        limit = max(1, int(maximum))
+        return ReflectionIndex([surface for _, surface in ranked[:limit]])
 
     def query_corners(
         self,
