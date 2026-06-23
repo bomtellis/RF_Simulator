@@ -1,0 +1,3 @@
+# Optional cross-vendor GPU acceleration for Intel, AMD and NVIDIA OpenCL devices.
+# A current vendor OpenCL runtime/driver is also required.
+pyopencl

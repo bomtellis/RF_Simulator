@@ -4,6 +4,7 @@ RF Attenuation Simulator - IFC Wi-Fi RSSI planning tool.
 Run:
     pip install PySide6 numpy ifcopenshell shapely contourpy
     pip install numba  # optional compiled RF kernels
+    pip install pyopencl  # optional Intel/AMD/NVIDIA OpenCL acceleration
     python rf_simulator.py
 """
 from __future__ import annotations
@@ -19,6 +20,8 @@ import math
 import multiprocessing
 import os
 import pickle
+import re
+import shutil
 import tempfile
 import threading
 import uuid
@@ -56,6 +59,15 @@ from rf_performance import (
     nearest_resample_regular_grid,
     resample_regular_grid,
     stable_digest,
+)
+from rf_gpu import (
+    discover_opencl_devices,
+    gpu_colourise,
+    gpu_influence_mask,
+    gpu_resample_regular_grid,
+    gpu_strongest_indices,
+    opencl_status,
+    reset_opencl_backends,
 )
 import sys
 from dataclasses import dataclass, field, replace
@@ -946,6 +958,18 @@ class HeatmapSettings:
     multipath_relative_power_cutoff_db: float = 30.0
     enable_numba_rf_kernels: bool = True
     use_shared_memory_rf_results: bool = True
+    # Optional hybrid OpenCL acceleration. OpenCL is vendor-neutral and can
+    # use Intel, AMD or NVIDIA GPUs. IFC geometry/ray discovery remains on
+    # the CPU; dense influence, resampling, AP-field aggregation and raster
+    # colour mapping are offloaded when the workload exceeds the threshold.
+    enable_opencl_gpu: bool = True
+    opencl_device_preference: str = "auto"
+    opencl_allow_cpu_device: bool = False
+    opencl_min_work_items: int = 100000
+    opencl_accelerate_influence: bool = True
+    opencl_accelerate_field_combine: bool = True
+    opencl_accelerate_resampling: bool = True
+    opencl_accelerate_raster: bool = True
     progressive_heatmap_updates: bool = True
     progressive_update_percent: int = 20
     heatmap_render_mode: str = "raster_contours"  # raster, raster_contours, contours
@@ -955,6 +979,16 @@ class HeatmapSettings:
     # When enabled and one or more shared planner boundaries exist, RSSI grid
     # points outside their union are not calculated, displayed or exported.
     ignore_results_outside_planner_boundaries: bool = False
+    # Optional absolute quick-calculation threshold. If the unobstructed best-case
+    # signal cannot reach this value, the AP/point path is skipped before IFC
+    # intersection, reflection or diffraction work. Values below the threshold
+    # are represented as disconnected rather than as an invented exact RSSI.
+    enable_quick_rssi_cutoff: bool = False
+    quick_rssi_cutoff_dbm: float = -80.0
+    # Persist completed floor/frequency result grids next to the RF plan. Saved
+    # files are signature checked before project-load or PDF reuse.
+    save_simulation_results_to_disk: bool = True
+    load_saved_simulation_results: bool = True
 
     # Advanced propagation model. Reflections use a bounded image-source model
     # on the active floor. Higher-order rays are available by increasing
@@ -1222,6 +1256,14 @@ class HeatmapSettings:
         settings.multipath_relative_power_cutoff_db = max(0.0, min(80.0, float(performance.get("multipath_relative_power_cutoff_db", settings.multipath_relative_power_cutoff_db))))
         settings.enable_numba_rf_kernels = bool(performance.get("enable_numba_kernels", settings.enable_numba_rf_kernels))
         settings.use_shared_memory_rf_results = bool(performance.get("use_shared_memory_results", settings.use_shared_memory_rf_results))
+        settings.enable_opencl_gpu = bool(performance.get("enable_opencl_gpu", settings.enable_opencl_gpu))
+        settings.opencl_device_preference = str(performance.get("opencl_device_preference", settings.opencl_device_preference) or "auto")
+        settings.opencl_allow_cpu_device = bool(performance.get("opencl_allow_cpu_device", settings.opencl_allow_cpu_device))
+        settings.opencl_min_work_items = max(1, int(performance.get("opencl_min_work_items", settings.opencl_min_work_items)))
+        settings.opencl_accelerate_influence = bool(performance.get("opencl_accelerate_influence", settings.opencl_accelerate_influence))
+        settings.opencl_accelerate_field_combine = bool(performance.get("opencl_accelerate_field_combine", settings.opencl_accelerate_field_combine))
+        settings.opencl_accelerate_resampling = bool(performance.get("opencl_accelerate_resampling", settings.opencl_accelerate_resampling))
+        settings.opencl_accelerate_raster = bool(performance.get("opencl_accelerate_raster", settings.opencl_accelerate_raster))
         settings.progressive_heatmap_updates = bool(performance.get("progressive_heatmap_updates", settings.progressive_heatmap_updates))
         settings.progressive_update_percent = max(5, min(100, int(performance.get("progressive_update_percent", settings.progressive_update_percent))))
         render_mode = str(performance.get("heatmap_render_mode", settings.heatmap_render_mode)).strip().lower()
@@ -1229,6 +1271,10 @@ class HeatmapSettings:
         settings.interactive_preview_enabled = bool(performance.get("interactive_preview_enabled", settings.interactive_preview_enabled))
         settings.interactive_preview_delay_ms = max(50, int(performance.get("interactive_preview_delay_ms", settings.interactive_preview_delay_ms)))
         settings.interactive_preview_resolution_m = max(0.25, float(performance.get("interactive_preview_resolution_m", settings.interactive_preview_resolution_m)))
+        settings.enable_quick_rssi_cutoff = bool(performance.get("enable_quick_rssi_cutoff", data.get("enable_quick_rssi_cutoff", settings.enable_quick_rssi_cutoff)))
+        settings.quick_rssi_cutoff_dbm = max(-180.0, min(-20.0, float(performance.get("quick_rssi_cutoff_dbm", data.get("quick_rssi_cutoff_dbm", settings.quick_rssi_cutoff_dbm)))))
+        settings.save_simulation_results_to_disk = bool(performance.get("save_simulation_results_to_disk", data.get("save_simulation_results_to_disk", settings.save_simulation_results_to_disk)))
+        settings.load_saved_simulation_results = bool(performance.get("load_saved_simulation_results", data.get("load_saved_simulation_results", settings.load_saved_simulation_results)))
         propagation = data.get("propagation_model", data.get("advanced_propagation", {}))
         if not isinstance(propagation, dict):
             propagation = {}
@@ -1345,12 +1391,24 @@ class HeatmapSettings:
             "multipath_relative_power_cutoff_db": float(self.multipath_relative_power_cutoff_db),
             "enable_numba_kernels": bool(self.enable_numba_rf_kernels),
             "use_shared_memory_results": bool(self.use_shared_memory_rf_results),
+            "enable_opencl_gpu": bool(self.enable_opencl_gpu),
+            "opencl_device_preference": str(self.opencl_device_preference),
+            "opencl_allow_cpu_device": bool(self.opencl_allow_cpu_device),
+            "opencl_min_work_items": int(self.opencl_min_work_items),
+            "opencl_accelerate_influence": bool(self.opencl_accelerate_influence),
+            "opencl_accelerate_field_combine": bool(self.opencl_accelerate_field_combine),
+            "opencl_accelerate_resampling": bool(self.opencl_accelerate_resampling),
+            "opencl_accelerate_raster": bool(self.opencl_accelerate_raster),
             "progressive_heatmap_updates": bool(self.progressive_heatmap_updates),
             "progressive_update_percent": int(self.progressive_update_percent),
             "heatmap_render_mode": str(self.heatmap_render_mode),
             "interactive_preview_enabled": bool(self.interactive_preview_enabled),
             "interactive_preview_delay_ms": int(self.interactive_preview_delay_ms),
             "interactive_preview_resolution_m": float(self.interactive_preview_resolution_m),
+            "enable_quick_rssi_cutoff": bool(self.enable_quick_rssi_cutoff),
+            "quick_rssi_cutoff_dbm": float(self.quick_rssi_cutoff_dbm),
+            "save_simulation_results_to_disk": bool(self.save_simulation_results_to_disk),
+            "load_saved_simulation_results": bool(self.load_saved_simulation_results),
         }
 
     def propagation_model_dict(self) -> Dict[str, object]:
@@ -1413,6 +1471,14 @@ class HeatmapSettings:
         self.multipath_relative_power_cutoff_db = max(0.0, min(80.0, float(data.get("multipath_relative_power_cutoff_db", self.multipath_relative_power_cutoff_db))))
         self.enable_numba_rf_kernels = bool(data.get("enable_numba_kernels", self.enable_numba_rf_kernels))
         self.use_shared_memory_rf_results = bool(data.get("use_shared_memory_results", self.use_shared_memory_rf_results))
+        self.enable_opencl_gpu = bool(data.get("enable_opencl_gpu", self.enable_opencl_gpu))
+        self.opencl_device_preference = str(data.get("opencl_device_preference", self.opencl_device_preference) or "auto")
+        self.opencl_allow_cpu_device = bool(data.get("opencl_allow_cpu_device", self.opencl_allow_cpu_device))
+        self.opencl_min_work_items = max(1, int(data.get("opencl_min_work_items", self.opencl_min_work_items)))
+        self.opencl_accelerate_influence = bool(data.get("opencl_accelerate_influence", self.opencl_accelerate_influence))
+        self.opencl_accelerate_field_combine = bool(data.get("opencl_accelerate_field_combine", self.opencl_accelerate_field_combine))
+        self.opencl_accelerate_resampling = bool(data.get("opencl_accelerate_resampling", self.opencl_accelerate_resampling))
+        self.opencl_accelerate_raster = bool(data.get("opencl_accelerate_raster", self.opencl_accelerate_raster))
         self.progressive_heatmap_updates = bool(data.get("progressive_heatmap_updates", self.progressive_heatmap_updates))
         self.progressive_update_percent = max(5, min(100, int(data.get("progressive_update_percent", self.progressive_update_percent))))
         render_mode = str(data.get("heatmap_render_mode", self.heatmap_render_mode)).strip().lower()
@@ -1420,6 +1486,10 @@ class HeatmapSettings:
         self.interactive_preview_enabled = bool(data.get("interactive_preview_enabled", self.interactive_preview_enabled))
         self.interactive_preview_delay_ms = max(50, int(data.get("interactive_preview_delay_ms", self.interactive_preview_delay_ms)))
         self.interactive_preview_resolution_m = max(0.25, float(data.get("interactive_preview_resolution_m", self.interactive_preview_resolution_m)))
+        self.enable_quick_rssi_cutoff = bool(data.get("enable_quick_rssi_cutoff", self.enable_quick_rssi_cutoff))
+        self.quick_rssi_cutoff_dbm = max(-180.0, min(-20.0, float(data.get("quick_rssi_cutoff_dbm", self.quick_rssi_cutoff_dbm))))
+        self.save_simulation_results_to_disk = bool(data.get("save_simulation_results_to_disk", self.save_simulation_results_to_disk))
+        self.load_saved_simulation_results = bool(data.get("load_saved_simulation_results", self.load_saved_simulation_results))
 
     def apply_propagation_model_dict(self, data: Optional[Dict[str, object]]):
         if not isinstance(data, dict):
@@ -2726,6 +2796,17 @@ class RFEngine:
         return pattern.gain_dbi(az_rel, elev_rel) if pattern else 0.0
 
     @staticmethod
+    def _maximum_pattern_gain(patterns: Optional[Dict[str, AntennaPattern]], pattern_name: str) -> float:
+        if not patterns:
+            return 0.0
+        pattern = patterns.get(pattern_name)
+        if pattern is None:
+            return 0.0
+        az_max = max([float(value[1]) for value in (pattern.azimuth_points or [])] or [float(pattern.peak_gain_dbi)])
+        el_max = max([float(value[1]) for value in (pattern.elevation_points or [])] or [0.0])
+        return az_max + el_max
+
+    @staticmethod
     def propagation_at(
         x: float,
         y: float,
@@ -2754,6 +2835,29 @@ class RFEngine:
             x, y, receiver_floor, ap, floors, radio, heatmap_settings
         ):
             return PropagationSample(disconnected, 0.0, 0, disconnected)
+        quick_cutoff_enabled = bool(getattr(heatmap_settings, "enable_quick_rssi_cutoff", False)) if heatmap_settings is not None else False
+        quick_cutoff_dbm = float(getattr(heatmap_settings, "quick_rssi_cutoff_dbm", -80.0)) if heatmap_settings is not None else -80.0
+        # Keep a conservative margin below the displayed cutoff so several weak
+        # coherent paths can still combine into a valid above-cutoff result.
+        quick_path_floor_dbm = quick_cutoff_dbm - max(
+            6.0,
+            min(20.0, float(getattr(heatmap_settings, "multipath_relative_power_cutoff_db", 30.0)) * 0.5),
+        )
+        if quick_cutoff_enabled:
+            horizontal_distance = math.hypot(float(x) - float(ap.x), float(y) - float(ap.y))
+            ap_height = float(ap_floor.elevation) + float(ap.mount_height_m)
+            receiver_height = float(receiver_floor.elevation) + float(ap.rx_height_m)
+            distance_3d = max(1.0, math.hypot(horizontal_distance, ap_height - receiver_height))
+            maximum_pattern_gain = RFEngine._maximum_pattern_gain(patterns, radio.antenna_pattern)
+            unobstructed_upper = (
+                float(radio.tx_power_dbm)
+                + float(getattr(radio, "antenna_gain_dbi", 0.0) or 0.0)
+                + maximum_pattern_gain
+                - RFEngine.free_space_loss_db_at_1m(float(radio.frequency_mhz))
+                - 10.0 * float(ap.path_loss_exponent) * math.log10(distance_3d)
+            )
+            if unobstructed_upper < quick_cutoff_dbm:
+                return PropagationSample(disconnected, 0.0, 0, disconnected)
         direct_rssi = RFEngine.rssi_at(
             x,
             y,
@@ -2845,7 +2949,7 @@ class RFEngine:
                         + coefficient_gain_db
                         - float(ray.extra_loss_db)
                     )
-                    if received < disconnected - 60.0:
+                    if received < (quick_path_floor_dbm if quick_cutoff_enabled else disconnected - 60.0):
                         continue
                     path_powers.append(PathPower(
                         power_dbm=received,
@@ -2918,7 +3022,7 @@ class RFEngine:
                             - element_loss
                             - float(ray.extra_loss_db)
                         )
-                        if received < disconnected - 60.0:
+                        if received < (quick_path_floor_dbm if quick_cutoff_enabled else disconnected - 60.0):
                             continue
                         path_powers.append(PathPower(
                             power_dbm=received,
@@ -2958,6 +3062,8 @@ class RFEngine:
                 stable_link_key(ap.name, radio.frequency_mhz, getattr(radio, "channel", "")),
             )
         combined_rssi = max(disconnected, float(combined_rssi))
+        if quick_cutoff_enabled and combined_rssi < quick_cutoff_dbm:
+            return PropagationSample(disconnected, 0.0, 0, float(direct_rssi))
         delay_spread = (
             compiled_delay_spread
             if heatmap_settings is not None and bool(getattr(heatmap_settings, "calculate_delay_spread", True))
@@ -3393,6 +3499,10 @@ class RFEngine:
             "combined_ap_mode": getattr(settings, "combined_ap_mode", "strongest"),
             "disconnected": getattr(settings, "disconnected_rssi_dbm", -120.0),
             "path_cutoff": getattr(settings, "multipath_relative_power_cutoff_db", 30.0),
+            "quick_cutoff": [
+                getattr(settings, "enable_quick_rssi_cutoff", False),
+                getattr(settings, "quick_rssi_cutoff_dbm", -80.0),
+            ],
             "adaptive": [
                 getattr(settings, "enable_adaptive_rf_grid", True),
                 getattr(settings, "adaptive_coarse_resolution_m", 3.0),
@@ -3516,9 +3626,17 @@ class RFEngine:
             return None
         stack = np.stack([result.rssi for result in fields], axis=0)
         finite_stack = np.where(np.isfinite(stack), stack, -np.inf)
-        strongest_index = np.argmax(finite_stack, axis=0)
-        strongest = np.take_along_axis(finite_stack, strongest_index[None, :, :], axis=0)[0]
-        all_invalid = ~np.any(np.isfinite(stack), axis=0)
+        gpu_selection = gpu_strongest_indices(stack, settings)
+        gpu_note = ""
+        if gpu_selection is not None:
+            strongest_index, gpu_valid, gpu_device = gpu_selection
+            strongest = np.take_along_axis(finite_stack, strongest_index[None, :, :], axis=0)[0]
+            all_invalid = ~gpu_valid
+            gpu_note = f"; OpenCL AP-field aggregation on {gpu_device}"
+        else:
+            strongest_index = np.argmax(finite_stack, axis=0)
+            strongest = np.take_along_axis(finite_stack, strongest_index[None, :, :], axis=0)[0]
+            all_invalid = ~np.any(np.isfinite(stack), axis=0)
         mode = str(getattr(settings, "combined_ap_mode", "strongest") or "strongest").lower()
         if mode == "power_sum":
             powers = np.where(np.isfinite(stack), np.power(10.0, stack / 10.0), 0.0)
@@ -3559,7 +3677,7 @@ class RFEngine:
             elapsed_seconds=float(elapsed),
             performance_note=(
                 f"combined {len(fields)} independently cached AP field(s); "
-                f"{cache_hits} cache hit(s), {cache_misses} recalculated field(s)"
+                f"{cache_hits} cache hit(s), {cache_misses} recalculated field(s){gpu_note}"
             ),
             approximate_points=max(int(result.approximate_points) for result in fields),
             exact_points=max(int(result.exact_points) for result in fields),
@@ -3635,6 +3753,56 @@ class RFEngine:
         grids = {key: initial_rssi.copy() for key in group_order}
         delays = {key: initial_delay.copy() for key in group_order}
         counts = {key: np.zeros((rows, cols), dtype=np.int16) for key in group_order}
+
+        # OpenCL performs one conservative whole-grid upper-bound pass before
+        # the CPU workers start. This does not replace IFC ray tracing; it removes
+        # points at which no AP/radio can possibly reach the active cutoff.
+        gpu_prune_note = ""
+        if bool(getattr(heatmap_settings, "enable_opencl_gpu", True)) and bool(
+            getattr(heatmap_settings, "opencl_accelerate_influence", True)
+        ):
+            link_rows = []
+            absolute_cutoff = (
+                float(getattr(heatmap_settings, "quick_rssi_cutoff_dbm", -80.0))
+                if bool(getattr(heatmap_settings, "enable_quick_rssi_cutoff", False))
+                else float(disconnected)
+            )
+            influence_margin = float(getattr(heatmap_settings, "tile_influence_margin_db", 8.0) or 8.0)
+            cutoff = (absolute_cutoff - influence_margin) if bool(
+                getattr(heatmap_settings, "enable_quick_rssi_cutoff", False)
+            ) else absolute_cutoff
+            seen_links = set()
+            for links in radio_links_by_group.values():
+                for ap, radio in links:
+                    link_key = (RFEngine._ap_revision(ap), round(float(radio.frequency_mhz), 6))
+                    if link_key in seen_links:
+                        continue
+                    seen_links.add(link_key)
+                    ap_floor = floors.get(ap.floor)
+                    if ap_floor is None:
+                        continue
+                    dz = (float(ap_floor.elevation) + float(ap.mount_height_m)) - (
+                        float(floor.elevation) + float(ap.rx_height_m)
+                    )
+                    eirp = (
+                        float(radio.tx_power_dbm)
+                        + float(getattr(radio, "antenna_gain_dbi", 0.0) or 0.0)
+                        + RFEngine._maximum_pattern_gain(patterns, radio.antenna_pattern)
+                    )
+                    radius = RFEngine.cutoff_radius_m_for_radio(radio, heatmap_settings)
+                    link_rows.append((
+                        float(ap.x), float(ap.y), float(dz),
+                        RFEngine.free_space_loss_db_at_1m(radio.frequency_mhz),
+                        float(ap.path_loss_exponent), float(eirp), float(cutoff),
+                        float(radius * radius) if radius > 0.0 else -1.0,
+                    ))
+            gpu_mask = gpu_influence_mask(
+                xs, ys, np.asarray(link_rows, dtype=np.float32), work_mask, heatmap_settings
+            ) if link_rows else None
+            if gpu_mask is not None:
+                work_mask = gpu_mask if work_mask is None else (work_mask & gpu_mask)
+                gpu_prune_note = f"; {opencl_status(heatmap_settings, initialize=True)} whole-grid influence pruning"
+
         exact_point_count = int(np.count_nonzero(work_mask)) if work_mask is not None else rows * cols
         total_links = sum(len(links) for links in radio_links_by_group.values())
         work_units = exact_point_count * max(1, total_links)
@@ -3725,9 +3893,13 @@ class RFEngine:
                         delays[key] = delay_stack[index].copy()
                         counts[key] = count_stack[index].copy()
                 elapsed = time.perf_counter() - started
+                quick_note = (
+                    f"; quick cutoff {float(getattr(heatmap_settings, 'quick_rssi_cutoff_dbm', -80.0)):g} dBm"
+                    if bool(getattr(heatmap_settings, "enable_quick_rssi_cutoff", False)) else ""
+                )
                 note = (
                     f"resident static model; {len(jobs)} adaptive tile(s); shared-memory outputs "
-                    f"{'enabled' if use_shared else 'disabled'}; frequency-independent path geometry reused"
+                    f"{'enabled' if use_shared else 'disabled'}; frequency-independent path geometry reused{quick_note}{gpu_prune_note}"
                 )
                 return {
                     key: SimulationResult(
@@ -3791,7 +3963,11 @@ class RFEngine:
                         ) for key in group_order
                     }, (iy + 1) / rows)
         elapsed = time.perf_counter() - started
-        note = fallback_note or "single-process exact grid; resident geometry and cross-frequency path cache enabled"
+        quick_note = (
+            f"; quick cutoff {float(getattr(heatmap_settings, 'quick_rssi_cutoff_dbm', -80.0)):g} dBm"
+            if bool(getattr(heatmap_settings, "enable_quick_rssi_cutoff", False)) else ""
+        )
+        note = fallback_note or ("single-process exact grid; resident geometry and cross-frequency path cache enabled" + quick_note + gpu_prune_note)
         return {
             key: SimulationResult(
                 xs=xs, ys=ys, rssi=grids[key], delay_spread_ns=delays[key], path_count=counts[key],
@@ -3836,12 +4012,20 @@ class RFEngine:
         all_aps = [ap for aps in group_aps.values() for ap in aps]
         fine_xs, fine_ys, calculation_boundary = RFEngine._grid_for_floor(floor, all_aps, resolution_m, calculation_boundary)
         fine_valid = RFEngine._boundary_mask(fine_xs, fine_ys, calculation_boundary)
+        def resample_dense(source_result, values):
+            accelerated = gpu_resample_regular_grid(
+                source_result.xs, source_result.ys, values, fine_xs, fine_ys, settings
+            )
+            return accelerated if accelerated is not None else resample_regular_grid(
+                source_result.xs, source_result.ys, values, fine_xs, fine_ys
+            )
+
         interpolated = {}
         for key, result in coarse.items():
             interpolated[key] = SimulationResult(
                 xs=fine_xs, ys=fine_ys,
-                rssi=resample_regular_grid(result.xs, result.ys, result.rssi, fine_xs, fine_ys),
-                delay_spread_ns=resample_regular_grid(result.xs, result.ys, result.delay_spread_ns, fine_xs, fine_ys) if result.delay_spread_ns is not None else None,
+                rssi=resample_dense(result, result.rssi),
+                delay_spread_ns=resample_dense(result, result.delay_spread_ns) if result.delay_spread_ns is not None else None,
                 path_count=nearest_resample_regular_grid(result.xs, result.ys, result.path_count, fine_xs, fine_ys).astype(np.int16) if result.path_count is not None else None,
                 valid_mask=None if fine_valid is None else fine_valid.copy(),
                 boundary_geometry=calculation_boundary, ignored_point_count=0 if fine_valid is None else int(fine_valid.size - np.count_nonzero(fine_valid)),
@@ -4874,14 +5058,28 @@ def _rf_grid_multi_tile_worker(args):
                 if ap_floor is None:
                     continue
                 dz = (float(ap_floor.elevation) + float(ap.mount_height_m)) - (float(floor.elevation) + float(ap.rx_height_m))
-                eirp = float(radio.tx_power_dbm) + float(getattr(radio, "antenna_gain_dbi", 0.0) or 0.0) + 12.0
+                eirp = (
+                    float(radio.tx_power_dbm)
+                    + float(getattr(radio, "antenna_gain_dbi", 0.0) or 0.0)
+                    + RFEngine._maximum_pattern_gain(patterns, radio.antenna_pattern)
+                )
                 upper = best_case_rssi_grid(
                     xs, ys_slice, ap.x, ap.y, dz,
                     RFEngine.free_space_loss_db_at_1m(radio.frequency_mhz),
                     ap.path_loss_exponent, eirp,
                     bool(getattr(heatmap_settings, "enable_numba_rf_kernels", True)),
                 )
-                cutoff = float(disconnected) + float(getattr(heatmap_settings, "tile_influence_margin_db", 8.0) or 8.0)
+                absolute_cutoff = (
+                    float(getattr(heatmap_settings, "quick_rssi_cutoff_dbm", -80.0))
+                    if bool(getattr(heatmap_settings, "enable_quick_rssi_cutoff", False))
+                    else float(disconnected)
+                )
+                influence_margin = float(getattr(heatmap_settings, "tile_influence_margin_db", 8.0) or 8.0)
+                cutoff = (
+                    absolute_cutoff - influence_margin
+                    if bool(getattr(heatmap_settings, "enable_quick_rssi_cutoff", False))
+                    else absolute_cutoff + influence_margin
+                )
                 mask = upper >= cutoff
                 radius = RFEngine.cutoff_radius_m_for_radio(radio, heatmap_settings)
                 if radius > 0.0:
@@ -5731,6 +5929,7 @@ class RFPerformanceSettingsDialog(QDialog):
         self._build_sampling_tab(settings)
         self._build_rendering_tab(settings)
         self._build_propagation_cost_tab(settings)
+        self._build_gpu_tab(settings)
 
         self.save_global_defaults = QCheckBox(
             f"Also save these values as global defaults in {self._settings_path.name}"
@@ -5757,6 +5956,14 @@ class RFPerformanceSettingsDialog(QDialog):
             self.progressive_updates,
             self.delay_spread,
             self.fading,
+            self.quick_cutoff,
+            self.quick_cutoff_dbm,
+            self.quick_cutoff_preset,
+            self.save_results_disk,
+            self.load_results_disk,
+            self.enable_opencl,
+            self.opencl_device,
+            self.opencl_min_work,
         ):
             if isinstance(widget, QComboBox):
                 widget.currentIndexChanged.connect(self._update_summary)
@@ -5915,6 +6122,14 @@ class RFPerformanceSettingsDialog(QDialog):
         self.shared_memory = QCheckBox("Use shared-memory worker result arrays")
         self.shared_memory.setChecked(bool(settings.use_shared_memory_rf_results))
         form.addRow(self.shared_memory)
+        self.save_results_disk = QCheckBox("Save completed simulations beside the RF plan")
+        self.save_results_disk.setChecked(bool(settings.save_simulation_results_to_disk))
+        self.save_results_disk.setToolTip("Writes one compressed result file for each floor and frequency after the RF plan has been saved or loaded.")
+        form.addRow(self.save_results_disk)
+        self.load_results_disk = QCheckBox("Reuse compatible saved simulations on project load and PDF export")
+        self.load_results_disk.setChecked(bool(settings.load_saved_simulation_results))
+        self.load_results_disk.setToolTip("Saved files are reused only when their AP, geometry, resolution, boundary and RF-setting signature matches.")
+        form.addRow(self.load_results_disk)
         self.tabs.addTab(page, "Sampling and caches")
 
     def _build_rendering_tab(self, settings: HeatmapSettings):
@@ -5993,7 +6208,106 @@ class RFPerformanceSettingsDialog(QDialog):
         self.relative_path_cutoff.setValue(float(settings.multipath_relative_power_cutoff_db))
         self.relative_path_cutoff.setSuffix(" dB")
         form.addRow("Discard paths below strongest by", self.relative_path_cutoff)
+        self.quick_cutoff = QCheckBox("Enable quick absolute RSSI cutoff")
+        self.quick_cutoff.setChecked(bool(settings.enable_quick_rssi_cutoff))
+        self.quick_cutoff.setToolTip("Skips all wall, reflection and diffraction work when the unobstructed best-case signal cannot reach the selected threshold.")
+        form.addRow(self.quick_cutoff)
+        self.quick_cutoff_preset = QComboBox()
+        self.quick_cutoff_preset.addItem("Custom", None)
+        self.quick_cutoff_preset.addItem("Wi-Fi working preview (-80 dBm)", -80.0)
+        self.quick_cutoff_preset.addItem("Short-range IoT / BLE (-95 dBm)", -95.0)
+        self.quick_cutoff_preset.addItem("LP-WAN working study (-120 dBm)", -120.0)
+        self.quick_cutoff_preset.addItem("Very weak-link study (-130 dBm)", -130.0)
+        form.addRow("Quick-cutoff preset", self.quick_cutoff_preset)
+        self.quick_cutoff_dbm = QDoubleSpinBox()
+        self.quick_cutoff_dbm.setRange(-180.0, -20.0)
+        self.quick_cutoff_dbm.setDecimals(1)
+        self.quick_cutoff_dbm.setSingleStep(1.0)
+        self.quick_cutoff_dbm.setValue(float(settings.quick_rssi_cutoff_dbm))
+        self.quick_cutoff_dbm.setSuffix(" dBm")
+        form.addRow("Quick calculation threshold", self.quick_cutoff_dbm)
+        self.quick_cutoff_preset.currentIndexChanged.connect(self._apply_quick_cutoff_preset)
         self.tabs.addTab(page, "Propagation cost")
+
+
+    def _build_gpu_tab(self, settings: HeatmapSettings):
+        page, form = self._page_with_form()
+        self.enable_opencl = QCheckBox("Use OpenCL GPU acceleration when available")
+        self.enable_opencl.setChecked(bool(settings.enable_opencl_gpu))
+        self.enable_opencl.setToolTip(
+            "OpenCL supports Intel, AMD and NVIDIA drivers. IFC/Shapely geometry remains CPU-based; "
+            "dense influence masks, AP-field aggregation, adaptive resampling and raster colour mapping use the GPU."
+        )
+        form.addRow(self.enable_opencl)
+
+        self.opencl_device = QComboBox()
+        self.opencl_device.addItem("Automatic GPU selection", "auto")
+        known = discover_opencl_devices(include_cpu=True)
+        for device in known:
+            token = f"{device.vendor} {device.name}".strip()
+            self.opencl_device.addItem(device.label, token)
+        preferred = str(settings.opencl_device_preference or "auto")
+        index = self.opencl_device.findData(preferred)
+        if index < 0 and preferred.lower() != "auto":
+            self.opencl_device.addItem(f"Saved preference: {preferred}", preferred)
+            index = self.opencl_device.count() - 1
+        self.opencl_device.setCurrentIndex(max(0, index))
+        form.addRow("OpenCL device", self.opencl_device)
+
+        self.opencl_allow_cpu = QCheckBox("Allow an OpenCL CPU device when no GPU is present")
+        self.opencl_allow_cpu.setChecked(bool(settings.opencl_allow_cpu_device))
+        form.addRow(self.opencl_allow_cpu)
+        self.opencl_min_work = QSpinBox()
+        self.opencl_min_work.setRange(1_000, 100_000_000)
+        self.opencl_min_work.setSingleStep(10_000)
+        self.opencl_min_work.setValue(int(settings.opencl_min_work_items))
+        self.opencl_min_work.setToolTip("Smaller jobs stay on NumPy/CPU because transfer and kernel-start overhead can exceed the GPU saving.")
+        form.addRow("Minimum GPU work items", self.opencl_min_work)
+
+        self.opencl_influence = QCheckBox("GPU whole-grid AP influence and cutoff pruning")
+        self.opencl_influence.setChecked(bool(settings.opencl_accelerate_influence))
+        form.addRow(self.opencl_influence)
+        self.opencl_combine = QCheckBox("GPU strongest-AP field aggregation")
+        self.opencl_combine.setChecked(bool(settings.opencl_accelerate_field_combine))
+        form.addRow(self.opencl_combine)
+        self.opencl_resample = QCheckBox("GPU adaptive-grid resampling")
+        self.opencl_resample.setChecked(bool(settings.opencl_accelerate_resampling))
+        form.addRow(self.opencl_resample)
+        self.opencl_raster = QCheckBox("GPU RSSI-to-colour raster generation")
+        self.opencl_raster.setChecked(bool(settings.opencl_accelerate_raster))
+        form.addRow(self.opencl_raster)
+
+        self.opencl_status_label = QLabel(opencl_status(settings))
+        self.opencl_status_label.setWordWrap(True)
+        form.addRow("Detected backend", self.opencl_status_label)
+        refresh = QPushButton("Refresh OpenCL device detection")
+        refresh.clicked.connect(self._refresh_opencl_devices)
+        form.addRow(refresh)
+        note = QLabel(
+            "Install PyOpenCL and the GPU vendor's current OpenCL runtime. The simulator automatically falls back "
+            "to its existing CPU multiprocessing path if the package, driver or selected device is unavailable."
+        )
+        note.setWordWrap(True)
+        form.addRow("Driver requirement", note)
+        self.tabs.addTab(page, "GPU / OpenCL")
+
+    def _refresh_opencl_devices(self):
+        reset_opencl_backends()
+        current = str(self.opencl_device.currentData() or "auto")
+        self.opencl_device.blockSignals(True)
+        self.opencl_device.clear()
+        self.opencl_device.addItem("Automatic GPU selection", "auto")
+        for device in discover_opencl_devices(include_cpu=True):
+            self.opencl_device.addItem(device.label, f"{device.vendor} {device.name}".strip())
+        index = self.opencl_device.findData(current)
+        self.opencl_device.setCurrentIndex(max(0, index))
+        self.opencl_device.blockSignals(False)
+        probe = copy.copy(self.parent().heatmap_settings) if self.parent() is not None else HeatmapSettings.default()
+        probe.enable_opencl_gpu = self.enable_opencl.isChecked()
+        probe.opencl_device_preference = str(self.opencl_device.currentData() or "auto")
+        probe.opencl_allow_cpu_device = self.opencl_allow_cpu.isChecked()
+        self.opencl_status_label.setText(opencl_status(probe))
+        self._update_summary()
 
     def _connect_enabled_state(self):
         self.enable_rf_mp.toggled.connect(self._update_enabled_state)
@@ -6005,6 +6319,13 @@ class RFPerformanceSettingsDialog(QDialog):
         self.interactive_preview.toggled.connect(self._update_enabled_state)
         self.reflections.toggled.connect(self._update_enabled_state)
         self.diffraction.toggled.connect(self._update_enabled_state)
+        self.quick_cutoff.toggled.connect(self._update_enabled_state)
+        self.enable_opencl.toggled.connect(self._update_enabled_state)
+
+    def _apply_quick_cutoff_preset(self, *_):
+        value = self.quick_cutoff_preset.currentData()
+        if value is not None:
+            self.quick_cutoff_dbm.setValue(float(value))
 
     def _update_enabled_state(self, *_):
         for widget in (self.rf_workers, self.rf_min_points, self.tile_rows, self.tiles_per_worker, self.reuse_pool, self.worker_index_cache):
@@ -6022,6 +6343,10 @@ class RFPerformanceSettingsDialog(QDialog):
         for widget in (self.reflection_order, self.reflection_surfaces, self.reflection_paths):
             widget.setEnabled(self.reflections.isChecked())
         self.diffraction_paths.setEnabled(self.diffraction.isChecked())
+        self.quick_cutoff_preset.setEnabled(self.quick_cutoff.isChecked())
+        self.quick_cutoff_dbm.setEnabled(self.quick_cutoff.isChecked())
+        for widget in (self.opencl_device, self.opencl_allow_cpu, self.opencl_min_work, self.opencl_influence, self.opencl_combine, self.opencl_resample, self.opencl_raster):
+            widget.setEnabled(self.enable_opencl.isChecked())
         self._update_summary()
 
     def _apply_laptop_preset(self):
@@ -6051,6 +6376,13 @@ class RFPerformanceSettingsDialog(QDialog):
         self.fading.setChecked(False)
         self.delay_spread.setChecked(False)
         self.relative_path_cutoff.setValue(25.0)
+        self.quick_cutoff.setChecked(True)
+        self.quick_cutoff_dbm.setValue(-80.0)
+        self.save_results_disk.setChecked(True)
+        self.load_results_disk.setChecked(True)
+        self.enable_opencl.setChecked(True)
+        self.opencl_device.setCurrentIndex(max(0, self.opencl_device.findData("auto")))
+        self.opencl_min_work.setValue(100000)
         self._update_enabled_state()
 
     def _apply_automatic_preset(self):
@@ -6083,6 +6415,12 @@ class RFPerformanceSettingsDialog(QDialog):
         self.fading.setChecked(True)
         self.delay_spread.setChecked(True)
         self.relative_path_cutoff.setValue(30.0)
+        self.quick_cutoff.setChecked(False)
+        self.save_results_disk.setChecked(True)
+        self.load_results_disk.setChecked(True)
+        self.enable_opencl.setChecked(True)
+        self.opencl_device.setCurrentIndex(max(0, self.opencl_device.findData("auto")))
+        self.opencl_min_work.setValue(100000)
         self._update_enabled_state()
 
     def _apply_fast_preset(self):
@@ -6093,18 +6431,22 @@ class RFPerformanceSettingsDialog(QDialog):
         self.diffraction.setChecked(False)
         self.relative_path_cutoff.setValue(20.0)
         self.preview_resolution.setValue(5.0)
+        self.quick_cutoff.setChecked(True)
+        self.quick_cutoff_dbm.setValue(-80.0)
         self._update_enabled_state()
 
     def _update_summary(self, *_):
         rf_workers = "automatic" if self.rf_workers.value() == 0 else str(self.rf_workers.value())
         ifc_workers = "automatic" if self.ifc_workers.value() == 0 else str(self.ifc_workers.value())
         boundary = "on" if self.boundary_filter.isChecked() else "off"
+        gpu = "off" if not self.enable_opencl.isChecked() else str(self.opencl_device.currentText())
         warning = ""
         if self.boundary_filter.isChecked() and not self._has_planner_boundaries:
             warning = " Boundary limiting is selected, but this project currently contains no planner boundaries."
         self.summary.setText(
             f"Current selection: {self.profile.currentText()}, RF workers {rf_workers}, IFC workers {ifc_workers}, "
-            f"{self.render_mode.currentText().lower()}, boundary filter {boundary}." + warning
+            f"{self.render_mode.currentText().lower()}, boundary filter {boundary}, "
+            f"quick cutoff {self.quick_cutoff_dbm.value():.0f} dBm if enabled, GPU {gpu}." + warning
         )
 
     @property
@@ -6140,6 +6482,15 @@ class RFPerformanceSettingsDialog(QDialog):
         settings.enable_tile_local_geometry = self.tile_local_geometry.isChecked()
         settings.enable_numba_rf_kernels = self.numba_kernels.isChecked()
         settings.use_shared_memory_rf_results = self.shared_memory.isChecked()
+        settings.enable_opencl_gpu = self.enable_opencl.isChecked()
+        settings.opencl_device_preference = str(self.opencl_device.currentData() or "auto")
+        settings.opencl_allow_cpu_device = self.opencl_allow_cpu.isChecked()
+        settings.opencl_min_work_items = int(self.opencl_min_work.value())
+        settings.opencl_accelerate_influence = self.opencl_influence.isChecked()
+        settings.opencl_accelerate_field_combine = self.opencl_combine.isChecked()
+        settings.opencl_accelerate_resampling = self.opencl_resample.isChecked()
+        settings.opencl_accelerate_raster = self.opencl_raster.isChecked()
+        reset_opencl_backends()
         settings.heatmap_render_mode = str(self.render_mode.currentData() or "raster")
         settings.contour_interpolation_factor = int(self.contour_interpolation.value())
         settings.progressive_heatmap_updates = self.progressive_updates.isChecked()
@@ -6156,6 +6507,189 @@ class RFPerformanceSettingsDialog(QDialog):
         settings.enable_small_scale_fading = self.fading.isChecked()
         settings.calculate_delay_spread = self.delay_spread.isChecked()
         settings.multipath_relative_power_cutoff_db = float(self.relative_path_cutoff.value())
+        settings.enable_quick_rssi_cutoff = self.quick_cutoff.isChecked()
+        settings.quick_rssi_cutoff_dbm = float(self.quick_cutoff_dbm.value())
+        settings.save_simulation_results_to_disk = self.save_results_disk.isChecked()
+        settings.load_saved_simulation_results = self.load_results_disk.isChecked()
+
+
+class PDFExportSelectionDialog(QDialog):
+    """Choose the floors and active RF frequencies included in a PDF report."""
+
+    def __init__(
+        self,
+        parent,
+        floor_items: Sequence[Tuple[str, FloorModel]],
+        frequencies_mhz: Sequence[float],
+        current_floor_name: str = "",
+        current_frequency_mhz: Optional[float] = None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("RSSI PDF export selection")
+        self.resize(700, 560)
+        self._current_floor_name = str(current_floor_name or "")
+        self._current_frequency_mhz = (
+            None if current_frequency_mhz is None else float(current_frequency_mhz)
+        )
+
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "Select the floors and frequencies to include. The report creates one page for each "
+            "selected floor/frequency combination and uses the same RF simulation engine, resolution, "
+            "propagation model, boundary mask and inter-floor setting as Simulate RSSI. Compatible saved "
+            "floor/frequency simulations are reused before any new calculation is started."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        columns = QHBoxLayout()
+        layout.addLayout(columns, 1)
+
+        floor_column = QVBoxLayout()
+        floor_column.addWidget(QLabel("Floors"))
+        self.floor_list = QListWidget()
+        self.floor_list.setAlternatingRowColors(True)
+        for floor_name, floor in floor_items:
+            item = QListWidgetItem(f"{floor_name}  —  elevation {float(floor.elevation):g} m")
+            item.setData(Qt.UserRole, str(floor_name))
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked)
+            self.floor_list.addItem(item)
+        floor_column.addWidget(self.floor_list, 1)
+        floor_buttons = QHBoxLayout()
+        floor_all = QPushButton("All")
+        floor_all.clicked.connect(lambda: self._set_all_checked(self.floor_list, True))
+        floor_current = QPushButton("Current only")
+        floor_current.clicked.connect(self._select_current_floor)
+        floor_none = QPushButton("None")
+        floor_none.clicked.connect(lambda: self._set_all_checked(self.floor_list, False))
+        floor_buttons.addWidget(floor_all)
+        floor_buttons.addWidget(floor_current)
+        floor_buttons.addWidget(floor_none)
+        floor_column.addLayout(floor_buttons)
+        columns.addLayout(floor_column, 1)
+
+        frequency_column = QVBoxLayout()
+        frequency_column.addWidget(QLabel("Frequencies"))
+        self.frequency_list = QListWidget()
+        self.frequency_list.setAlternatingRowColors(True)
+        for frequency in sorted({float(value) for value in frequencies_mhz}):
+            item = QListWidgetItem(MainWindow._pdf_frequency_label(frequency))
+            item.setData(Qt.UserRole, float(frequency))
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            use_current = (
+                self._current_frequency_mhz is not None
+                and abs(float(frequency) - self._current_frequency_mhz) < 1e-6
+            )
+            item.setCheckState(Qt.Checked if use_current else Qt.Unchecked)
+            self.frequency_list.addItem(item)
+        if not self.selected_frequencies() and self.frequency_list.count():
+            self.frequency_list.item(0).setCheckState(Qt.Checked)
+        frequency_column.addWidget(self.frequency_list, 1)
+        frequency_buttons = QHBoxLayout()
+        frequency_all = QPushButton("All")
+        frequency_all.clicked.connect(lambda: self._set_all_checked(self.frequency_list, True))
+        frequency_current = QPushButton("Current only")
+        frequency_current.clicked.connect(self._select_current_frequency)
+        frequency_none = QPushButton("None")
+        frequency_none.clicked.connect(lambda: self._set_all_checked(self.frequency_list, False))
+        frequency_buttons.addWidget(frequency_all)
+        frequency_buttons.addWidget(frequency_current)
+        frequency_buttons.addWidget(frequency_none)
+        frequency_column.addLayout(frequency_buttons)
+        columns.addLayout(frequency_column, 1)
+
+        self.summary = QLabel()
+        self.summary.setWordWrap(True)
+        layout.addWidget(self.summary)
+        self.floor_list.itemChanged.connect(self._update_summary)
+        self.frequency_list.itemChanged.connect(self._update_summary)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self._update_summary()
+
+    @staticmethod
+    def _set_all_checked(list_widget: QListWidget, checked: bool):
+        state = Qt.Checked if checked else Qt.Unchecked
+        list_widget.blockSignals(True)
+        try:
+            for index in range(list_widget.count()):
+                list_widget.item(index).setCheckState(state)
+        finally:
+            list_widget.blockSignals(False)
+        parent = list_widget.window()
+        if isinstance(parent, PDFExportSelectionDialog):
+            parent._update_summary()
+
+    def _select_current_floor(self):
+        self.floor_list.blockSignals(True)
+        try:
+            for index in range(self.floor_list.count()):
+                item = self.floor_list.item(index)
+                item.setCheckState(
+                    Qt.Checked
+                    if str(item.data(Qt.UserRole)) == self._current_floor_name
+                    else Qt.Unchecked
+                )
+        finally:
+            self.floor_list.blockSignals(False)
+        if not self.selected_floor_names() and self.floor_list.count():
+            self.floor_list.item(0).setCheckState(Qt.Checked)
+        self._update_summary()
+
+    def _select_current_frequency(self):
+        self.frequency_list.blockSignals(True)
+        try:
+            for index in range(self.frequency_list.count()):
+                item = self.frequency_list.item(index)
+                frequency = float(item.data(Qt.UserRole))
+                item.setCheckState(
+                    Qt.Checked
+                    if self._current_frequency_mhz is not None
+                    and abs(frequency - self._current_frequency_mhz) < 1e-6
+                    else Qt.Unchecked
+                )
+        finally:
+            self.frequency_list.blockSignals(False)
+        if not self.selected_frequencies() and self.frequency_list.count():
+            self.frequency_list.item(0).setCheckState(Qt.Checked)
+        self._update_summary()
+
+    def selected_floor_names(self) -> List[str]:
+        return [
+            str(self.floor_list.item(index).data(Qt.UserRole))
+            for index in range(self.floor_list.count())
+            if self.floor_list.item(index).checkState() == Qt.Checked
+        ]
+
+    def selected_frequencies(self) -> List[float]:
+        return [
+            float(self.frequency_list.item(index).data(Qt.UserRole))
+            for index in range(self.frequency_list.count())
+            if self.frequency_list.item(index).checkState() == Qt.Checked
+        ]
+
+    def _update_summary(self, *_):
+        floor_count = len(self.selected_floor_names())
+        frequency_count = len(self.selected_frequencies())
+        page_count = floor_count * frequency_count
+        self.summary.setText(
+            f"Selected: {floor_count} floor{'s' if floor_count != 1 else ''}, "
+            f"{frequency_count} frequenc{'ies' if frequency_count != 1 else 'y'}, "
+            f"{page_count} PDF page{'s' if page_count != 1 else ''}."
+        )
+
+    def accept(self):
+        if not self.selected_floor_names():
+            QMessageBox.warning(self, "No floors selected", "Select at least one floor for the PDF report.")
+            return
+        if not self.selected_frequencies():
+            QMessageBox.warning(self, "No frequencies selected", "Select at least one active RF frequency.")
+            return
+        super().accept()
 
 
 class PropagationSettingsDialog(QDialog):
@@ -7392,6 +7926,10 @@ class MainWindow(QMainWindow):
         self._suggested_boundary_preview_items: List[QGraphicsItem] = []
         self._suggested_space_preview_items: List[QGraphicsItem] = []
         self._pending_plan_data: Optional[Dict[str, object]] = None
+        self._suppress_saved_result_restore: bool = False
+        self.current_rf_plan_path: Optional[Path] = None
+        self._saved_simulation_entries: Dict[Tuple[str, float], Dict[str, object]] = {}
+        self._saved_simulation_root: Optional[Path] = None
         self.dxf_overlay: Optional[DxfOverlay] = None
         self.ifc_alignment = AlignmentTransform()
         self.alignment_pick_mode: Optional[str] = None
@@ -7443,6 +7981,35 @@ class MainWindow(QMainWindow):
         self._refresh_rssi_frequency_dropdown()
 
         self.rssi_results_by_frequency: Dict[float, SimulationResult] = {}
+
+        # Full RSSI calculations are coordinated by a daemon thread so waiting
+        # for process-pool tiles, adaptive passes and cache assembly never blocks
+        # the Qt event loop. Only scene/result application happens on the GUI
+        # thread through the polling timer below.
+        self._rssi_calculation_thread: Optional[threading.Thread] = None
+        self._rssi_calculation_future: Optional[concurrent.futures.Future] = None
+        self._rssi_calculation_poll_timer = QTimer(self)
+        self._rssi_calculation_poll_timer.setInterval(75)
+        self._rssi_calculation_poll_timer.timeout.connect(self._poll_rssi_calculation)
+        self._rssi_calculation_progress_dialog: Optional[QProgressDialog] = None
+        self._rssi_calculation_cancel_event: Optional[threading.Event] = None
+        self._rssi_calculation_state_lock = threading.Lock()
+        self._rssi_calculation_progress_state: Dict[str, object] = {
+            "done": 0, "total": 1, "label": "Preparing RSSI calculation..."
+        }
+        self._rssi_calculation_partial_results: Optional[Dict[float, SimulationResult]] = None
+        self._rssi_calculation_partial_fraction: float = 0.0
+        self._rssi_calculation_partial_applied: float = 0.0
+        self._rssi_calculation_request_token: str = ""
+        self._rssi_calculation_floor_name: str = ""
+        self._rssi_calculation_signature_context: Optional[Dict[str, object]] = None
+        self._rssi_calculation_frequencies: List[float] = []
+        self._rssi_calculation_previous_results: Dict[float, SimulationResult] = {}
+        self._rssi_calculation_previous_last_result: Optional[SimulationResult] = None
+        self._rssi_calculation_results_persisted: bool = False
+        self._rssi_calculation_ui_states: List[Tuple[object, bool]] = []
+        self._rssi_persist_lock = threading.Lock()
+        self._heatmap_scene_items: List[QGraphicsItem] = []
 
         self.pattern_combo = QComboBox()
         self.pattern_combo.addItems(list(self.antenna_patterns.keys()))
@@ -7952,7 +8519,7 @@ class MainWindow(QMainWindow):
                 "SP_DialogSaveButton", "Ctrl+E"
             ),
             "export_pdf_action": (
-                "Export floor PDF", "Calculate the selected RSSI frequency for every floor and export one scaled floor-plan heatmap page per floor, including the RSSI legend and propagation summary.",
+                "Export floor PDF", "Choose floors and active frequencies, then calculate and export one scaled RSSI heatmap page for each selected floor/frequency combination using the same simulation pipeline as Simulate RSSI.",
                 "SP_FileDialogContentsView", "Ctrl+Shift+E"
             ),
             "clear_ap_action": (
@@ -8012,7 +8579,7 @@ class MainWindow(QMainWindow):
                 "SP_FileDialogDetailedView", "Ctrl+Alt+M"
             ),
             "performance_settings_action": (
-                "Performance settings", "Configure RF and IFC worker counts, adaptive sampling, AP-field caches, raster rendering, previews and propagation-cost limits. Includes an i7-1255U/laptop preset.",
+                "Performance settings", "Configure RF and IFC workers, adaptive sampling, AP-field caches, quick RSSI cutoffs, saved floor/frequency simulations, raster rendering, previews and propagation-cost limits. Includes an i7-1255U/laptop preset.",
                 "SP_ComputerIcon", "Ctrl+Alt+Shift+P"
             ),
             "boundary_result_filter_action": (
@@ -12395,7 +12962,7 @@ class MainWindow(QMainWindow):
                 else:
                     inferred_spaces.append(item)
         return {
-            "format": "rf-attenuation-plan", "version": 7,
+            "format": "rf-attenuation-plan", "version": 8,
             "ifc_paths": [str(path) for path in self.loaded_ifc_paths],
             "selected_floor": self.floor.name if self.floor else "", "view_rotation_deg": self.view_rotation_deg,
             "ifc_alignment": {"dx": self.ifc_alignment.dx, "dy": self.ifc_alignment.dy, "rotation_deg": self.ifc_alignment.rotation_deg, "scale": self.ifc_alignment.scale},
@@ -12417,13 +12984,244 @@ class MainWindow(QMainWindow):
             "element_overrides": element_overrides,
         }
 
+    @staticmethod
+    def _safe_result_component(value: object) -> str:
+        text = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "floor")).strip("._")
+        return text or "floor"
+
+    @staticmethod
+    def _result_directory_for_plan(plan_path: Path) -> Path:
+        name = plan_path.name
+        if name.lower().endswith(".rfplan.json"):
+            stem = name[:-len(".rfplan.json")]
+        else:
+            stem = plan_path.stem
+        return plan_path.parent / f"{stem}_rf_results"
+
+    def _simulation_signature_context(self) -> Dict[str, object]:
+        """Build common signature state once for a save/load/PDF batch.
+
+        Floor geometry and relevant AP revisions are deliberately added by
+        ``_simulation_signature``. This means a change on another floor does not
+        invalidate a saved result when inter-floor propagation is disabled.
+        """
+        return {
+            "format": 1,
+            "resolution_m": round(float(self.resolution.value()), 6),
+            "include_inter_floor": bool(self.include_inter_floor.isChecked()),
+            "settings": RFEngine._settings_revision(self.heatmap_settings),
+            "patterns": RFEngine._pattern_revision(self.antenna_patterns),
+            "boundary": RFEngine._boundary_revision(self._rssi_calculation_boundary()),
+        }
+
+    def _simulation_signature(
+        self, floor: FloorModel, frequency_mhz: float,
+        context: Optional[Dict[str, object]] = None,
+    ) -> str:
+        frequency = float(frequency_mhz)
+        signature_context = context or self._simulation_signature_context()
+        include_inter_floor = bool(signature_context.get(
+            "include_inter_floor", self.include_inter_floor.isChecked()
+        ))
+        relevant_aps = []
+        for ap in self.aps:
+            if not include_inter_floor and str(ap.floor) != str(floor.name):
+                continue
+            radios = [
+                radio for radio in ap.active_radios()
+                if abs(float(radio.frequency_mhz) - frequency) < 1e-6
+            ]
+            if radios:
+                relevant_aps.append(RFEngine._ap_revision(replace(ap, radios=radios)))
+        geometry_models = self.floors if include_inter_floor else {str(floor.name): floor}
+        return stable_digest({
+            "context": signature_context,
+            "floor": str(floor.name),
+            "frequency_mhz": round(frequency, 6),
+            "geometry": RFEngine._geometry_revision(geometry_models),
+            "aps": tuple(sorted(relevant_aps)),
+        })
+
+    def _simulation_result_filename(self, floor_name: str, frequency_mhz: float) -> str:
+        floor_text = self._safe_result_component(floor_name)
+        frequency_text = (f"{float(frequency_mhz):.6f}").rstrip("0").rstrip(".").replace(".", "_")
+        return f"floor_{floor_text}__frequency_{frequency_text}MHz.rfsim.npz"
+
+    @staticmethod
+    def _write_simulation_result_payload(
+        target: Path, result: SimulationResult, metadata: Dict[str, object]
+    ) -> None:
+        """Write one compressed result without accessing any Qt object."""
+        target.parent.mkdir(parents=True, exist_ok=True)
+        delay = np.asarray(
+            result.delay_spread_ns if result.delay_spread_ns is not None else np.empty((0, 0)),
+            dtype=float,
+        )
+        counts = np.asarray(
+            result.path_count if result.path_count is not None else np.empty((0, 0)),
+            dtype=np.int16,
+        )
+        valid = np.asarray(
+            result.valid_mask if result.valid_mask is not None else np.empty((0, 0)),
+            dtype=bool,
+        )
+        temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with temporary.open("wb") as stream:
+                np.savez_compressed(
+                    stream,
+                    xs=np.asarray(result.xs, dtype=float),
+                    ys=np.asarray(result.ys, dtype=float),
+                    rssi=np.asarray(result.rssi, dtype=float),
+                    delay_spread_ns=delay,
+                    path_count=counts,
+                    valid_mask=valid,
+                    metadata_json=np.asarray(json.dumps(metadata, separators=(",", ":"))),
+                )
+            os.replace(temporary, target)
+        finally:
+            try:
+                if temporary.exists():
+                    temporary.unlink()
+            except Exception:
+                pass
+
+    def _write_simulation_result_file(self, target: Path, floor: FloorModel, frequency_mhz: float, result: SimulationResult, signature_context: Optional[Dict[str, object]] = None) -> Dict[str, object]:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        signature = self._simulation_signature(floor, frequency_mhz, signature_context)
+        metadata = {
+            "format": "rf-simulation-result", "version": 1,
+            "floor": str(floor.name), "frequency_mhz": float(frequency_mhz),
+            "signature": signature, "resolution_m": float(self.resolution.value()),
+            "include_inter_floor": bool(self.include_inter_floor.isChecked()),
+            "ignored_point_count": int(result.ignored_point_count),
+            "execution_mode": str(result.execution_mode), "worker_processes": int(result.worker_processes),
+            "elapsed_seconds": float(result.elapsed_seconds),
+            "performance_note": str(result.performance_note),
+            "approximate_points": int(result.approximate_points), "exact_points": int(result.exact_points),
+            "cache_hits": int(result.cache_hits), "cache_misses": int(result.cache_misses),
+            "render_mode_override": str(result.render_mode_override),
+            "quick_cutoff_enabled": bool(self.heatmap_settings.enable_quick_rssi_cutoff),
+            "quick_cutoff_dbm": float(self.heatmap_settings.quick_rssi_cutoff_dbm),
+        }
+        self._write_simulation_result_payload(target, result, metadata)
+        return {
+            "floor": str(floor.name), "frequency_mhz": float(frequency_mhz),
+            "file": target.name, "signature": signature,
+        }
+
+    def _read_simulation_result_file(self, path: Path, floor: FloorModel, frequency_mhz: float, signature_context: Optional[Dict[str, object]] = None) -> Optional[SimulationResult]:
+        if not path.exists():
+            return None
+        try:
+            with np.load(path, allow_pickle=False) as stored:
+                metadata = json.loads(str(np.asarray(stored["metadata_json"]).item()))
+                if metadata.get("format") != "rf-simulation-result":
+                    return None
+                if str(metadata.get("floor", "")) != str(floor.name):
+                    return None
+                if abs(float(metadata.get("frequency_mhz", 0.0)) - float(frequency_mhz)) > 1e-6:
+                    return None
+                if str(metadata.get("signature", "")) != self._simulation_signature(floor, frequency_mhz, signature_context):
+                    return None
+                delay = np.asarray(stored["delay_spread_ns"], dtype=float)
+                counts = np.asarray(stored["path_count"], dtype=np.int16)
+                valid = np.asarray(stored["valid_mask"], dtype=bool)
+                result = SimulationResult(
+                    xs=np.asarray(stored["xs"], dtype=float), ys=np.asarray(stored["ys"], dtype=float),
+                    rssi=np.asarray(stored["rssi"], dtype=float),
+                    delay_spread_ns=None if delay.size == 0 else delay,
+                    path_count=None if counts.size == 0 else counts,
+                    valid_mask=None if valid.size == 0 else valid,
+                    boundary_geometry=self._rssi_calculation_boundary(),
+                    ignored_point_count=int(metadata.get("ignored_point_count", 0)),
+                    execution_mode="saved-result", worker_processes=int(metadata.get("worker_processes", 1)),
+                    elapsed_seconds=float(metadata.get("elapsed_seconds", 0.0)),
+                    performance_note=(str(metadata.get("performance_note", "")) + " Loaded from disk.").strip(),
+                    approximate_points=int(metadata.get("approximate_points", 0)),
+                    exact_points=int(metadata.get("exact_points", 0)),
+                    cache_hits=int(metadata.get("cache_hits", 0)), cache_misses=int(metadata.get("cache_misses", 0)),
+                    render_mode_override=str(metadata.get("render_mode_override", "")),
+                )
+                return result
+        except Exception:
+            return None
+
+    def _persist_simulation_results(self, floor: FloorModel, results: Dict[float, SimulationResult], plan_path: Optional[Path] = None, signature_context: Optional[Dict[str, object]] = None):
+        if not bool(self.heatmap_settings.save_simulation_results_to_disk):
+            return
+        target_plan = Path(plan_path or self.current_rf_plan_path) if (plan_path or self.current_rf_plan_path) else None
+        if target_plan is None:
+            return
+        root = self._result_directory_for_plan(target_plan)
+        for frequency, result in results.items():
+            if result is None:
+                continue
+            target = root / self._simulation_result_filename(floor.name, float(frequency))
+            entry = self._write_simulation_result_file(target, floor, float(frequency), result, signature_context)
+            self._saved_simulation_entries[(str(floor.name), float(frequency))] = entry
+        self._saved_simulation_root = root
+
+    def _load_saved_results_for_floor(self, floor: FloorModel, frequencies_mhz: Sequence[float], signature_context: Optional[Dict[str, object]] = None) -> Dict[float, SimulationResult]:
+        if not bool(self.heatmap_settings.load_saved_simulation_results):
+            return {}
+        root = self._saved_simulation_root
+        if root is None and self.current_rf_plan_path is not None:
+            root = self._result_directory_for_plan(self.current_rf_plan_path)
+        if root is None:
+            return {}
+        loaded: Dict[float, SimulationResult] = {}
+        for frequency in frequencies_mhz:
+            key = (str(floor.name), float(frequency))
+            entry = self._saved_simulation_entries.get(key, {})
+            filename = str(entry.get("file", "")) or self._simulation_result_filename(floor.name, float(frequency))
+            result = self._read_simulation_result_file(root / filename, floor, float(frequency), signature_context)
+            if result is not None:
+                loaded[float(frequency)] = result
+                self._saved_simulation_entries[key] = {
+                    "floor": str(floor.name), "frequency_mhz": float(frequency),
+                    "file": filename, "signature": self._simulation_signature(floor, float(frequency), signature_context),
+                }
+        return loaded
+
+    def _simulation_manifest_for_plan(self, plan_path: Path) -> Dict[str, object]:
+        new_root = self._result_directory_for_plan(plan_path)
+        old_root = self._saved_simulation_root
+        if old_root is not None and old_root.resolve() != new_root.resolve():
+            new_root.mkdir(parents=True, exist_ok=True)
+            for entry in list(self._saved_simulation_entries.values()):
+                filename = str(entry.get("file", ""))
+                if not filename:
+                    continue
+                source = old_root / filename
+                if source.exists():
+                    try:
+                        shutil.copy2(source, new_root / filename)
+                    except Exception:
+                        pass
+        signature_context = self._simulation_signature_context()
+        if self.floor is not None and self.rssi_results_by_frequency:
+            self._persist_simulation_results(self.floor, self.rssi_results_by_frequency, plan_path, signature_context)
+        self._saved_simulation_root = new_root
+        files = sorted(self._saved_simulation_entries.values(), key=lambda item: (str(item.get("floor", "")), float(item.get("frequency_mhz", 0.0))))
+        return {
+            "format": "rf-simulation-result-set", "version": 1,
+            "directory": new_root.name, "files": files,
+        }
+
     def save_rf_plan(self):
         path, _ = QFileDialog.getSaveFileName(self, "Save RF plan", "rf_plan.rfplan.json", "RF plan (*.rfplan.json);;JSON files (*.json)")
         if not path:
             return
         try:
-            Path(path).write_text(json.dumps(self._rf_plan_data(), indent=2), encoding="utf-8")
-            self.statusBar().showMessage(f"Saved RF plan: {Path(path).name}")
+            plan_path = Path(path)
+            self.current_rf_plan_path = plan_path
+            data = self._rf_plan_data()
+            data["simulation_results"] = self._simulation_manifest_for_plan(plan_path)
+            temporary = plan_path.with_name(f".{plan_path.name}.{uuid.uuid4().hex}.tmp")
+            temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            os.replace(temporary, plan_path)
+            self.statusBar().showMessage(f"Saved RF plan and simulation files: {plan_path.name}")
         except Exception as exc:
             QMessageBox.warning(self, "RF plan save failed", str(exc))
 
@@ -12432,11 +13230,24 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
-            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            plan_path = Path(path)
+            data = json.loads(plan_path.read_text(encoding="utf-8"))
             if data.get("format") != "rf-attenuation-plan":
                 raise ValueError("This is not an RF Attenuation Simulator plan file.")
         except Exception as exc:
             QMessageBox.warning(self, "RF plan load failed", str(exc)); return
+        self.current_rf_plan_path = plan_path
+        manifest = data.get("simulation_results", {}) if isinstance(data.get("simulation_results", {}), dict) else {}
+        directory = str(manifest.get("directory", "")).strip()
+        self._saved_simulation_root = plan_path.parent / directory if directory else self._result_directory_for_plan(plan_path)
+        self._saved_simulation_entries = {}
+        for entry in manifest.get("files", []):
+            if not isinstance(entry, dict):
+                continue
+            try:
+                self._saved_simulation_entries[(str(entry.get("floor", "")), float(entry.get("frequency_mhz", 0.0)))] = dict(entry)
+            except Exception:
+                continue
         if not self.floors:
             paths = [Path(v) for v in data.get("ifc_paths", []) if str(v).strip()]
             existing_paths = [candidate for candidate in paths if candidate.exists()]
@@ -12680,8 +13491,12 @@ class MainWindow(QMainWindow):
         )
         self.boundary_result_filter_action.blockSignals(False)
         selected_floor = str(data.get("selected_floor", ""))
-        if selected_floor in self.floors:
-            self.floor_combo.setCurrentText(selected_floor)
+        self._suppress_saved_result_restore = True
+        try:
+            if selected_floor in self.floors:
+                self.floor_combo.setCurrentText(selected_floor)
+        finally:
+            self._suppress_saved_result_restore = False
         self.reset_view_rotation()
         saved_rotation = float(data.get("view_rotation_deg", 0.0))
         if abs(saved_rotation) > 1e-9:
@@ -12689,8 +13504,20 @@ class MainWindow(QMainWindow):
         self._invalidate_interactive_preview_requests()
         self.last_result = None; self.rssi_results_by_frequency = {}
         self._refresh_rssi_frequency_dropdown()
+        loaded_count = 0
+        if self.floor is not None:
+            frequencies = sorted({float(radio.frequency_mhz) for ap in self.aps for radio in ap.active_radios()})
+            restored = self._load_saved_results_for_floor(self.floor, frequencies, self._simulation_signature_context())
+            if restored:
+                self.rssi_results_by_frequency = restored
+                selected_frequency = self._selected_rssi_view_frequency()
+                self.last_result = restored.get(selected_frequency) or restored[sorted(restored)[0]]
+                loaded_count = len(restored)
         self.populate_ap_table(); self.populate_wall_table(); self.draw_floor()
-        self.statusBar().showMessage("Loaded RF plan")
+        self.statusBar().showMessage(
+            f"Loaded RF plan and {loaded_count} saved floor/frequency simulation(s)"
+            if loaded_count else "Loaded RF plan"
+        )
 
     def _refresh_rssi_frequency_dropdown(self):
         if not hasattr(self, "rssi_view_frequency"):
@@ -12730,7 +13557,7 @@ class MainWindow(QMainWindow):
         else:
             self._invalidate_interactive_preview_requests()
             self.last_result = None
-        self.draw_floor()
+        self._replace_heatmap_only(self.last_result)
 
     @staticmethod
     def _bilinear_grid_value(
@@ -13928,6 +14755,20 @@ class MainWindow(QMainWindow):
         self.floor = dict.get(self.floors, str(name), None)
         self._invalidate_interactive_preview_requests()
         self.last_result = None
+        self.rssi_results_by_frequency = {}
+        if (
+            self.floor is not None
+            and self.current_rf_plan_path is not None
+            and self.aps
+            and self._pending_plan_data is None
+            and not self._suppress_saved_result_restore
+        ):
+            frequencies = sorted({float(radio.frequency_mhz) for ap in self.aps for radio in ap.active_radios()})
+            restored = self._load_saved_results_for_floor(self.floor, frequencies, self._simulation_signature_context())
+            if restored:
+                self.rssi_results_by_frequency = restored
+                selected_frequency = self._selected_rssi_view_frequency()
+                self.last_result = restored.get(selected_frequency) or restored[sorted(restored)[0]]
         self._load_slab_attenuation_to_ui()
         self.draw_floor()
         self.populate_ap_table()
@@ -14014,6 +14855,7 @@ class MainWindow(QMainWindow):
         self.view.hide_rssi_hover()
         self._drawing_floor = True
         scene.clear()
+        self._heatmap_scene_items = []
         self._ap_ruler_items = []
         self._ifc_snap_marker_items = []
         self._wall_preview_items = []
@@ -14255,6 +15097,28 @@ class MainWindow(QMainWindow):
                 path.closeSubpath()
         return path
 
+    def _add_heatmap_scene_item(self, item: Optional[QGraphicsItem]):
+        if item is None:
+            return
+        self.view.scene().addItem(item)
+        self._heatmap_scene_items.append(item)
+
+    def _replace_heatmap_only(self, result: Optional[SimulationResult]):
+        """Replace only RF graphics without reconstructing the IFC scene."""
+        scene = self.view.scene()
+        self.view.hide_rssi_hover()
+        for item in list(getattr(self, "_heatmap_scene_items", [])):
+            try:
+                if item.scene() is scene:
+                    scene.removeItem(item)
+            except RuntimeError:
+                pass
+        self._heatmap_scene_items = []
+        if result is not None:
+            self._draw_heatmap(result)
+        scene.update()
+        self._update_rssi_legend()
+
     def _draw_heatmap_raster(self, result: SimulationResult, xs: np.ndarray, ys: np.ndarray, z: np.ndarray):
         """Render the heatmap as one RGBA pixmap instead of thousands of fill polygons."""
         if len(xs) < 2 or len(ys) < 2 or z.size == 0:
@@ -14265,9 +15129,14 @@ class MainWindow(QMainWindow):
         )
         image = result.render_cache.get(cache_key)
         if image is None:
-            rgba = np.zeros((z.shape[0], z.shape[1], 4), dtype=np.uint8)
+            gpu_raster = gpu_colourise(z, self.heatmap_settings.zones, self.heatmap_settings)
+            if gpu_raster is not None:
+                rgba, gpu_device = gpu_raster
+                result.render_cache[("opencl_raster_device",)] = gpu_device
+            else:
+                rgba = np.zeros((z.shape[0], z.shape[1], 4), dtype=np.uint8)
             finite = np.isfinite(z)
-            for zone in self.heatmap_settings.zones:
+            for zone in (() if gpu_raster is not None else self.heatmap_settings.zones):
                 mask = finite & (z >= float(zone.min_dbm)) & (z < float(zone.max_dbm))
                 if not np.any(mask):
                     continue
@@ -14279,7 +15148,7 @@ class MainWindow(QMainWindow):
                 rgba[mask, 2] = int(colour.blue())
                 rgba[mask, 3] = max(0, min(255, int(zone.alpha)))
             # Cover values above/below the explicitly bounded zones using the configured end colours.
-            if np.any(finite):
+            if gpu_raster is None and np.any(finite):
                 uncovered = finite & (rgba[:, :, 3] == 0)
                 if np.any(uncovered):
                     high = max(self.heatmap_settings.zones, key=lambda zone: zone.max_dbm)
@@ -14313,7 +15182,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         item.setAcceptedMouseButtons(Qt.NoButton)
-        self.view.scene().addItem(item)
+        self._add_heatmap_scene_item(item)
 
     def _draw_heatmap(self, result: SimulationResult):
         """Draw a cached raster heatmap and optional isolines/sample annotations."""
@@ -14437,7 +15306,7 @@ class MainWindow(QMainWindow):
             item.setBrush(QBrush(self.heatmap_settings.colour_for_rssi(colour_ref)))
             item.setPen(QPen(Qt.NoPen))
             item.setZValue(Z_HEATMAP_FILL)
-            scene.addItem(item)
+            self._add_heatmap_scene_item(item)
 
         contour_font_size = max(1, int(self.heatmap_settings.contour_label_font_size))
         contour_label_limit = 3
@@ -14491,10 +15360,12 @@ class MainWindow(QMainWindow):
                 x_value, y_value, angle = chosen
                 if any(math.hypot(x_value - px, y_value - py) < contour_min_spacing for px, py in label_positions):
                     continue
-                self._add_upright_text(
+                label_item = self._add_upright_text(
                     scene, f"{level:.0f} dBm", x_value, y_value, colours["contour_text"],
                     contour_font_size, Z_TEXT, bold=True, rotation_deg=angle
                 )
+                if label_item is not None:
+                    self._heatmap_scene_items.append(label_item)
                 label_positions.append((x_value, y_value))
                 labels_on_level += 1
 
@@ -14503,7 +15374,7 @@ class MainWindow(QMainWindow):
                 item.setPen(pen)
                 item.setBrush(QBrush(Qt.NoBrush))
                 item.setZValue(Z_CONTOUR_LINE)
-                scene.addItem(item)
+                self._add_heatmap_scene_item(item)
 
         if render_mode != "contours":
             return
@@ -14528,16 +15399,18 @@ class MainWindow(QMainWindow):
                 cross_path.lineTo(x_value + cross_size, y_value)
                 cross_path.moveTo(x_value, y_value - cross_size)
                 cross_path.lineTo(x_value, y_value + cross_size)
-                self._add_upright_text(
+                label_item = self._add_upright_text(
                     scene, f"{rssi:.0f} dBm", x_value + cross_size * 1.8, y_value + cross_size * 1.2,
                     sample_colour, sample_font_size, Z_TEXT
                 )
+                if label_item is not None:
+                    self._heatmap_scene_items.append(label_item)
         if not cross_path.isEmpty():
             cross_item = QGraphicsPathItem(cross_path)
             cross_item.setPen(sample_pen)
             cross_item.setBrush(QBrush(Qt.NoBrush))
             cross_item.setZValue(Z_SAMPLE_MARK)
-            scene.addItem(cross_item)
+            self._add_heatmap_scene_item(cross_item)
 
     def _update_rssi_legend(self):
         """Render the RSSI zone key in a fixed panel below the IFC view.
@@ -14932,159 +15805,588 @@ class MainWindow(QMainWindow):
         self.slab_att_5.blockSignals(False)
         self.slab_att_6.blockSignals(False)
 
-    def simulate(self):
-        self._invalidate_interactive_preview_requests()
-        self._rssi_result_stale = False
-        if not self.floor:
-            return
-        self._sync_slab_attenuation_from_ui()
-        if not self.aps:
-            QMessageBox.information(self, "No APs", "Double-click the floor plan to place at least one AP.")
-            return
-        for ap in self.aps:
-            ap.path_loss_exponent = float(self.ple.value())
-            # Keep per-AP TX/frequency/pattern edits from the AP table.
-            ap.rx_height_m = float(self.rx_height.value())
+    def _simulate_rssi_frequencies_for_floor(
+        self,
+        floor: FloorModel,
+        frequencies_mhz: Sequence[float],
+        progress_callback=None,
+        progressive_callback=None,
+        simulation_context: Optional[Dict[str, object]] = None,
+    ) -> Dict[float, SimulationResult]:
+        """Single source of truth for screen and PDF RSSI calculations.
 
-        progress = QProgressDialog("Calculating RSSI heatmap...", "Cancel", 0, 100, self)
-        progress.setWindowTitle("RSSI calculation")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setValue(0)
-        progress.show()
-
-        def update_progress(done, total):
-            if total <= 0:
-                return
-            progress.setValue(int((done / total) * 100))
-            QApplication.processEvents()
-            if progress.wasCanceled():
-                raise RuntimeError("RSSI calculation cancelled")
-
-        progressive_state = {"fraction": 0.0}
-
-        def update_progressive_heatmap(partial_results, fraction):
-            if not bool(getattr(self.heatmap_settings, "progressive_heatmap_updates", True)):
-                return
-            fraction = max(0.0, min(1.0, float(fraction)))
-            if fraction < 1.0 and fraction - progressive_state["fraction"] < 0.10:
-                return
-            progressive_state["fraction"] = fraction
-            converted = {float(key): value for key, value in partial_results.items()}
-            if not converted:
-                return
-            for value in converted.values():
-                value.render_mode_override = "raster"
-            self.rssi_results_by_frequency = converted
-            selected = self._selected_rssi_view_frequency()
-            self.last_result = converted.get(selected) or converted[sorted(converted)[0]]
-            self._preserve_view_on_redraw = True
-            self.draw_floor()
-            progress.setLabelText(f"Calculating RSSI heatmap... {int(fraction * 100)}% field available")
-            QApplication.processEvents()
-
-        self.rssi_results_by_frequency = {}
-
-        active_freqs = sorted(
-            {float(r.frequency_mhz) for ap in self.aps for r in ap.active_radios()}
+        ``simulation_context`` allows a background coordinator to supply immutable
+        AP/settings/pattern snapshots while retaining the exact same RF engine and
+        call path used by PDF export and synchronous compatibility callers. Large
+        floor geometry is intentionally shared read-only rather than deep-copied.
+        """
+        context = simulation_context or {}
+        floors = context.get("floors", self.floors)
+        aps = context.get("aps", self.aps)
+        resolution_m = float(context.get("resolution_m", self.resolution.value()))
+        patterns = context.get("patterns", self.antenna_patterns)
+        include_inter_floor = bool(context.get(
+            "include_inter_floor", self.include_inter_floor.isChecked()
+        ))
+        settings = context.get("heatmap_settings", self.heatmap_settings)
+        if "calculation_boundary" in context:
+            calculation_boundary = context.get("calculation_boundary")
+        else:
+            calculation_boundary = self._rssi_calculation_boundary()
+        return RFEngine.simulate_frequencies(
+            floor,
+            floors,
+            aps,
+            [float(value) for value in frequencies_mhz],
+            resolution_m,
+            patterns,
+            include_inter_floor=include_inter_floor,
+            heatmap_settings=settings,
+            progress_callback=progress_callback,
+            calculation_boundary=calculation_boundary,
+            progressive_callback=progressive_callback,
         )
 
-        if not active_freqs:
-            progress.close()
-            QMessageBox.information(
-                self,
-                "No active radios",
-                "No enabled AP radios are available for RSSI calculation.",
-            )
-            return
+    @staticmethod
+    def _rssi_request_token_for(
+        floor: FloorModel,
+        frequencies_mhz: Sequence[float],
+        aps: Sequence[AccessPoint],
+        resolution_m: float,
+        patterns: Dict[str, AntennaPattern],
+        include_inter_floor: bool,
+        settings: HeatmapSettings,
+        calculation_boundary,
+    ) -> str:
+        """Return a compact identity used to reject stale background output."""
+        return stable_digest({
+            "floor": str(floor.name),
+            "frequencies": tuple(sorted(round(float(value), 6) for value in frequencies_mhz)),
+            "aps": tuple(sorted(RFEngine._ap_revision(ap) for ap in aps)),
+            "resolution_m": round(float(resolution_m), 6),
+            "patterns": RFEngine._pattern_revision(patterns),
+            "include_inter_floor": bool(include_inter_floor),
+            "settings": RFEngine._settings_revision(settings),
+            "boundary": RFEngine._boundary_revision(calculation_boundary),
+        })
 
+    def _current_rssi_request_token(
+        self, floor: FloorModel, frequencies_mhz: Sequence[float]
+    ) -> str:
+        return self._rssi_request_token_for(
+            floor, frequencies_mhz, self.aps, float(self.resolution.value()),
+            self.antenna_patterns, bool(self.include_inter_floor.isChecked()),
+            self.heatmap_settings, self._rssi_calculation_boundary(),
+        )
+
+    def _set_rssi_calculation_ui(self, running: bool):
+        """Temporarily lock model-changing controls while keeping pan/zoom live."""
+        if running:
+            if self._rssi_calculation_ui_states:
+                return
+            names = (
+                "sim_action", "export_pdf_action", "open_action", "add_action",
+                "align_ifc_action", "clear_dxf_action", "clear_ap_action",
+                "planner_settings_action", "propagation_settings_action",
+                "performance_settings_action", "predict_aps_action", "bulk_ap_action",
+                "draw_wall_action", "bulk_attenuation_action", "draw_space_action",
+                "select_ap_spaces_action", "inferred_space_interaction_action",
+                "draw_boundary_action", "draw_polygon_boundary_action",
+                "suggest_external_boundary_action", "create_spaces_action",
+                "clear_inferred_spaces_action", "clear_boundaries_action",
+                "rotate_left_action", "rotate_right_action", "reset_rotation_action",
+                "load_plan_action",
+            )
+            controls = [
+                getattr(self, name, None) for name in names
+            ] + [
+                getattr(self, name, None) for name in (
+                    "floor_combo", "ap_table", "wall_table", "resolution", "ple",
+                    "rx_height", "include_inter_floor",
+                )
+            ]
+            seen = set()
+            for control in controls:
+                if control is None or id(control) in seen or not hasattr(control, "setEnabled"):
+                    continue
+                seen.add(id(control))
+                enabled = bool(control.isEnabled()) if hasattr(control, "isEnabled") else True
+                self._rssi_calculation_ui_states.append((control, enabled))
+                control.setEnabled(False)
+        else:
+            states = self._rssi_calculation_ui_states
+            self._rssi_calculation_ui_states = []
+            for control, enabled in states:
+                try:
+                    control.setEnabled(bool(enabled))
+                except RuntimeError:
+                    pass
+
+    def _cancel_rssi_calculation(self):
+        event = self._rssi_calculation_cancel_event
+        if event is not None:
+            event.set()
+        future = self._rssi_calculation_future
+        if future is not None and not future.running():
+            future.cancel()
+        progress = self._rssi_calculation_progress_dialog
+        if progress is not None:
+            progress.setLabelText(
+                "Cancelling RSSI calculation after the current worker tile..."
+            )
         self.statusBar().showMessage(
-            f"Calculating {len(active_freqs)} RSSI band(s) with shared worker geometry..."
+            "Cancelling RSSI calculation after the current worker tile..."
         )
-        try:
-            self.rssi_results_by_frequency = RFEngine.simulate_frequencies(
-                self.floor,
-                self.floors,
-                self.aps,
-                active_freqs,
-                self.resolution.value(),
-                self.antenna_patterns,
-                include_inter_floor=self.include_inter_floor.isChecked(),
-                heatmap_settings=self.heatmap_settings,
-                progress_callback=update_progress,
-                calculation_boundary=self._rssi_calculation_boundary(),
-                progressive_callback=update_progressive_heatmap,
-            )
-        except Exception as exc:
-            progress.close()
-            if "cancel" in str(exc).lower():
-                self.statusBar().showMessage("RSSI calculation cancelled")
-                return
-            QMessageBox.warning(self, "RSSI calculation failed", str(exc))
-            self.statusBar().showMessage("RSSI calculation failed")
-            return
-        finally:
-            progress.close()
 
+    def _persist_snapshot_results(
+        self,
+        floor: FloorModel,
+        results: Dict[float, SimulationResult],
+        simulation_context: Dict[str, object],
+        signature_context: Dict[str, object],
+    ) -> bool:
+        """Persist completed grids from the coordinator thread using snapshots."""
+        settings = simulation_context.get("heatmap_settings", self.heatmap_settings)
+        plan_path = simulation_context.get("plan_path")
+        if (
+            not bool(getattr(settings, "save_simulation_results_to_disk", False))
+            or plan_path is None
+            or not results
+        ):
+            return False
+        plan_path = Path(plan_path)
+        root = self._result_directory_for_plan(plan_path)
+        floors = simulation_context.get("floors", self.floors)
+        aps = simulation_context.get("aps", self.aps)
+        include_inter_floor = bool(simulation_context.get("include_inter_floor", False))
+        resolution_m = float(simulation_context.get("resolution_m", 2.0))
+        geometry_models = floors if include_inter_floor else {str(floor.name): floor}
+        geometry_revision = RFEngine._geometry_revision(geometry_models)
+        entries: Dict[Tuple[str, float], Dict[str, object]] = {}
+        for frequency, result in results.items():
+            frequency = float(frequency)
+            relevant_aps = []
+            for ap in aps:
+                if not include_inter_floor and str(ap.floor) != str(floor.name):
+                    continue
+                radios = [
+                    radio for radio in ap.active_radios()
+                    if abs(float(radio.frequency_mhz) - frequency) < 1e-6
+                ]
+                if radios:
+                    relevant_aps.append(RFEngine._ap_revision(replace(ap, radios=radios)))
+            signature = stable_digest({
+                "context": signature_context,
+                "floor": str(floor.name),
+                "frequency_mhz": round(frequency, 6),
+                "geometry": geometry_revision,
+                "aps": tuple(sorted(relevant_aps)),
+            })
+            metadata = {
+                "format": "rf-simulation-result", "version": 1,
+                "floor": str(floor.name), "frequency_mhz": frequency,
+                "signature": signature, "resolution_m": resolution_m,
+                "include_inter_floor": include_inter_floor,
+                "ignored_point_count": int(result.ignored_point_count),
+                "execution_mode": str(result.execution_mode),
+                "worker_processes": int(result.worker_processes),
+                "elapsed_seconds": float(result.elapsed_seconds),
+                "performance_note": str(result.performance_note),
+                "approximate_points": int(result.approximate_points),
+                "exact_points": int(result.exact_points),
+                "cache_hits": int(result.cache_hits),
+                "cache_misses": int(result.cache_misses),
+                "render_mode_override": str(result.render_mode_override),
+                "quick_cutoff_enabled": bool(getattr(settings, "enable_quick_rssi_cutoff", False)),
+                "quick_cutoff_dbm": float(getattr(settings, "quick_rssi_cutoff_dbm", -80.0)),
+            }
+            target = root / self._simulation_result_filename(floor.name, frequency)
+            self._write_simulation_result_payload(target, result, metadata)
+            entries[(str(floor.name), frequency)] = {
+                "floor": str(floor.name), "frequency_mhz": frequency,
+                "file": target.name, "signature": signature,
+            }
+        with self._rssi_persist_lock:
+            self._saved_simulation_entries.update(entries)
+            self._saved_simulation_root = root
+        return bool(entries)
+
+    def _apply_rssi_results(
+        self, results: Dict[float, SimulationResult], floor: FloorModel,
+        signature_context: Optional[Dict[str, object]],
+        results_persisted: bool = False,
+    ):
+        converted = {float(key): value for key, value in results.items()}
+        self.rssi_results_by_frequency = converted
         selected_freq = self._selected_rssi_view_frequency()
-
-        if selected_freq in self.rssi_results_by_frequency:
-            self.last_result = self.rssi_results_by_frequency[selected_freq]
-        elif self.rssi_results_by_frequency:
-            first_freq = sorted(self.rssi_results_by_frequency.keys())[0]
-            self.last_result = self.rssi_results_by_frequency[first_freq]
-
+        if selected_freq in converted:
+            self.last_result = converted[selected_freq]
+        elif converted:
+            first_freq = sorted(converted.keys())[0]
+            self.last_result = converted[first_freq]
             idx = self.rssi_view_frequency.findData(first_freq)
             if idx >= 0:
                 self.rssi_view_frequency.blockSignals(True)
                 self.rssi_view_frequency.setCurrentIndex(idx)
                 self.rssi_view_frequency.blockSignals(False)
         else:
-            self._invalidate_interactive_preview_requests()
             self.last_result = None
 
         self._rssi_result_stale = False
         self.statusBar().showMessage("Rendering RSSI heatmap...")
-        QApplication.processEvents()
-        self.draw_floor()
-        if self.last_result is not None:
-            mode = self.last_result.execution_mode
-            workers = max(1, int(self.last_result.worker_processes))
-            elapsed = max(float(result.elapsed_seconds) for result in self.rssi_results_by_frequency.values())
-            ignored = max(int(result.ignored_point_count) for result in self.rssi_results_by_frequency.values())
-            boundary_text = (
-                f" {ignored} grid point{'s' if ignored != 1 else ''} outside the shared boundary were ignored."
-                if ignored else ""
+        self._replace_heatmap_only(self.last_result)
+
+        if self.last_result is None:
+            self.statusBar().showMessage("RSSI calculation completed without a usable grid")
+            return
+        mode = self.last_result.execution_mode
+        workers = max(1, int(self.last_result.worker_processes))
+        elapsed = max(float(value.elapsed_seconds) for value in converted.values())
+        ignored = max(int(value.ignored_point_count) for value in converted.values())
+        boundary_text = (
+            f" {ignored} grid point{'s' if ignored != 1 else ''} outside the shared boundary were ignored."
+            if ignored else ""
+        )
+        exact_points = max(int(value.exact_points) for value in converted.values())
+        approximate_points = max(int(value.approximate_points) for value in converted.values())
+        cache_hits = max(int(value.cache_hits) for value in converted.values())
+        cache_misses = max(int(value.cache_misses) for value in converted.values())
+        adaptive_text = (
+            f" {exact_points:,} exact and {approximate_points:,} interpolated points."
+            if approximate_points else ""
+        )
+        cache_text = (
+            f" AP-field cache: {cache_hits} hit(s), {cache_misses} recalculated."
+            if cache_hits or cache_misses else ""
+        )
+        quick_text = (
+            f" Quick cutoff: {float(self.heatmap_settings.quick_rssi_cutoff_dbm):g} dBm; weaker links omitted."
+            if bool(self.heatmap_settings.enable_quick_rssi_cutoff) else ""
+        )
+        disk_text = ""
+        if bool(self.heatmap_settings.save_simulation_results_to_disk):
+            disk_text = (
+                " Results were saved by floor and frequency."
+                if results_persisted
+                else (
+                    " Save the RF plan to enable reusable on-disk results."
+                    if self.current_rf_plan_path is None
+                    else " Result-file saving was skipped."
+                )
             )
-            exact_points = max(int(result.exact_points) for result in self.rssi_results_by_frequency.values())
-            approximate_points = max(int(result.approximate_points) for result in self.rssi_results_by_frequency.values())
-            cache_hits = max(int(result.cache_hits) for result in self.rssi_results_by_frequency.values())
-            cache_misses = max(int(result.cache_misses) for result in self.rssi_results_by_frequency.values())
-            adaptive_text = (
-                f" {exact_points:,} exact and {approximate_points:,} interpolated points."
-                if approximate_points else ""
-            )
-            cache_text = (
-                f" AP-field cache: {cache_hits} hit(s), {cache_misses} recalculated."
-                if cache_hits or cache_misses else ""
-            )
+        self.statusBar().showMessage(
+            f"RSSI calculation complete in {elapsed:.1f} s using {mode} "
+            f"({workers} worker{'s' if workers != 1 else ''})."
+            f"{adaptive_text}{cache_text}{boundary_text}{quick_text}{disk_text} "
+            "Hover over the heatmap to inspect RSSI, path count and RMS delay spread."
+        )
+        fallback = next((
+            value.performance_note for value in converted.values()
+            if value.execution_mode == "single-process-fallback"
+        ), "")
+        if fallback:
+            QMessageBox.warning(self, "RF multiprocessing fallback", fallback)
+
+    def _poll_rssi_calculation(self):
+        future = self._rssi_calculation_future
+        progress = self._rssi_calculation_progress_dialog
+        if future is None:
+            self._rssi_calculation_poll_timer.stop()
+            return
+
+        if progress is not None and progress.wasCanceled():
+            self._cancel_rssi_calculation()
+
+        with self._rssi_calculation_state_lock:
+            state = dict(self._rssi_calculation_progress_state)
+            partial = self._rssi_calculation_partial_results
+            partial_fraction = float(self._rssi_calculation_partial_fraction)
+            if partial is not None:
+                self._rssi_calculation_partial_results = None
+
+        done = int(state.get("done", 0) or 0)
+        total = max(1, int(state.get("total", 1) or 1))
+        if progress is not None:
+            progress.setValue(max(0, min(99, int((done / total) * 100))))
+            label = str(state.get("label", "Calculating RSSI heatmap..."))
+            if label:
+                progress.setLabelText(label)
+
+        if (
+            partial is not None
+            and partial_fraction > self._rssi_calculation_partial_applied
+            and not (self._rssi_calculation_cancel_event and self._rssi_calculation_cancel_event.is_set())
+            and self.floor is not None
+            and str(self.floor.name) == self._rssi_calculation_floor_name
+        ):
+            self._rssi_calculation_partial_applied = partial_fraction
+            converted = {float(key): value for key, value in partial.items()}
+            for value in converted.values():
+                value.render_mode_override = "raster"
+            self.rssi_results_by_frequency = converted
+            selected = self._selected_rssi_view_frequency()
+            self.last_result = converted.get(selected) or (converted[sorted(converted)[0]] if converted else None)
+            self._rssi_result_stale = False
+            self._replace_heatmap_only(self.last_result)
+
+        if not future.done():
+            return
+
+        self._rssi_calculation_poll_timer.stop()
+        error: Optional[BaseException] = None
+        results: Dict[float, SimulationResult] = {}
+        try:
+            results = future.result()
+        except concurrent.futures.CancelledError as exc:
+            error = exc
+        except BaseException as exc:
+            error = exc
+
+        job_floor_name = self._rssi_calculation_floor_name
+        request_token = self._rssi_calculation_request_token
+        signature_context = self._rssi_calculation_signature_context
+        requested_frequencies = list(self._rssi_calculation_frequencies)
+        previous_results = self._rssi_calculation_previous_results
+        previous_last_result = self._rssi_calculation_previous_last_result
+        results_persisted = bool(self._rssi_calculation_results_persisted)
+        canceled = bool(
+            self._rssi_calculation_cancel_event
+            and self._rssi_calculation_cancel_event.is_set()
+        )
+        self._rssi_calculation_future = None
+        self._rssi_calculation_thread = None
+        self._rssi_calculation_cancel_event = None
+        self._rssi_calculation_progress_dialog = None
+        self._rssi_calculation_partial_results = None
+        self._rssi_calculation_frequencies = []
+        self._rssi_calculation_previous_results = {}
+        self._rssi_calculation_previous_last_result = None
+        self._rssi_calculation_results_persisted = False
+        self._set_rssi_calculation_ui(False)
+        if progress is not None:
+            progress.setValue(100)
+            progress.close()
+
+        if canceled or isinstance(error, concurrent.futures.CancelledError):
+            self.rssi_results_by_frequency = previous_results
+            self.last_result = previous_last_result
+            self._rssi_result_stale = False
+            self._replace_heatmap_only(self.last_result)
+            self.statusBar().showMessage("RSSI calculation cancelled")
+            return
+        if error is not None:
+            self.rssi_results_by_frequency = previous_results
+            self.last_result = previous_last_result
+            self._rssi_result_stale = False
+            self._replace_heatmap_only(self.last_result)
+            message = str(error)
+            if "cancel" in message.lower():
+                self.statusBar().showMessage("RSSI calculation cancelled")
+            else:
+                QMessageBox.warning(self, "RSSI calculation failed", message)
+                self.statusBar().showMessage("RSSI calculation failed")
+            return
+        if self.floor is None or str(self.floor.name) != job_floor_name:
             self.statusBar().showMessage(
-                f"RSSI calculation complete in {elapsed:.1f} s using {mode} "
-                f"({workers} worker{'s' if workers != 1 else ''})."
-                f"{adaptive_text}{cache_text}{boundary_text} "
-                f"Hover over the heatmap to inspect RSSI, path count and RMS delay spread."
+                "RSSI calculation completed, but the selected floor changed; result was not applied."
             )
-            fallback = next((
-                result.performance_note for result in self.rssi_results_by_frequency.values()
-                if result.execution_mode == "single-process-fallback"
-            ), "")
-            if fallback:
-                QMessageBox.warning(self, "RF multiprocessing fallback", fallback)
+            return
+        current_token = self._current_rssi_request_token(self.floor, requested_frequencies)
+        if current_token != request_token:
+            self.rssi_results_by_frequency = {}
+            self.last_result = None
+            self._rssi_result_stale = True
+            self._replace_heatmap_only(None)
+            self.statusBar().showMessage(
+                "RSSI inputs changed while calculating; stale background result was discarded."
+            )
+            return
+        self._apply_rssi_results(results, self.floor, signature_context, results_persisted)
+
+    def simulate(self):
+        running = self._rssi_calculation_future
+        if running is not None and not running.done():
+            progress = self._rssi_calculation_progress_dialog
+            if progress is not None:
+                progress.show()
+                progress.raise_()
+                progress.activateWindow()
+            self.statusBar().showMessage("An RSSI calculation is already running")
+            return
+
+        self._invalidate_interactive_preview_requests()
+        self._rssi_result_stale = False
+        if not self.floor:
+            return
+        self._sync_slab_attenuation_from_ui()
+        if not self.aps:
+            QMessageBox.information(
+                self, "No APs", "Double-click the floor plan to place at least one AP."
+            )
+            return
+        for ap in self.aps:
+            ap.path_loss_exponent = float(self.ple.value())
+            ap.rx_height_m = float(self.rx_height.value())
+
+        active_freqs = sorted({
+            float(radio.frequency_mhz)
+            for ap in self.aps for radio in ap.active_radios()
+        })
+        if not active_freqs:
+            QMessageBox.information(
+                self, "No active radios",
+                "No enabled AP radios are available for RSSI calculation.",
+            )
+            return
+
+        floor = self.floor
+        aps_snapshot = self._snapshot_rf_access_points(self.aps)
+        settings_snapshot = copy.deepcopy(self.heatmap_settings)
+        patterns_snapshot = copy.deepcopy(self.antenna_patterns)
+        resolution_m = float(self.resolution.value())
+        include_inter_floor = bool(self.include_inter_floor.isChecked())
+        calculation_boundary = self._rssi_calculation_boundary()
+        simulation_context: Dict[str, object] = {
+            "floors": self.floors,
+            "aps": aps_snapshot,
+            "resolution_m": resolution_m,
+            "patterns": patterns_snapshot,
+            "include_inter_floor": include_inter_floor,
+            "heatmap_settings": settings_snapshot,
+            "calculation_boundary": calculation_boundary,
+            "plan_path": Path(self.current_rf_plan_path) if self.current_rf_plan_path is not None else None,
+        }
+        request_token = self._rssi_request_token_for(
+            floor, active_freqs, aps_snapshot, resolution_m, patterns_snapshot,
+            include_inter_floor, settings_snapshot, calculation_boundary,
+        )
+        signature_context = {
+            "format": 1,
+            "resolution_m": round(resolution_m, 6),
+            "include_inter_floor": include_inter_floor,
+            "settings": RFEngine._settings_revision(settings_snapshot),
+            "patterns": RFEngine._pattern_revision(patterns_snapshot),
+            "boundary": RFEngine._boundary_revision(calculation_boundary),
+        }
+
+        progress = QProgressDialog(
+            "Preparing background RSSI calculation...", "Cancel", 0, 100, self
+        )
+        progress.setWindowTitle("RSSI calculation")
+        progress.setWindowModality(Qt.NonModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+        progress.canceled.connect(self._cancel_rssi_calculation)
+        progress.show()
+
+        cancel_event = threading.Event()
+        future: concurrent.futures.Future = concurrent.futures.Future()
+        self._rssi_calculation_future = future
+        self._rssi_calculation_cancel_event = cancel_event
+        self._rssi_calculation_progress_dialog = progress
+        self._rssi_calculation_request_token = request_token
+        self._rssi_calculation_floor_name = str(floor.name)
+        self._rssi_calculation_signature_context = signature_context
+        self._rssi_calculation_frequencies = list(active_freqs)
+        self._rssi_calculation_previous_results = dict(self.rssi_results_by_frequency)
+        self._rssi_calculation_previous_last_result = self.last_result
+        self._rssi_calculation_results_persisted = False
+        self._rssi_calculation_partial_applied = 0.0
+        with self._rssi_calculation_state_lock:
+            self._rssi_calculation_progress_state = {
+                "done": 0, "total": 1,
+                "label": f"Calculating {len(active_freqs)} RSSI band(s) in the background...",
+            }
+            self._rssi_calculation_partial_results = None
+            self._rssi_calculation_partial_fraction = 0.0
+
+        progressive_enabled = bool(
+            getattr(settings_snapshot, "progressive_heatmap_updates", True)
+        )
+        progressive_step = max(
+            0.25, min(1.0, float(getattr(
+                settings_snapshot, "progressive_update_percent", 20
+            )) / 100.0)
+        )
+        worker_progressive_fraction = {"value": 0.0}
+
+        def update_progress(done, total):
+            if cancel_event.is_set():
+                raise RuntimeError("RSSI calculation cancelled")
+            with self._rssi_calculation_state_lock:
+                self._rssi_calculation_progress_state = {
+                    "done": int(done), "total": max(1, int(total)),
+                    "label": f"Calculating RSSI heatmap... {int((float(done) / max(1.0, float(total))) * 100.0)}%",
+                }
+
+        def update_progressive_heatmap(partial_results, fraction):
+            if cancel_event.is_set():
+                raise RuntimeError("RSSI calculation cancelled")
+            if not progressive_enabled:
+                return
+            fraction = max(0.0, min(1.0, float(fraction)))
+            if (
+                fraction < 1.0
+                and fraction - worker_progressive_fraction["value"] < progressive_step
+            ):
+                return
+            worker_progressive_fraction["value"] = fraction
+            converted = {float(key): value for key, value in partial_results.items()}
+            with self._rssi_calculation_state_lock:
+                self._rssi_calculation_partial_results = converted
+                self._rssi_calculation_partial_fraction = fraction
+                self._rssi_calculation_progress_state["label"] = (
+                    f"Calculating RSSI heatmap... {int(fraction * 100)}% field available"
+                )
+
+        def calculate_background():
+            if not future.set_running_or_notify_cancel():
+                return
+            try:
+                result = self._simulate_rssi_frequencies_for_floor(
+                    floor, active_freqs, progress_callback=update_progress,
+                    progressive_callback=update_progressive_heatmap,
+                    simulation_context=simulation_context,
+                )
+                if cancel_event.is_set():
+                    raise RuntimeError("RSSI calculation cancelled")
+                with self._rssi_calculation_state_lock:
+                    self._rssi_calculation_progress_state["label"] = (
+                        "Saving reusable floor/frequency results..."
+                    )
+                persisted = self._persist_snapshot_results(
+                    floor, result, simulation_context, signature_context
+                )
+                with self._rssi_calculation_state_lock:
+                    self._rssi_calculation_results_persisted = bool(persisted)
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+
+        self._set_rssi_calculation_ui(True)
+        self.statusBar().showMessage(
+            f"Calculating {len(active_freqs)} RSSI band(s) in the background; pan and zoom remain available..."
+        )
+        self._rssi_calculation_thread = threading.Thread(
+            target=calculate_background, name="rf-full-calculation", daemon=True
+        )
+        self._rssi_calculation_thread.start()
+        self._rssi_calculation_poll_timer.start()
 
     def closeEvent(self, event):
         self._invalidate_interactive_preview_requests()
         self._interactive_preview_poll_timer.stop()
         self._interactive_preview_thread = None
+        if self._rssi_calculation_cancel_event is not None:
+            self._rssi_calculation_cancel_event.set()
+        self._rssi_calculation_poll_timer.stop()
+        future = self._rssi_calculation_future
+        if future is not None and not future.running():
+            future.cancel()
+        self._rssi_calculation_thread = None
         self._shutdown_ifc_process_executor()
         _shutdown_rf_process_executor(wait=False)
         super().closeEvent(event)
@@ -15144,6 +16446,34 @@ class MainWindow(QMainWindow):
             return f"{frequency_mhz / 1000.0:g} GHz"
         return f"{frequency_mhz:g} MHz"
 
+    def _render_pdf_plan_scene(self, painter: QPainter, target_rect: QRectF, source_rect: QRectF):
+        """Render the full scene with the same Y-up and view rotation as the GUI."""
+        scene = self.view.scene()
+        export_view = QGraphicsView(scene)
+        export_view.setFrameShape(QFrame.NoFrame)
+        export_view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        export_view.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        export_view.setBackgroundBrush(QBrush(QColor("#FFFFFF")))
+        export_view.setRenderHints(self.view.renderHints())
+        viewport_width = max(64, int(target_rect.width()))
+        viewport_height = max(64, int(target_rect.height()))
+        export_view.resize(viewport_width, viewport_height)
+        export_view.viewport().resize(viewport_width, viewport_height)
+        export_view.setSceneRect(source_rect)
+        # Use the current plan-view transform as the orientation authority. It
+        # contains the IFC Y-up reflection and any display rotation, but not the
+        # scrollbar translation. fitInView then replaces the current zoom with a
+        # page-fit scale while retaining that exact orientation.
+        export_view.setTransform(QTransform(self.view.transform()))
+        export_view.fitInView(source_rect, Qt.KeepAspectRatio)
+        export_view.render(
+            painter, target_rect,
+            QRectF(0.0, 0.0, float(export_view.viewport().width()), float(export_view.viewport().height())),
+            Qt.KeepAspectRatio,
+        )
+        export_view.setScene(None)
+        export_view.deleteLater()
+
     def _draw_pdf_rssi_legend(
         self,
         painter: QPainter,
@@ -15177,24 +16507,28 @@ class MainWindow(QMainWindow):
         body_font.setPointSize(8)
         painter.setFont(body_font)
 
-        zone_row_height = 30.0
-        swatch_width = 34.0
-        for zone in self.heatmap_settings.zones:
-            if y + zone_row_height > rect.bottom() - 175.0:
-                break
+        zones = list(self.heatmap_settings.zones)
+        zone_count = max(1, len(zones))
+        available_zone_height = max(150.0, min(rect.height() * 0.38, 330.0))
+        zone_row_height = max(24.0, available_zone_height / zone_count)
+        swatch_width = max(42.0, width * 0.19)
+        for zone in zones:
             colour = QColor(zone.colour)
             if not colour.isValid():
                 colour = QColor("#555555")
             colour.setAlpha(255)
-            swatch = QRectF(x, y + 4.0, swatch_width, zone_row_height - 8.0)
+            row_rect = QRectF(x, y, width, zone_row_height - 2.0)
+            painter.fillRect(row_rect, QColor("#FFFFFF"))
+            swatch = QRectF(x + 2.0, y + 3.0, swatch_width, max(12.0, zone_row_height - 8.0))
             painter.fillRect(swatch, colour)
-            painter.setPen(QPen(QColor("#4B5563"), 0.8))
+            painter.setPen(QPen(QColor("#334155"), 0.9))
             painter.drawRect(swatch)
             painter.setPen(QColor("#111827"))
-            label = f"{zone.name}: {zone.min_dbm:.0f} to {zone.max_dbm:.0f} dBm"
+            upper = "and above" if float(zone.max_dbm) >= 0.0 else f"to {zone.max_dbm:.0f} dBm"
+            label = f"{zone.name}: {zone.min_dbm:.0f} dBm {upper}"
             painter.drawText(
-                QRectF(x + swatch_width + 9.0, y, width - swatch_width - 9.0, zone_row_height),
-                Qt.AlignLeft | Qt.AlignVCenter,
+                QRectF(x + swatch_width + 12.0, y, width - swatch_width - 12.0, zone_row_height),
+                Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWordWrap,
                 label,
             )
             y += zone_row_height
@@ -15267,30 +16601,41 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No active radios", "No enabled AP radios are available for PDF export.")
             return
 
-        frequency_mhz = self._selected_rssi_view_frequency()
-        if frequency_mhz not in active_frequencies:
-            frequency_mhz = active_frequencies[0]
-
-        aps_for_frequency: List[AccessPoint] = []
-        for ap in self.aps:
-            radios = [
-                radio for radio in ap.active_radios()
-                if getattr(radio, "enabled", True)
-                and abs(float(radio.frequency_mhz) - float(frequency_mhz)) < 1e-6
-            ]
-            if radios:
-                aps_for_frequency.append(replace(ap, radios=radios))
-
-        if not aps_for_frequency:
-            QMessageBox.information(
-                self,
-                "No APs on selected frequency",
-                f"No enabled access-point radios use {self._pdf_frequency_label(frequency_mhz)}.",
-            )
+        all_floor_items = sorted(self.floors.items(), key=lambda item: (item[1].elevation, item[0]))
+        current_frequency = self._selected_rssi_view_frequency()
+        if current_frequency not in active_frequencies:
+            current_frequency = active_frequencies[0]
+        selection = PDFExportSelectionDialog(
+            self,
+            all_floor_items,
+            active_frequencies,
+            self.floor.name if self.floor else "",
+            current_frequency,
+        )
+        if selection.exec() != QDialog.Accepted:
             return
 
-        frequency_name = f"{float(frequency_mhz):g}".replace(".", "_")
-        default_name = f"rssi_floor_report_{frequency_name}MHz.pdf"
+        selected_floor_names = set(selection.selected_floor_names())
+        selected_frequencies = sorted(selection.selected_frequencies())
+        floor_items = [
+            (floor_name, floor)
+            for floor_name, floor in all_floor_items
+            if floor_name in selected_floor_names
+        ]
+        pages = [
+            (floor_name, floor, frequency)
+            for floor_name, floor in floor_items
+            for frequency in selected_frequencies
+        ]
+        if not pages:
+            QMessageBox.information(self, "Nothing selected", "Select at least one floor and frequency.")
+            return
+
+        if len(selected_frequencies) == 1:
+            frequency_name = f"{float(selected_frequencies[0]):g}".replace(".", "_")
+            default_name = f"rssi_floor_report_{frequency_name}MHz.pdf"
+        else:
+            default_name = "rssi_floor_report_selected_frequencies.pdf"
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Export RSSI floor report",
@@ -15304,12 +16649,13 @@ class MainWindow(QMainWindow):
             target_path = target_path.with_suffix(".pdf")
         temporary_path = target_path.with_name(f".{target_path.stem}.{uuid.uuid4().hex}.tmp.pdf")
 
-        floor_items = sorted(self.floors.items(), key=lambda item: (item[1].elevation, item[0]))
+        calculation_units = max(1, len(floor_items) * 100)
+        render_units = max(1, len(pages) * 10)
         progress = QProgressDialog(
-            "Calculating RSSI for all floors...",
+            "Calculating selected RSSI floor results...",
             "Cancel",
             0,
-            max(1, len(floor_items) * 110),
+            calculation_units + render_units,
             self,
         )
         progress.setWindowTitle("Export RSSI floor PDF")
@@ -15318,11 +16664,13 @@ class MainWindow(QMainWindow):
         progress.setValue(0)
         progress.show()
 
-        results_by_floor: Dict[str, Optional[SimulationResult]] = {}
+        results_by_floor_frequency: Dict[Tuple[str, float], Optional[SimulationResult]] = {}
         try:
+            frequency_text = ", ".join(self._pdf_frequency_label(value) for value in selected_frequencies)
+            signature_context = self._simulation_signature_context()
             for floor_index, (floor_name, floor) in enumerate(floor_items):
                 progress.setLabelText(
-                    f"Calculating {self._pdf_frequency_label(frequency_mhz)} RSSI for {floor_name} "
+                    f"Calculating {frequency_text} for {floor_name} "
                     f"({floor_index + 1}/{len(floor_items)})..."
                 )
 
@@ -15333,22 +16681,29 @@ class MainWindow(QMainWindow):
                     if progress.wasCanceled():
                         raise RuntimeError("RSSI floor PDF export cancelled")
 
-                floor_results = RFEngine.simulate_frequencies(
-                    floor,
-                    self.floors,
-                    aps_for_frequency,
-                    [float(frequency_mhz)],
-                    self.resolution.value(),
-                    self.antenna_patterns,
-                    include_inter_floor=self.include_inter_floor.isChecked(),
-                    heatmap_settings=self.heatmap_settings,
-                    progress_callback=update_progress,
-                    calculation_boundary=self._rssi_calculation_boundary(),
-                )
-                results_by_floor[floor_name] = floor_results.get(float(frequency_mhz))
+                # Reuse signature-compatible floor/frequency files first. Any
+                # missing or stale frequency is calculated through the same shared
+                # helper as Simulate RSSI, then immediately persisted separately.
+                floor_results = self._load_saved_results_for_floor(floor, selected_frequencies, signature_context)
+                missing_frequencies = [
+                    float(value) for value in selected_frequencies
+                    if float(value) not in floor_results
+                ]
+                if missing_frequencies:
+                    calculated = self._simulate_rssi_frequencies_for_floor(
+                        floor,
+                        missing_frequencies,
+                        progress_callback=update_progress,
+                    )
+                    floor_results.update(calculated)
+                    self._persist_simulation_results(floor, calculated, signature_context=signature_context)
+                else:
+                    progress.setValue((floor_index + 1) * 100)
+                for frequency in selected_frequencies:
+                    results_by_floor_frequency[(floor_name, float(frequency))] = floor_results.get(float(frequency))
                 progress.setValue((floor_index + 1) * 100)
 
-            progress.setLabelText("Rendering floor pages to PDF...")
+            progress.setLabelText("Rendering selected floor/frequency pages to PDF...")
             QApplication.processEvents()
             if progress.wasCanceled():
                 raise RuntimeError("RSSI floor PDF export cancelled")
@@ -15356,7 +16711,8 @@ class MainWindow(QMainWindow):
             writer = QPdfWriter(str(temporary_path))
             writer.setCreator("RF Attenuation Simulator")
             writer.setTitle(
-                f"RSSI floor report - {self._pdf_frequency_label(frequency_mhz)}"
+                "RSSI floor report - "
+                + ", ".join(self._pdf_frequency_label(value) for value in selected_frequencies)
             )
             writer.setResolution(150)
             writer.setPageSize(QPageSize(QPageSize.PageSizeId.A3))
@@ -15375,26 +16731,36 @@ class MainWindow(QMainWindow):
             original_results = self.rssi_results_by_frequency
             original_preserve = self._preserve_view_on_redraw
             original_ruler = self.ap_ruler_enabled
+            original_dark_theme = bool(getattr(self, "dark_theme", False))
+            original_cutoff_visibility = bool(self.heatmap_settings.show_ap_cutoff_zones)
             original_transform = self.view.transform()
             original_h = self.view.horizontalScrollBar().value()
             original_v = self.view.verticalScrollBar().value()
 
             self.setUpdatesEnabled(False)
             self.ap_ruler_enabled = False
+            self.dark_theme = False
+            self.heatmap_settings.show_ap_cutoff_zones = False
             try:
-                for page_index, (floor_name, floor) in enumerate(floor_items):
+                for page_index, (floor_name, floor, frequency_mhz) in enumerate(pages):
                     if page_index > 0 and not writer.newPage():
                         raise RuntimeError(f"Could not create PDF page {page_index + 1}.")
                     if progress.wasCanceled():
                         raise RuntimeError("RSSI floor PDF export cancelled")
 
-                    result = results_by_floor.get(floor_name)
+                    result = results_by_floor_frequency.get((floor_name, float(frequency_mhz)))
                     self.floor = floor
                     self.last_result = result
+                    self.rssi_results_by_frequency = (
+                        {float(frequency_mhz): result} if result is not None else {}
+                    )
                     self._preserve_view_on_redraw = True
                     self.draw_floor()
                     scene = self.view.scene()
                     scene.clearSelection()
+                    # Reports always use a true white drawing background even if
+                    # the normal light theme is configured as slightly off-white.
+                    scene.setBackgroundBrush(QBrush(QColor("#FFFFFF")))
 
                     page_rect = QRectF(writer.pageLayout().paintRectPixels(writer.resolution()))
                     painter.fillRect(page_rect, QColor("#FFFFFF"))
@@ -15452,7 +16818,7 @@ class MainWindow(QMainWindow):
                         subtitle,
                     )
 
-                    painter.fillRect(plan_rect, self._theme_colours()["background"])
+                    painter.fillRect(plan_rect, QColor("#FFFFFF"))
                     source_rect = scene.itemsBoundingRect()
                     if result is not None and result.xs.size and result.ys.size:
                         result_rect = QRectF(
@@ -15469,7 +16835,7 @@ class MainWindow(QMainWindow):
 
                     painter.save()
                     painter.setClipRect(plan_rect)
-                    scene.render(painter, plan_rect, source_rect, Qt.KeepAspectRatio)
+                    self._render_pdf_plan_scene(painter, plan_rect, source_rect)
                     painter.restore()
                     painter.setPen(QPen(QColor("#94A3B8"), 1.0))
                     painter.setBrush(QBrush(Qt.NoBrush))
@@ -15484,19 +16850,25 @@ class MainWindow(QMainWindow):
                         painter.drawText(
                             plan_rect,
                             Qt.AlignCenter | Qt.TextWordWrap,
-                            "No RSSI grid was produced for this floor.",
+                            "No RSSI grid was produced for this floor and frequency.",
                         )
 
-                    floor_ap_count = sum(
-                        1 for ap in aps_for_frequency if ap.floor == floor_name
-                    )
+                    frequency_aps = [
+                        ap for ap in self.aps
+                        if any(
+                            getattr(radio, "enabled", True)
+                            and abs(float(radio.frequency_mhz) - float(frequency_mhz)) < 1e-6
+                            for radio in ap.active_radios()
+                        )
+                    ]
+                    floor_ap_count = sum(1 for ap in frequency_aps if ap.floor == floor_name)
                     self._draw_pdf_rssi_legend(
                         painter,
                         legend_rect,
                         frequency_mhz,
                         floor,
                         result,
-                        len(aps_for_frequency),
+                        len(frequency_aps),
                         floor_ap_count,
                     )
 
@@ -15512,9 +16884,9 @@ class MainWindow(QMainWindow):
                             footer_height,
                         ),
                         Qt.AlignRight | Qt.AlignVCenter,
-                        f"Page {page_index + 1} of {len(floor_items)}",
+                        f"Page {page_index + 1} of {len(pages)}",
                     )
-                    progress.setValue((len(floor_items) * 100) + ((page_index + 1) * 10))
+                    progress.setValue(calculation_units + ((page_index + 1) * 10))
                     QApplication.processEvents()
             finally:
                 painter.end()
@@ -15522,6 +16894,8 @@ class MainWindow(QMainWindow):
                 self.last_result = original_last_result
                 self.rssi_results_by_frequency = original_results
                 self.ap_ruler_enabled = original_ruler
+                self.dark_theme = original_dark_theme
+                self.heatmap_settings.show_ap_cutoff_zones = original_cutoff_visibility
                 self._preserve_view_on_redraw = True
                 self.draw_floor()
                 self.view.setTransform(original_transform)
@@ -15535,13 +16909,15 @@ class MainWindow(QMainWindow):
             os.replace(str(temporary_path), str(target_path))
             progress.setValue(progress.maximum())
             self.statusBar().showMessage(
-                f"Exported {len(floor_items)} RSSI floor page(s) to {target_path}"
+                f"Exported {len(pages)} RSSI page(s) for {len(floor_items)} floor(s) and "
+                f"{len(selected_frequencies)} frequency selection(s) to {target_path}"
             )
             QMessageBox.information(
                 self,
                 "RSSI floor PDF exported",
-                f"Exported {len(floor_items)} floor page(s) at "
-                f"{self._pdf_frequency_label(frequency_mhz)} to:\n{target_path}",
+                f"Exported {len(pages)} page(s) covering {len(floor_items)} floor(s) and "
+                f"{len(selected_frequencies)} frequenc{'ies' if len(selected_frequencies) != 1 else 'y'} to:\n"
+                f"{target_path}",
             )
         except Exception as exc:
             try:
