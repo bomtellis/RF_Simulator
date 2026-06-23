@@ -9,6 +9,7 @@ Run:
 from __future__ import annotations
 
 import atexit
+import copy
 import csv
 import cmath
 import concurrent.futures
@@ -1191,6 +1192,17 @@ class HeatmapSettings:
         performance = data.get("rf_performance", data.get("performance", {}))
         if not isinstance(performance, dict):
             performance = {}
+        settings.enable_ifc_multiprocessing = bool(performance.get("enable_ifc_multiprocessing", settings.enable_ifc_multiprocessing))
+        settings.max_ifc_loader_processes = max(0, int(performance.get("max_ifc_loader_processes", settings.max_ifc_loader_processes)))
+        settings.max_parallel_huge_ifc_processes = max(1, int(performance.get("max_parallel_huge_ifc_processes", settings.max_parallel_huge_ifc_processes)))
+        settings.enable_rf_multiprocessing = bool(performance.get("enable_rf_multiprocessing", settings.enable_rf_multiprocessing))
+        settings.max_rf_worker_processes = max(0, int(performance.get("max_rf_worker_processes", settings.max_rf_worker_processes)))
+        settings.rf_multiprocessing_min_points = max(1, int(performance.get("rf_multiprocessing_min_points", settings.rf_multiprocessing_min_points)))
+        settings.rf_tile_rows = max(1, int(performance.get("rf_tile_rows", settings.rf_tile_rows)))
+        settings.rf_tiles_per_worker = max(1, min(8, int(performance.get("rf_tiles_per_worker", settings.rf_tiles_per_worker))))
+        settings.reuse_rf_process_pool = bool(performance.get("reuse_rf_process_pool", settings.reuse_rf_process_pool))
+        settings.rf_worker_index_cache_entries = max(1, min(8, int(performance.get("rf_worker_index_cache_entries", settings.rf_worker_index_cache_entries))))
+        settings.contour_interpolation_factor = max(1, int(performance.get("contour_interpolation_factor", settings.contour_interpolation_factor)))
         profile = str(performance.get("calculation_profile", data.get("rf_calculation_profile", settings.rf_calculation_profile))).strip().lower()
         settings.rf_calculation_profile = profile if profile in {"fast", "balanced", "detailed"} else "balanced"
         settings.enable_adaptive_rf_grid = bool(performance.get("enable_adaptive_grid", data.get("enable_adaptive_rf_grid", settings.enable_adaptive_rf_grid)))
@@ -1304,6 +1316,17 @@ class HeatmapSettings:
 
     def performance_model_dict(self) -> Dict[str, object]:
         return {
+            "enable_ifc_multiprocessing": bool(self.enable_ifc_multiprocessing),
+            "max_ifc_loader_processes": int(self.max_ifc_loader_processes),
+            "max_parallel_huge_ifc_processes": int(self.max_parallel_huge_ifc_processes),
+            "enable_rf_multiprocessing": bool(self.enable_rf_multiprocessing),
+            "max_rf_worker_processes": int(self.max_rf_worker_processes),
+            "rf_multiprocessing_min_points": int(self.rf_multiprocessing_min_points),
+            "rf_tile_rows": int(self.rf_tile_rows),
+            "rf_tiles_per_worker": int(self.rf_tiles_per_worker),
+            "reuse_rf_process_pool": bool(self.reuse_rf_process_pool),
+            "rf_worker_index_cache_entries": int(self.rf_worker_index_cache_entries),
+            "contour_interpolation_factor": int(self.contour_interpolation_factor),
             "calculation_profile": str(self.rf_calculation_profile),
             "enable_adaptive_grid": bool(self.enable_adaptive_rf_grid),
             "coarse_resolution_m": float(self.adaptive_coarse_resolution_m),
@@ -1360,6 +1383,17 @@ class HeatmapSettings:
     def apply_performance_model_dict(self, data: Optional[Dict[str, object]]):
         if not isinstance(data, dict):
             return
+        self.enable_ifc_multiprocessing = bool(data.get("enable_ifc_multiprocessing", self.enable_ifc_multiprocessing))
+        self.max_ifc_loader_processes = max(0, int(data.get("max_ifc_loader_processes", self.max_ifc_loader_processes)))
+        self.max_parallel_huge_ifc_processes = max(1, int(data.get("max_parallel_huge_ifc_processes", self.max_parallel_huge_ifc_processes)))
+        self.enable_rf_multiprocessing = bool(data.get("enable_rf_multiprocessing", self.enable_rf_multiprocessing))
+        self.max_rf_worker_processes = max(0, int(data.get("max_rf_worker_processes", self.max_rf_worker_processes)))
+        self.rf_multiprocessing_min_points = max(1, int(data.get("rf_multiprocessing_min_points", self.rf_multiprocessing_min_points)))
+        self.rf_tile_rows = max(1, int(data.get("rf_tile_rows", self.rf_tile_rows)))
+        self.rf_tiles_per_worker = max(1, min(8, int(data.get("rf_tiles_per_worker", self.rf_tiles_per_worker))))
+        self.reuse_rf_process_pool = bool(data.get("reuse_rf_process_pool", self.reuse_rf_process_pool))
+        self.rf_worker_index_cache_entries = max(1, min(8, int(data.get("rf_worker_index_cache_entries", self.rf_worker_index_cache_entries))))
+        self.contour_interpolation_factor = max(1, int(data.get("contour_interpolation_factor", self.contour_interpolation_factor)))
         profile = str(data.get("calculation_profile", self.rf_calculation_profile)).strip().lower()
         self.rf_calculation_profile = profile if profile in {"fast", "balanced", "detailed"} else "balanced"
         self.enable_adaptive_rf_grid = bool(data.get("enable_adaptive_grid", self.enable_adaptive_rf_grid))
@@ -5650,6 +5684,480 @@ class AutoPlannerSettingsDialog(QDialog):
         super().accept()
 
 
+class RFPerformanceSettingsDialog(QDialog):
+    """Configure RF/IFC multiprocessing, adaptive sampling, caching and rendering."""
+
+    def __init__(
+        self,
+        parent,
+        settings: HeatmapSettings,
+        has_planner_boundaries: bool = False,
+        settings_path: Optional[Path] = None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("RF and IFC performance settings")
+        self.resize(780, 720)
+        self._has_planner_boundaries = bool(has_planner_boundaries)
+        self._settings_path = Path(settings_path) if settings_path else Path(__file__).with_name("rf_heatmap_settings.json")
+
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "Tune worker counts, adaptive sampling, caches and heatmap rendering for the available CPU and memory. "
+            "A value of 0 for a worker count means automatic. On hybrid laptop processors, fewer workers can be faster "
+            "than using every logical thread. Changes apply immediately to the current project when OK is pressed."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("Presets:"))
+        laptop = QPushButton("Intel i7-1255U / laptop")
+        laptop.setToolTip("Four RF/IFC workers, boundary-limited raster output, smaller caches and lighter working propagation.")
+        laptop.clicked.connect(self._apply_laptop_preset)
+        automatic = QPushButton("Automatic / workstation")
+        automatic.setToolTip("Automatic worker counts and the application balanced defaults.")
+        automatic.clicked.connect(self._apply_automatic_preset)
+        fast = QPushButton("Fast interactive")
+        fast.clicked.connect(self._apply_fast_preset)
+        preset_row.addWidget(laptop)
+        preset_row.addWidget(automatic)
+        preset_row.addWidget(fast)
+        preset_row.addStretch(1)
+        layout.addLayout(preset_row)
+
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs, 1)
+        self._build_workers_tab(settings)
+        self._build_sampling_tab(settings)
+        self._build_rendering_tab(settings)
+        self._build_propagation_cost_tab(settings)
+
+        self.save_global_defaults = QCheckBox(
+            f"Also save these values as global defaults in {self._settings_path.name}"
+        )
+        self.save_global_defaults.setChecked(False)
+        self.save_global_defaults.setToolTip(str(self._settings_path))
+        layout.addWidget(self.save_global_defaults)
+
+        self.summary = QLabel()
+        self.summary.setWordWrap(True)
+        layout.addWidget(self.summary)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        for widget in (
+            self.profile,
+            self.rf_workers,
+            self.ifc_workers,
+            self.boundary_filter,
+            self.render_mode,
+            self.progressive_updates,
+            self.delay_spread,
+            self.fading,
+        ):
+            if isinstance(widget, QComboBox):
+                widget.currentIndexChanged.connect(self._update_summary)
+            elif isinstance(widget, (QSpinBox, QDoubleSpinBox)):
+                widget.valueChanged.connect(self._update_summary)
+            else:
+                widget.toggled.connect(self._update_summary)
+        self._connect_enabled_state()
+        self._update_enabled_state()
+        self._update_summary()
+
+    @staticmethod
+    def _page_with_form() -> Tuple[QWidget, QFormLayout]:
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        form_widget = QWidget()
+        form = QFormLayout(form_widget)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(form_widget)
+        outer.addWidget(scroll)
+        return page, form
+
+    @staticmethod
+    def _automatic_spin(maximum: int = 64) -> QSpinBox:
+        spin = QSpinBox()
+        spin.setRange(0, maximum)
+        spin.setSpecialValueText("Automatic")
+        return spin
+
+    def _build_workers_tab(self, settings: HeatmapSettings):
+        page, form = self._page_with_form()
+        self.profile = QComboBox()
+        self.profile.addItem("Fast preview", "fast")
+        self.profile.addItem("Balanced", "balanced")
+        self.profile.addItem("Detailed / report", "detailed")
+        self.profile.setCurrentIndex(max(0, self.profile.findData(str(settings.rf_calculation_profile))))
+        form.addRow("Calculation profile", self.profile)
+
+        self.enable_rf_mp = QCheckBox("Enable multiprocessing for RSSI calculation")
+        self.enable_rf_mp.setChecked(bool(settings.enable_rf_multiprocessing))
+        form.addRow(self.enable_rf_mp)
+        self.rf_workers = self._automatic_spin(64)
+        self.rf_workers.setValue(int(settings.max_rf_worker_processes))
+        self.rf_workers.setToolTip("0 uses the logical processor count. Four is a good starting point on an i7-1255U.")
+        form.addRow("Maximum RF worker processes", self.rf_workers)
+        self.rf_min_points = QSpinBox()
+        self.rf_min_points.setRange(1, 100_000_000)
+        self.rf_min_points.setValue(int(settings.rf_multiprocessing_min_points))
+        form.addRow("Minimum point-radio work for multiprocessing", self.rf_min_points)
+        self.tile_rows = QSpinBox()
+        self.tile_rows.setRange(1, 512)
+        self.tile_rows.setValue(int(settings.rf_tile_rows))
+        form.addRow("Preferred minimum RF tile rows", self.tile_rows)
+        self.tiles_per_worker = QSpinBox()
+        self.tiles_per_worker.setRange(1, 8)
+        self.tiles_per_worker.setValue(int(settings.rf_tiles_per_worker))
+        form.addRow("RF tiles per worker", self.tiles_per_worker)
+        self.reuse_pool = QCheckBox("Keep the RF process pool alive between calculations")
+        self.reuse_pool.setChecked(bool(settings.reuse_rf_process_pool))
+        form.addRow(self.reuse_pool)
+        self.worker_index_cache = QSpinBox()
+        self.worker_index_cache.setRange(1, 8)
+        self.worker_index_cache.setValue(int(settings.rf_worker_index_cache_entries))
+        form.addRow("Resident floor-index revisions per worker", self.worker_index_cache)
+
+        self.enable_ifc_mp = QCheckBox("Enable multiprocessing while loading IFC files")
+        self.enable_ifc_mp.setChecked(bool(settings.enable_ifc_multiprocessing))
+        form.addRow(self.enable_ifc_mp)
+        self.ifc_workers = self._automatic_spin(64)
+        self.ifc_workers.setValue(int(settings.max_ifc_loader_processes))
+        form.addRow("Maximum IFC loader processes", self.ifc_workers)
+        self.huge_ifc_workers = QSpinBox()
+        self.huge_ifc_workers.setRange(1, 8)
+        self.huge_ifc_workers.setValue(int(settings.max_parallel_huge_ifc_processes))
+        self.huge_ifc_workers.setToolTip("Keep this at 1 for very large IFC files to avoid multiplying memory use.")
+        form.addRow("Parallel huge-IFC processes", self.huge_ifc_workers)
+
+        self.boundary_filter = QCheckBox("Limit RSSI calculation and results to accepted planner boundaries")
+        self.boundary_filter.setChecked(bool(settings.ignore_results_outside_planner_boundaries))
+        form.addRow(self.boundary_filter)
+        self.boundary_note = QLabel(
+            "Accepted boundaries are present." if self._has_planner_boundaries else
+            "No planner boundaries are currently saved in this project. This option will take effect after a boundary is drawn or accepted."
+        )
+        self.boundary_note.setWordWrap(True)
+        form.addRow("Boundary status", self.boundary_note)
+        self.tabs.addTab(page, "Workers and scope")
+
+    def _build_sampling_tab(self, settings: HeatmapSettings):
+        page, form = self._page_with_form()
+        self.adaptive_grid = QCheckBox("Use adaptive coarse-to-fine sampling")
+        self.adaptive_grid.setChecked(bool(settings.enable_adaptive_rf_grid))
+        form.addRow(self.adaptive_grid)
+        self.coarse_resolution = QDoubleSpinBox()
+        self.coarse_resolution.setRange(0.25, 20.0)
+        self.coarse_resolution.setDecimals(2)
+        self.coarse_resolution.setValue(float(settings.adaptive_coarse_resolution_m))
+        self.coarse_resolution.setSuffix(" m")
+        form.addRow("Coarse-grid spacing", self.coarse_resolution)
+        self.gradient_threshold = QDoubleSpinBox()
+        self.gradient_threshold.setRange(0.05, 50.0)
+        self.gradient_threshold.setDecimals(2)
+        self.gradient_threshold.setValue(float(settings.adaptive_gradient_threshold_db_per_m))
+        self.gradient_threshold.setSuffix(" dB/m")
+        form.addRow("RSSI gradient refinement threshold", self.gradient_threshold)
+        self.threshold_margin = QDoubleSpinBox()
+        self.threshold_margin.setRange(0.1, 30.0)
+        self.threshold_margin.setValue(float(settings.adaptive_threshold_margin_db))
+        self.threshold_margin.setSuffix(" dB")
+        form.addRow("Coverage-threshold refinement margin", self.threshold_margin)
+        self.geometry_buffer = QDoubleSpinBox()
+        self.geometry_buffer.setRange(0.0, 30.0)
+        self.geometry_buffer.setValue(float(settings.adaptive_geometry_buffer_m))
+        self.geometry_buffer.setSuffix(" m")
+        form.addRow("Geometry refinement buffer", self.geometry_buffer)
+        self.ap_refine_radius = QDoubleSpinBox()
+        self.ap_refine_radius.setRange(0.5, 100.0)
+        self.ap_refine_radius.setValue(float(settings.adaptive_ap_refine_radius_m))
+        self.ap_refine_radius.setSuffix(" m")
+        form.addRow("AP refinement radius", self.ap_refine_radius)
+
+        self.per_ap_cache = QCheckBox("Cache each AP/frequency field for incremental recalculation")
+        self.per_ap_cache.setChecked(bool(settings.enable_per_ap_heatmap_cache))
+        form.addRow(self.per_ap_cache)
+        self.cache_entries = QSpinBox()
+        self.cache_entries.setRange(1, 10_000)
+        self.cache_entries.setValue(int(settings.per_ap_heatmap_cache_entries))
+        form.addRow("Maximum AP-field cache entries", self.cache_entries)
+        self.cache_mb = QSpinBox()
+        self.cache_mb.setRange(32, 32_768)
+        self.cache_mb.setValue(int(settings.per_ap_heatmap_cache_mb))
+        self.cache_mb.setSuffix(" MB")
+        form.addRow("Maximum AP-field cache memory", self.cache_mb)
+        self.reuse_path_geometry = QCheckBox("Reuse frequency-independent ray geometry across bands")
+        self.reuse_path_geometry.setChecked(bool(settings.reuse_path_geometry_across_frequencies))
+        form.addRow(self.reuse_path_geometry)
+        self.precompute_reflections = QCheckBox("Precompute reflection candidates per AP/tile")
+        self.precompute_reflections.setChecked(bool(settings.precompute_reflection_candidates_per_tile))
+        form.addRow(self.precompute_reflections)
+        self.tile_influence = QCheckBox("Reject APs that cannot influence an entire tile")
+        self.tile_influence.setChecked(bool(settings.enable_tile_influence_pruning))
+        form.addRow(self.tile_influence)
+        self.tile_influence_margin = QDoubleSpinBox()
+        self.tile_influence_margin.setRange(0.0, 40.0)
+        self.tile_influence_margin.setValue(float(settings.tile_influence_margin_db))
+        self.tile_influence_margin.setSuffix(" dB")
+        form.addRow("Tile influence safety margin", self.tile_influence_margin)
+        self.tile_local_geometry = QCheckBox("Use tile-local wall/opening/reflection geometry")
+        self.tile_local_geometry.setChecked(bool(settings.enable_tile_local_geometry))
+        form.addRow(self.tile_local_geometry)
+        self.numba_kernels = QCheckBox("Use compiled Numba kernels when available")
+        self.numba_kernels.setChecked(bool(settings.enable_numba_rf_kernels))
+        form.addRow(self.numba_kernels)
+        self.shared_memory = QCheckBox("Use shared-memory worker result arrays")
+        self.shared_memory.setChecked(bool(settings.use_shared_memory_rf_results))
+        form.addRow(self.shared_memory)
+        self.tabs.addTab(page, "Sampling and caches")
+
+    def _build_rendering_tab(self, settings: HeatmapSettings):
+        page, form = self._page_with_form()
+        self.render_mode = QComboBox()
+        self.render_mode.addItem("Raster heatmap only (fastest)", "raster")
+        self.render_mode.addItem("Raster heatmap with isolines", "raster_contours")
+        self.render_mode.addItem("Filled contour polygons (slowest)", "contours")
+        self.render_mode.setCurrentIndex(max(0, self.render_mode.findData(str(settings.heatmap_render_mode))))
+        form.addRow("Heatmap rendering", self.render_mode)
+        self.contour_interpolation = QSpinBox()
+        self.contour_interpolation.setRange(1, 16)
+        self.contour_interpolation.setValue(int(settings.contour_interpolation_factor))
+        form.addRow("Contour interpolation factor", self.contour_interpolation)
+        self.progressive_updates = QCheckBox("Redraw coarse and completed tile results during calculation")
+        self.progressive_updates.setChecked(bool(settings.progressive_heatmap_updates))
+        form.addRow(self.progressive_updates)
+        self.progressive_percent = QSpinBox()
+        self.progressive_percent.setRange(5, 100)
+        self.progressive_percent.setValue(int(settings.progressive_update_percent))
+        self.progressive_percent.setSuffix(" %")
+        form.addRow("Progressive update interval", self.progressive_percent)
+        self.interactive_preview = QCheckBox("Calculate a background preview after AP movement")
+        self.interactive_preview.setChecked(bool(settings.interactive_preview_enabled))
+        form.addRow(self.interactive_preview)
+        self.preview_delay = QSpinBox()
+        self.preview_delay.setRange(50, 10_000)
+        self.preview_delay.setValue(int(settings.interactive_preview_delay_ms))
+        self.preview_delay.setSuffix(" ms")
+        form.addRow("AP-move preview delay", self.preview_delay)
+        self.preview_resolution = QDoubleSpinBox()
+        self.preview_resolution.setRange(0.25, 20.0)
+        self.preview_resolution.setDecimals(2)
+        self.preview_resolution.setValue(float(settings.interactive_preview_resolution_m))
+        self.preview_resolution.setSuffix(" m")
+        form.addRow("AP-move preview spacing", self.preview_resolution)
+        self.tabs.addTab(page, "Rendering and preview")
+
+    def _build_propagation_cost_tab(self, settings: HeatmapSettings):
+        page, form = self._page_with_form()
+        note = QLabel(
+            "These controls change RF fidelity as well as speed. Use lighter values while placing APs and restore the Detailed profile for final reports."
+        )
+        note.setWordWrap(True)
+        form.addRow(note)
+        self.reflections = QCheckBox("Enable multipath reflections")
+        self.reflections.setChecked(bool(settings.enable_multipath_reflections))
+        form.addRow(self.reflections)
+        self.reflection_order = QSpinBox()
+        self.reflection_order.setRange(0, 3)
+        self.reflection_order.setValue(int(settings.max_reflection_order))
+        form.addRow("Maximum reflection order", self.reflection_order)
+        self.reflection_surfaces = QSpinBox()
+        self.reflection_surfaces.setRange(1, 24)
+        self.reflection_surfaces.setValue(int(settings.max_reflection_surfaces))
+        form.addRow("Candidate reflection surfaces", self.reflection_surfaces)
+        self.reflection_paths = QSpinBox()
+        self.reflection_paths.setRange(0, 64)
+        self.reflection_paths.setValue(int(settings.max_reflection_paths))
+        form.addRow("Retained reflection paths", self.reflection_paths)
+        self.diffraction = QCheckBox("Enable corner diffraction")
+        self.diffraction.setChecked(bool(settings.enable_corner_diffraction))
+        form.addRow(self.diffraction)
+        self.diffraction_paths = QSpinBox()
+        self.diffraction_paths.setRange(0, 32)
+        self.diffraction_paths.setValue(int(settings.max_diffraction_paths))
+        form.addRow("Retained diffraction paths", self.diffraction_paths)
+        self.fading = QCheckBox("Enable deterministic small-scale fading")
+        self.fading.setChecked(bool(settings.enable_small_scale_fading))
+        form.addRow(self.fading)
+        self.delay_spread = QCheckBox("Calculate RMS delay spread")
+        self.delay_spread.setChecked(bool(settings.calculate_delay_spread))
+        form.addRow(self.delay_spread)
+        self.relative_path_cutoff = QDoubleSpinBox()
+        self.relative_path_cutoff.setRange(0.0, 80.0)
+        self.relative_path_cutoff.setValue(float(settings.multipath_relative_power_cutoff_db))
+        self.relative_path_cutoff.setSuffix(" dB")
+        form.addRow("Discard paths below strongest by", self.relative_path_cutoff)
+        self.tabs.addTab(page, "Propagation cost")
+
+    def _connect_enabled_state(self):
+        self.enable_rf_mp.toggled.connect(self._update_enabled_state)
+        self.enable_ifc_mp.toggled.connect(self._update_enabled_state)
+        self.adaptive_grid.toggled.connect(self._update_enabled_state)
+        self.per_ap_cache.toggled.connect(self._update_enabled_state)
+        self.tile_influence.toggled.connect(self._update_enabled_state)
+        self.progressive_updates.toggled.connect(self._update_enabled_state)
+        self.interactive_preview.toggled.connect(self._update_enabled_state)
+        self.reflections.toggled.connect(self._update_enabled_state)
+        self.diffraction.toggled.connect(self._update_enabled_state)
+
+    def _update_enabled_state(self, *_):
+        for widget in (self.rf_workers, self.rf_min_points, self.tile_rows, self.tiles_per_worker, self.reuse_pool, self.worker_index_cache):
+            widget.setEnabled(self.enable_rf_mp.isChecked())
+        for widget in (self.ifc_workers, self.huge_ifc_workers):
+            widget.setEnabled(self.enable_ifc_mp.isChecked())
+        for widget in (self.coarse_resolution, self.gradient_threshold, self.threshold_margin, self.geometry_buffer, self.ap_refine_radius):
+            widget.setEnabled(self.adaptive_grid.isChecked())
+        for widget in (self.cache_entries, self.cache_mb):
+            widget.setEnabled(self.per_ap_cache.isChecked())
+        self.tile_influence_margin.setEnabled(self.tile_influence.isChecked())
+        self.progressive_percent.setEnabled(self.progressive_updates.isChecked())
+        for widget in (self.preview_delay, self.preview_resolution):
+            widget.setEnabled(self.interactive_preview.isChecked())
+        for widget in (self.reflection_order, self.reflection_surfaces, self.reflection_paths):
+            widget.setEnabled(self.reflections.isChecked())
+        self.diffraction_paths.setEnabled(self.diffraction.isChecked())
+        self._update_summary()
+
+    def _apply_laptop_preset(self):
+        self.profile.setCurrentIndex(max(0, self.profile.findData("balanced")))
+        self.enable_rf_mp.setChecked(True)
+        self.rf_workers.setValue(4)
+        self.enable_ifc_mp.setChecked(True)
+        self.ifc_workers.setValue(4)
+        self.huge_ifc_workers.setValue(1)
+        self.boundary_filter.setChecked(True)
+        self.adaptive_grid.setChecked(True)
+        self.coarse_resolution.setValue(4.0)
+        self.per_ap_cache.setChecked(True)
+        self.cache_entries.setValue(96)
+        self.cache_mb.setValue(384)
+        self.render_mode.setCurrentIndex(max(0, self.render_mode.findData("raster")))
+        self.contour_interpolation.setValue(2)
+        self.progressive_updates.setChecked(False)
+        self.interactive_preview.setChecked(True)
+        self.preview_resolution.setValue(4.0)
+        self.reflections.setChecked(True)
+        self.reflection_order.setValue(1)
+        self.reflection_surfaces.setValue(4)
+        self.reflection_paths.setValue(4)
+        self.diffraction.setChecked(True)
+        self.diffraction_paths.setValue(1)
+        self.fading.setChecked(False)
+        self.delay_spread.setChecked(False)
+        self.relative_path_cutoff.setValue(25.0)
+        self._update_enabled_state()
+
+    def _apply_automatic_preset(self):
+        defaults = HeatmapSettings.default()
+        self.profile.setCurrentIndex(max(0, self.profile.findData("balanced")))
+        self.enable_rf_mp.setChecked(True)
+        self.rf_workers.setValue(0)
+        self.rf_min_points.setValue(defaults.rf_multiprocessing_min_points)
+        self.tile_rows.setValue(defaults.rf_tile_rows)
+        self.tiles_per_worker.setValue(defaults.rf_tiles_per_worker)
+        self.reuse_pool.setChecked(True)
+        self.worker_index_cache.setValue(defaults.rf_worker_index_cache_entries)
+        self.enable_ifc_mp.setChecked(True)
+        self.ifc_workers.setValue(0)
+        self.huge_ifc_workers.setValue(1)
+        self.adaptive_grid.setChecked(True)
+        self.coarse_resolution.setValue(3.0)
+        self.per_ap_cache.setChecked(True)
+        self.cache_entries.setValue(192)
+        self.cache_mb.setValue(768)
+        self.render_mode.setCurrentIndex(max(0, self.render_mode.findData("raster_contours")))
+        self.contour_interpolation.setValue(4)
+        self.progressive_updates.setChecked(True)
+        self.reflections.setChecked(True)
+        self.reflection_order.setValue(1)
+        self.reflection_surfaces.setValue(6)
+        self.reflection_paths.setValue(8)
+        self.diffraction.setChecked(True)
+        self.diffraction_paths.setValue(3)
+        self.fading.setChecked(True)
+        self.delay_spread.setChecked(True)
+        self.relative_path_cutoff.setValue(30.0)
+        self._update_enabled_state()
+
+    def _apply_fast_preset(self):
+        self._apply_laptop_preset()
+        self.profile.setCurrentIndex(max(0, self.profile.findData("fast")))
+        self.coarse_resolution.setValue(5.0)
+        self.reflection_paths.setValue(2)
+        self.diffraction.setChecked(False)
+        self.relative_path_cutoff.setValue(20.0)
+        self.preview_resolution.setValue(5.0)
+        self._update_enabled_state()
+
+    def _update_summary(self, *_):
+        rf_workers = "automatic" if self.rf_workers.value() == 0 else str(self.rf_workers.value())
+        ifc_workers = "automatic" if self.ifc_workers.value() == 0 else str(self.ifc_workers.value())
+        boundary = "on" if self.boundary_filter.isChecked() else "off"
+        warning = ""
+        if self.boundary_filter.isChecked() and not self._has_planner_boundaries:
+            warning = " Boundary limiting is selected, but this project currently contains no planner boundaries."
+        self.summary.setText(
+            f"Current selection: {self.profile.currentText()}, RF workers {rf_workers}, IFC workers {ifc_workers}, "
+            f"{self.render_mode.currentText().lower()}, boundary filter {boundary}." + warning
+        )
+
+    @property
+    def global_settings_path(self) -> Path:
+        return self._settings_path
+
+    def apply_to(self, settings: HeatmapSettings):
+        settings.rf_calculation_profile = str(self.profile.currentData() or "balanced")
+        settings.enable_rf_multiprocessing = self.enable_rf_mp.isChecked()
+        settings.max_rf_worker_processes = int(self.rf_workers.value())
+        settings.rf_multiprocessing_min_points = int(self.rf_min_points.value())
+        settings.rf_tile_rows = int(self.tile_rows.value())
+        settings.rf_tiles_per_worker = int(self.tiles_per_worker.value())
+        settings.reuse_rf_process_pool = self.reuse_pool.isChecked()
+        settings.rf_worker_index_cache_entries = int(self.worker_index_cache.value())
+        settings.enable_ifc_multiprocessing = self.enable_ifc_mp.isChecked()
+        settings.max_ifc_loader_processes = int(self.ifc_workers.value())
+        settings.max_parallel_huge_ifc_processes = int(self.huge_ifc_workers.value())
+        settings.ignore_results_outside_planner_boundaries = self.boundary_filter.isChecked()
+        settings.enable_adaptive_rf_grid = self.adaptive_grid.isChecked()
+        settings.adaptive_coarse_resolution_m = float(self.coarse_resolution.value())
+        settings.adaptive_gradient_threshold_db_per_m = float(self.gradient_threshold.value())
+        settings.adaptive_threshold_margin_db = float(self.threshold_margin.value())
+        settings.adaptive_geometry_buffer_m = float(self.geometry_buffer.value())
+        settings.adaptive_ap_refine_radius_m = float(self.ap_refine_radius.value())
+        settings.enable_per_ap_heatmap_cache = self.per_ap_cache.isChecked()
+        settings.per_ap_heatmap_cache_entries = int(self.cache_entries.value())
+        settings.per_ap_heatmap_cache_mb = int(self.cache_mb.value())
+        settings.reuse_path_geometry_across_frequencies = self.reuse_path_geometry.isChecked()
+        settings.precompute_reflection_candidates_per_tile = self.precompute_reflections.isChecked()
+        settings.enable_tile_influence_pruning = self.tile_influence.isChecked()
+        settings.tile_influence_margin_db = float(self.tile_influence_margin.value())
+        settings.enable_tile_local_geometry = self.tile_local_geometry.isChecked()
+        settings.enable_numba_rf_kernels = self.numba_kernels.isChecked()
+        settings.use_shared_memory_rf_results = self.shared_memory.isChecked()
+        settings.heatmap_render_mode = str(self.render_mode.currentData() or "raster")
+        settings.contour_interpolation_factor = int(self.contour_interpolation.value())
+        settings.progressive_heatmap_updates = self.progressive_updates.isChecked()
+        settings.progressive_update_percent = int(self.progressive_percent.value())
+        settings.interactive_preview_enabled = self.interactive_preview.isChecked()
+        settings.interactive_preview_delay_ms = int(self.preview_delay.value())
+        settings.interactive_preview_resolution_m = float(self.preview_resolution.value())
+        settings.enable_multipath_reflections = self.reflections.isChecked()
+        settings.max_reflection_order = int(self.reflection_order.value())
+        settings.max_reflection_surfaces = int(self.reflection_surfaces.value())
+        settings.max_reflection_paths = int(self.reflection_paths.value())
+        settings.enable_corner_diffraction = self.diffraction.isChecked()
+        settings.max_diffraction_paths = int(self.diffraction_paths.value())
+        settings.enable_small_scale_fading = self.fading.isChecked()
+        settings.calculate_delay_spread = self.delay_spread.isChecked()
+        settings.multipath_relative_power_cutoff_db = float(self.relative_path_cutoff.value())
+
+
 class PropagationSettingsDialog(QDialog):
     """Configure bounded ray tracing, fading, delay spread and AP combination."""
 
@@ -6368,6 +6876,10 @@ class AccessPointGraphicsItem(QGraphicsPathItem):
         self._drag_items: List[Tuple[QGraphicsItem, QPointF]] = []
         self._dragged = False
         self._toggle_selection_on_click = False
+        # Labels and AP cutoff circles are separate scene items.  Keep lightweight
+        # followers with the AP so live dragging does not require rebuilding the
+        # complete IFC scene on mouse release.
+        self._move_followers: List[QGraphicsItem] = []
         self.setPos(float(ap.x), float(ap.y))
         self.setBrush(QBrush(colour))
         pen = QPen(main._theme_colours()["ap_outline"], 0.2)
@@ -6405,6 +6917,28 @@ class AccessPointGraphicsItem(QGraphicsPathItem):
             if isinstance(item, AccessPointGraphicsItem)
         ]
         return selected or [self]
+
+    def add_move_follower(self, item: QGraphicsItem):
+        """Move an auxiliary scene item by the same delta as this AP symbol."""
+        if item is not None and item not in self._move_followers:
+            self._move_followers.append(item)
+
+    def set_scene_position_with_followers(self, position: QPointF):
+        current = QPointF(self.pos())
+        delta = QPointF(position) - current
+        self.setPos(position)
+        if delta.manhattanLength() <= 1e-12:
+            return
+        for follower in list(self._move_followers):
+            try:
+                follower.setPos(follower.pos() + delta)
+            except RuntimeError:
+                # The scene may have been rebuilt while an old item reference was
+                # pending.  Drop deleted Qt objects without interrupting dragging.
+                try:
+                    self._move_followers.remove(follower)
+                except ValueError:
+                    pass
 
     def mousePressEvent(self, event):
         if event.button() != Qt.LeftButton:
@@ -6448,7 +6982,10 @@ class AccessPointGraphicsItem(QGraphicsPathItem):
                 delta.setX(0.0)
 
         for item, origin in self._drag_items:
-            item.setPos(origin + delta)
+            if isinstance(item, AccessPointGraphicsItem):
+                item.set_scene_position_with_followers(origin + delta)
+            else:
+                item.setPos(origin + delta)
         if getattr(self.main, "ap_ruler_enabled", False):
             self.main.refresh_access_point_rulers()
         if delta.manhattanLength() > 1e-6:
@@ -6521,6 +7058,7 @@ class AccessPointGraphicsItem(QGraphicsPathItem):
             self.main.delete_access_point(self.ap)
         elif chosen in type_actions:
             self.ap.ap_type = type_actions[chosen]
+            self.main._invalidate_interactive_preview_requests()
             self.main.last_result = None
             self.main.draw_floor()
             self.main.populate_ap_table()
@@ -6803,6 +7341,22 @@ class MainWindow(QMainWindow):
         self._interactive_preview_timer = QTimer(self)
         self._interactive_preview_timer.setSingleShot(True)
         self._interactive_preview_timer.timeout.connect(self._run_interactive_rf_preview)
+        # RF preview orchestration runs on a background thread.  The RF engine may
+        # still use its process pool, but waiting for worker tiles never blocks the
+        # Qt event loop.  Generation numbers coalesce rapid AP moves and prevent a
+        # stale preview from replacing a newer layout.
+        self._interactive_preview_thread: Optional[threading.Thread] = None
+        self._interactive_preview_future: Optional[concurrent.futures.Future] = None
+        self._interactive_preview_poll_timer = QTimer(self)
+        self._interactive_preview_poll_timer.setInterval(50)
+        self._interactive_preview_poll_timer.timeout.connect(self._poll_interactive_rf_preview)
+        self._interactive_preview_generation = 0
+        self._interactive_preview_job_generation = 0
+        self._interactive_preview_job_floor = ""
+        self._interactive_preview_pending = False
+        self._interactive_preview_profile = "fast"
+        self._interactive_preview_cold_start = False
+        self._rssi_result_stale = False
         self.auto_planner_settings = AutoPlannerSettings.from_dict(self.heatmap_settings.auto_planner_settings)
         self.heatmap_settings_path: Optional[Path] = None
         self.ifc_origin_info: Dict[str, Dict[str, object]] = {}
@@ -7081,6 +7635,8 @@ class MainWindow(QMainWindow):
         self.load_heatmap_settings_action.triggered.connect(self.load_heatmap_settings)
         self.propagation_settings_action = QAction("Propagation model", self)
         self.propagation_settings_action.triggered.connect(self.show_propagation_settings)
+        self.performance_settings_action = QAction("Performance settings", self)
+        self.performance_settings_action.triggered.connect(self.show_performance_settings)
         self.boundary_result_filter_action = QAction("Limit RSSI to boundaries", self)
         self.boundary_result_filter_action.setCheckable(True)
         self.boundary_result_filter_action.setChecked(
@@ -7342,6 +7898,7 @@ class MainWindow(QMainWindow):
 
         if not deleted_labels:
             return False
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.draw_floor()
         self.populate_ap_table()
@@ -7453,6 +8010,10 @@ class MainWindow(QMainWindow):
             "propagation_settings_action": (
                 "Propagation model", "Configure coherent reflections, higher-order rays, corner diffraction, small-scale fading, delay spread and multiple-AP power combination.",
                 "SP_FileDialogDetailedView", "Ctrl+Alt+M"
+            ),
+            "performance_settings_action": (
+                "Performance settings", "Configure RF and IFC worker counts, adaptive sampling, AP-field caches, raster rendering, previews and propagation-cost limits. Includes an i7-1255U/laptop preset.",
+                "SP_ComputerIcon", "Ctrl+Alt+Shift+P"
             ),
             "boundary_result_filter_action": (
                 "Limit RSSI to boundaries", "Skip and hide RSSI samples outside the union of accepted shared planner boundaries. The filter also applies to hover values, CSV statistics and floor PDF exports.",
@@ -7632,7 +8193,7 @@ class MainWindow(QMainWindow):
         ]), "Walls and boundaries")
         ribbon.addTab(self._make_ribbon_page([
             ("Antenna data", ["load_pattern_action"]),
-            ("Propagation and display", ["propagation_settings_action", "boundary_result_filter_action", "load_heatmap_settings_action"]),
+            ("Propagation and display", ["propagation_settings_action", "performance_settings_action", "boundary_result_filter_action", "load_heatmap_settings_action"]),
             ("Analysis", ["sim_action", "export_action", "export_pdf_action"]),
         ]), "Radio and analysis")
         return ribbon
@@ -8020,6 +8581,7 @@ class MainWindow(QMainWindow):
                 ap = self.add_ap(x, y, redraw=False)
                 if ap is not None:
                     created.append(ap)
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.rssi_results_by_frequency = {}
         self.draw_floor()
@@ -8160,6 +8722,7 @@ class MainWindow(QMainWindow):
                 successful_spaces += 1
             if limit_reached:
                 break
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.rssi_results_by_frequency = {}
         self._ensure_ap_interaction_enabled()
@@ -8289,8 +8852,10 @@ class MainWindow(QMainWindow):
         if not created:
             self.statusBar().showMessage("No valid access points could be pasted")
             return False
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.rssi_results_by_frequency = {}
+        self._rssi_result_stale = False
         self._refresh_rssi_frequency_dropdown()
         self._pending_ap_selection_ids = {id(ap) for ap in created}
         self._preserve_view_on_redraw = True
@@ -8300,6 +8865,37 @@ class MainWindow(QMainWindow):
             f"Pasted {len(created)} access point(s) onto {self.floor.name}; the pasted group remains selected."
         )
         return True
+
+    def _update_ap_table_positions(self, moved_aps: List[AccessPoint]):
+        """Update only X/Y cells after a drag instead of rebuilding every AP row."""
+        if not moved_aps or not hasattr(self, "ap_table"):
+            return
+        by_name = {ap.name: ap for ap in moved_aps}
+        self.ap_table.blockSignals(True)
+        try:
+            for row in range(self.ap_table.rowCount()):
+                identity_item = self.ap_table.item(row, 0)
+                if identity_item is None:
+                    continue
+                ap = by_name.get(str(identity_item.data(Qt.UserRole) or identity_item.text()))
+                if ap is None:
+                    continue
+                x_item = self.ap_table.item(row, 5)
+                y_item = self.ap_table.item(row, 6)
+                if x_item is not None:
+                    x_item.setText(f"{float(ap.x):.2f}")
+                if y_item is not None:
+                    y_item.setText(f"{float(ap.y):.2f}")
+        finally:
+            self.ap_table.blockSignals(False)
+
+    @staticmethod
+    def _snapshot_rf_access_points(aps: List[AccessPoint]) -> List[AccessPoint]:
+        """Create an RF-only AP snapshot safe for a background calculation."""
+        return [
+            replace(ap, radios=[replace(radio) for radio in ap.radios])
+            for ap in aps
+        ]
 
     def commit_access_point_group_move(self, moved_aps: List[AccessPoint], delta: QPointF):
         unique: List[AccessPoint] = []
@@ -8311,58 +8907,198 @@ class MainWindow(QMainWindow):
             unique.append(ap)
         if not unique:
             return
-        self.last_result = None
-        self.rssi_results_by_frequency = {}
-        self.populate_ap_table()
-        self._pending_ap_selection_ids = {id(ap) for ap in unique}
-        self._preserve_view_on_redraw = True
-        QTimer.singleShot(0, self.draw_floor)
+
+        # The AP symbol, boresight, label and cutoff rings have already moved in
+        # the existing scene.  Do not reconstruct every IFC object just to commit
+        # new coordinates.  Keep the previous heatmap visible but suppress its
+        # hover values until the asynchronous replacement is ready.
+        self._rssi_result_stale = bool(self.last_result is not None)
+        self._update_ap_table_positions(unique)
+        self.refresh_access_point_rulers()
+        if self.view.scene() is not None:
+            self.view.scene().update()
         self.statusBar().showMessage(
-            f"Moved {len(unique)} access point(s) by ΔX {float(delta.x()):.2f} m, ΔY {float(delta.y()):.2f} m"
+            f"Moved {len(unique)} access point(s) by ΔX {float(delta.x()):.2f} m, ΔY {float(delta.y()):.2f} m. "
+            "RSSI preview queued in the background."
         )
         self._schedule_interactive_rf_preview()
 
     def _schedule_interactive_rf_preview(self):
         if not bool(getattr(self.heatmap_settings, "interactive_preview_enabled", True)):
             return
-        if self.floor is None or not self.aps or self._interactive_preview_running:
+        if self.floor is None or not self.aps:
             return
+        self._interactive_preview_generation += 1
+        self._interactive_preview_pending = True
         delay = max(50, int(getattr(self.heatmap_settings, "interactive_preview_delay_ms", 350)))
         self._interactive_preview_timer.start(delay)
 
-    def _run_interactive_rf_preview(self):
-        if self._interactive_preview_running or self.floor is None or not self.aps:
+    def _invalidate_interactive_preview_requests(self):
+        """Discard queued/running preview output without blocking for its worker."""
+        if not hasattr(self, "_interactive_preview_generation"):
             return
-        active_freqs = sorted({float(radio.frequency_mhz) for ap in self.aps for radio in ap.active_radios()})
+        self._interactive_preview_generation += 1
+        self._interactive_preview_pending = False
+        self._interactive_preview_timer.stop()
+        future = self._interactive_preview_future
+        if future is not None and not future.running():
+            future.cancel()
+
+    def _run_interactive_rf_preview(self):
+        if self.floor is None or not self.aps:
+            return
+        future = self._interactive_preview_future
+        if future is not None and not future.done():
+            # A rapid second drag should not start another complete calculation.
+            # The generation marker makes the current output stale; the latest
+            # request starts as soon as the single background slot is free.
+            self._interactive_preview_pending = True
+            self.statusBar().showMessage("AP moved again; coalescing the RSSI preview update...")
+            return
+
+        active_freqs = sorted({
+            float(radio.frequency_mhz)
+            for ap in self.aps for radio in ap.active_radios()
+        })
         if not active_freqs:
             return
+
+        generation = int(self._interactive_preview_generation)
+        floor = self.floor
+        aps_snapshot = self._snapshot_rf_access_points(self.aps)
+        settings_snapshot = copy.deepcopy(self.heatmap_settings)
+        patterns_snapshot = copy.deepcopy(self.antenna_patterns)
+        resolution = max(
+            float(self.resolution.value()),
+            float(getattr(settings_snapshot, "interactive_preview_resolution_m", 3.0)),
+        )
+        had_current_fields = bool(self.rssi_results_by_frequency)
+        profile_override = str(getattr(settings_snapshot, "rf_calculation_profile", "balanced")) if had_current_fields else "fast"
+        cold_start = not had_current_fields
+        if cold_start and len(aps_snapshot) >= 8:
+            # Immediately after predictive placement no per-AP heatmap fields
+            # exist.  A bounded direct/penetration preview avoids ray tracing all
+            # planned APs before the user can continue editing.  The explicit
+            # Calculate RSSI command still uses the configured propagation model.
+            settings_snapshot.enable_multipath_reflections = False
+            settings_snapshot.enable_corner_diffraction = False
+            settings_snapshot.enable_small_scale_fading = False
+            settings_snapshot.calculate_delay_spread = False
+            settings_snapshot.enable_adaptive_rf_grid = True
+            settings_snapshot.adaptive_coarse_resolution_m = max(
+                float(settings_snapshot.adaptive_coarse_resolution_m), resolution, 4.0
+            )
+            settings_snapshot.heatmap_render_mode = "raster"
+
         self._interactive_preview_running = True
-        try:
-            resolution = max(
-                float(self.resolution.value()),
-                float(getattr(self.heatmap_settings, "interactive_preview_resolution_m", 3.0)),
-            )
-            self.statusBar().showMessage("Updating fast RSSI preview for the moved AP field...")
-            results = RFEngine.simulate_frequencies(
-                self.floor, self.floors, self.aps, active_freqs, resolution, self.antenna_patterns,
-                include_inter_floor=self.include_inter_floor.isChecked(),
-                heatmap_settings=self.heatmap_settings,
-                calculation_boundary=self._rssi_calculation_boundary(),
-                profile_override="fast",
-            )
-            if results:
-                self.rssi_results_by_frequency = results
-                selected = self._selected_rssi_view_frequency()
-                self.last_result = results.get(selected) or results[sorted(results)[0]]
-                self._preserve_view_on_redraw = True
-                self.draw_floor()
-                self.statusBar().showMessage(
-                    "Fast RSSI preview updated. Run Calculate RSSI for the configured study profile."
+        self._interactive_preview_pending = False
+        self._interactive_preview_job_generation = generation
+        self._interactive_preview_job_floor = str(floor.name)
+        self._interactive_preview_profile = profile_override
+        self._interactive_preview_cold_start = cold_start
+        self.statusBar().showMessage(
+            "Building a rapid RSSI preview in the background..."
+            if cold_start else
+            "Recalculating only changed AP field(s) in the background..."
+        )
+        future: concurrent.futures.Future = concurrent.futures.Future()
+        self._interactive_preview_future = future
+        calculation_boundary = self._rssi_calculation_boundary()
+        include_inter_floor = self.include_inter_floor.isChecked()
+
+        def calculate_preview():
+            if not future.set_running_or_notify_cancel():
+                return
+            try:
+                result = RFEngine.simulate_frequencies(
+                    floor,
+                    self.floors,
+                    aps_snapshot,
+                    active_freqs,
+                    resolution,
+                    patterns_snapshot,
+                    include_inter_floor,
+                    settings_snapshot,
+                    None,
+                    calculation_boundary,
+                    None,
+                    profile_override,
                 )
-        except Exception as exc:
-            self.statusBar().showMessage(f"Fast RSSI preview skipped: {exc}")
-        finally:
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+
+        # A daemon coordinator keeps the Qt thread responsive while the existing
+        # process pool performs the numerical work.  Daemon lifetime also means a
+        # long preview cannot prevent the application from closing.
+        self._interactive_preview_thread = threading.Thread(
+            target=calculate_preview,
+            name="rf-interactive-preview",
+            daemon=True,
+        )
+        self._interactive_preview_thread.start()
+        self._interactive_preview_poll_timer.start()
+
+    def _poll_interactive_rf_preview(self):
+        future = self._interactive_preview_future
+        if future is None:
+            self._interactive_preview_poll_timer.stop()
             self._interactive_preview_running = False
+            return
+        if not future.done():
+            return
+
+        self._interactive_preview_poll_timer.stop()
+        job_generation = int(self._interactive_preview_job_generation)
+        job_floor = str(self._interactive_preview_job_floor)
+        cold_start = bool(self._interactive_preview_cold_start)
+        self._interactive_preview_future = None
+        self._interactive_preview_running = False
+        try:
+            results = future.result()
+        except concurrent.futures.CancelledError:
+            results = {}
+        except Exception as exc:
+            results = {}
+            if job_generation == self._interactive_preview_generation:
+                self.statusBar().showMessage(f"Background RSSI preview skipped: {exc}")
+
+        current_floor_name = str(self.floor.name) if self.floor is not None else ""
+        current_request = (
+            job_generation == self._interactive_preview_generation
+            and job_floor == current_floor_name
+        )
+        if current_request and results:
+            converted = {float(key): value for key, value in results.items()}
+            self.rssi_results_by_frequency = converted
+            selected = self._selected_rssi_view_frequency()
+            self.last_result = converted.get(selected) or converted[sorted(converted)[0]]
+            self._rssi_result_stale = False
+            scene = self.view.scene()
+            self._pending_ap_selection_ids = {
+                id(item.ap) for item in (scene.selectedItems() if scene is not None else [])
+                if isinstance(item, AccessPointGraphicsItem)
+            }
+            self._preserve_view_on_redraw = True
+            self.draw_floor()
+            misses = max((int(result.cache_misses) for result in converted.values()), default=0)
+            hits = max((int(result.cache_hits) for result in converted.values()), default=0)
+            if cold_start:
+                message = (
+                    "Rapid post-planner RSSI preview updated in the background. "
+                    "Run Calculate RSSI for the configured propagation study."
+                )
+            else:
+                message = f"RSSI preview updated: {misses} AP field(s) recalculated, {hits} reused."
+            self.statusBar().showMessage(message)
+
+        # If the AP moved again while this job was running, immediately start the
+        # newest coalesced request.  No stale result is ever applied to the scene.
+        if self._interactive_preview_pending:
+            self._interactive_preview_pending = False
+            self._interactive_preview_timer.stop()
+            QTimer.singleShot(0, self._run_interactive_rf_preview)
 
     def focus_ap_in_table(self, ap: AccessPoint):
         self.inspector_tabs.setCurrentIndex(1)
@@ -8384,6 +9120,7 @@ class MainWindow(QMainWindow):
             radios=[replace(radio) for radio in ap.radios],
         )
         self.aps.append(duplicate)
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.rssi_results_by_frequency = {}
         self.draw_floor()
@@ -8392,6 +9129,7 @@ class MainWindow(QMainWindow):
 
     def delete_access_point(self, ap: AccessPoint):
         self.aps = [candidate for candidate in self.aps if candidate is not ap]
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.rssi_results_by_frequency = {}
         self.draw_floor()
@@ -8405,8 +9143,10 @@ class MainWindow(QMainWindow):
             ap.tx_power_dbm = float(ap.radios[0].tx_power_dbm)
             ap.frequency_mhz = float(ap.radios[0].frequency_mhz)
             ap.antenna_pattern = ap.radios[0].antenna_pattern
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.rssi_results_by_frequency = {}
+        self._rssi_result_stale = False
         self._refresh_rssi_frequency_dropdown()
         self.draw_floor()
         self.populate_ap_table()
@@ -8777,6 +9517,7 @@ class MainWindow(QMainWindow):
         ))
         self._space_polygon_points = []
         self._clear_space_preview()
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.draw_floor()
         self.statusBar().showMessage(
@@ -9582,6 +10323,7 @@ class MainWindow(QMainWindow):
         if floor is None or not space.is_inferred:
             return
         floor.spaces = [candidate for candidate in floor.spaces if candidate is not space]
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.draw_floor()
         self.statusBar().showMessage(f"Deleted inferred space '{space.name}'")
@@ -9622,6 +10364,7 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.Yes:
             return
         self.floor.spaces = [space for space in self.floor.spaces if not space.is_inferred]
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.draw_floor()
         self.statusBar().showMessage(f"Cleared {count} inferred space{'s' if count != 1 else ''}")
@@ -9811,6 +10554,7 @@ class MainWindow(QMainWindow):
         self.floor.walls.append(wall)
         self._wall_draw_start = None
         self._clear_wall_preview()
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.edit_wall_rf_properties(wall)
         self.draw_floor(); self.populate_wall_table()
@@ -9835,6 +10579,7 @@ class MainWindow(QMainWindow):
             instance.rf_type_override = wall_type
             instance.attenuation_by_band_db.update({float(k): float(v) for k, v in attenuation.items()})
             instance.rf_customised = True
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.populate_wall_table(); self.draw_floor()
         self.statusBar().showMessage(f"Updated RF attenuation for {wall.name or wall.guid}")
@@ -9966,6 +10711,7 @@ class MainWindow(QMainWindow):
         if not changed_types:
             self.statusBar().showMessage("No IFC attenuation type rows were selected")
             return
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.rssi_results_by_frequency = {}
         self.populate_wall_table()
@@ -9993,6 +10739,7 @@ class MainWindow(QMainWindow):
             instance.rf_type_override = rf_type
             instance.attenuation_by_band_db.update({float(key): float(value) for key, value in attenuation.items()})
             instance.rf_customised = True
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.rssi_results_by_frequency = {}
         self.populate_wall_table()
@@ -10007,6 +10754,7 @@ class MainWindow(QMainWindow):
             instance.rf_customised = False
             instance.rf_type_override = ""
             instance.attenuation_by_band_db = self._profile_for_ifc_element_from_settings(instance)
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.rssi_results_by_frequency = {}
         self.populate_wall_table()
@@ -10085,8 +10833,10 @@ class MainWindow(QMainWindow):
                 ap.frequency_mhz = float(ap.radios[0].frequency_mhz)
                 ap.antenna_pattern = ap.radios[0].antenna_pattern
 
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.rssi_results_by_frequency = {}
+        self._rssi_result_stale = False
         self._refresh_rssi_frequency_dropdown()
         self._pending_ap_selection_ids = {id(ap) for ap in targets if ap.floor == (self.floor.name if self.floor else "")}
         self.populate_ap_table()
@@ -10221,6 +10971,7 @@ class MainWindow(QMainWindow):
                     f"({pivot_x:.3f}, {pivot_y:.3f}) m"
                 ),
             )
+            self._invalidate_interactive_preview_requests()
             self.last_result = None
             self.rssi_results_by_frequency = {}
             aligned_angle = self._wall_major_axis_angle_deg(wall.polygon)
@@ -10238,6 +10989,7 @@ class MainWindow(QMainWindow):
             instance.rf_type_override = ""
             instance.rf_customised = False
             instance.attenuation_by_band_db = self._profile_for_wall_from_settings(instance)
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.populate_wall_table(); self.draw_floor()
 
@@ -10247,6 +10999,7 @@ class MainWindow(QMainWindow):
         floor = self.floors.get(wall.floor)
         if floor is not None:
             floor.walls = [candidate for candidate in floor.walls if candidate is not wall]
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.populate_wall_table(); self.draw_floor()
 
@@ -10329,6 +11082,7 @@ class MainWindow(QMainWindow):
                 )
             ]
             removed += before - len(floor.walls)
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.populate_wall_table()
         self.draw_floor()
@@ -10340,6 +11094,7 @@ class MainWindow(QMainWindow):
         floor = self.floors.get(space.floor)
         if floor is not None:
             floor.spaces = [candidate for candidate in floor.spaces if candidate is not space]
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.draw_floor()
         self.statusBar().showMessage(f"Deleted user-created space '{space.name}'")
@@ -10370,6 +11125,7 @@ class MainWindow(QMainWindow):
                 )
             ]
             removed += before - len(floor.spaces)
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.draw_floor()
         self.statusBar().showMessage(f"Removed {removed} imported IFC space instance{'s' if removed != 1 else ''} from the RF model")
@@ -10396,6 +11152,7 @@ class MainWindow(QMainWindow):
                 )
             ]
             removed += before - len(floor.elements)
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.draw_floor()
         self.statusBar().showMessage(f"Removed {removed} imported IFC element instance{'s' if removed != 1 else ''} from the RF model")
@@ -10420,6 +11177,7 @@ class MainWindow(QMainWindow):
         for candidate in floor.spaces:
             if self._space_ref(candidate) == target_ref:
                 candidate.ap_planning_selected = selected
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.draw_floor()
         count = len(self._selected_ap_planning_spaces())
@@ -10492,6 +11250,7 @@ class MainWindow(QMainWindow):
             return
         for space, check in checks:
             space.ap_planning_selected = bool(check.isChecked())
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.draw_floor()
         count = len(self._selected_ap_planning_spaces())
@@ -10507,6 +11266,7 @@ class MainWindow(QMainWindow):
         return self._planner_boundary_area()
 
     def _clear_rssi_results(self):
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.rssi_results_by_frequency = {}
 
@@ -10525,6 +11285,91 @@ class MainWindow(QMainWindow):
             )
         else:
             self.statusBar().showMessage("Boundary RSSI filter disabled")
+
+    def _save_performance_defaults(self, path: Path):
+        """Update only performance/propagation keys while preserving the rest of the JSON file."""
+        path = Path(path)
+        data: Dict[str, object] = {}
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if isinstance(loaded, dict):
+                data = loaded
+        data.update({
+            "enable_ifc_multiprocessing": bool(self.heatmap_settings.enable_ifc_multiprocessing),
+            "max_ifc_loader_processes": int(self.heatmap_settings.max_ifc_loader_processes),
+            "max_parallel_huge_ifc_processes": int(self.heatmap_settings.max_parallel_huge_ifc_processes),
+            "enable_rf_multiprocessing": bool(self.heatmap_settings.enable_rf_multiprocessing),
+            "max_rf_worker_processes": int(self.heatmap_settings.max_rf_worker_processes),
+            "rf_multiprocessing_min_points": int(self.heatmap_settings.rf_multiprocessing_min_points),
+            "rf_tile_rows": int(self.heatmap_settings.rf_tile_rows),
+            "rf_tiles_per_worker": int(self.heatmap_settings.rf_tiles_per_worker),
+            "reuse_rf_process_pool": bool(self.heatmap_settings.reuse_rf_process_pool),
+            "rf_worker_index_cache_entries": int(self.heatmap_settings.rf_worker_index_cache_entries),
+            "contour_interpolation_factor": int(self.heatmap_settings.contour_interpolation_factor),
+            "ignore_results_outside_planner_boundaries": bool(self.heatmap_settings.ignore_results_outside_planner_boundaries),
+        })
+        data["rf_performance"] = self.heatmap_settings.performance_model_dict()
+        existing_propagation = data.get("propagation_model", {})
+        if not isinstance(existing_propagation, dict):
+            existing_propagation = {}
+        existing_propagation.update(self.heatmap_settings.propagation_model_dict())
+        data["propagation_model"] = existing_propagation
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+        self.heatmap_settings_path = path
+
+    def show_performance_settings(self):
+        before = self.heatmap_settings.performance_model_dict()
+        before_propagation = self.heatmap_settings.propagation_model_dict()
+        dialog = RFPerformanceSettingsDialog(
+            self,
+            self.heatmap_settings,
+            has_planner_boundaries=bool(self.planner_boundaries),
+            settings_path=self.heatmap_settings_path,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        dialog.apply_to(self.heatmap_settings)
+        after = self.heatmap_settings.performance_model_dict()
+        after_propagation = self.heatmap_settings.propagation_model_dict()
+
+        worker_keys = {
+            "enable_rf_multiprocessing", "max_rf_worker_processes", "reuse_rf_process_pool",
+            "rf_worker_index_cache_entries", "rf_tile_rows", "rf_tiles_per_worker",
+        }
+        if any(before.get(key) != after.get(key) for key in worker_keys):
+            _shutdown_rf_process_executor(wait=False)
+        _RF_AP_FIELD_CACHE.clear()
+        self.boundary_result_filter_action.blockSignals(True)
+        self.boundary_result_filter_action.setChecked(
+            bool(self.heatmap_settings.ignore_results_outside_planner_boundaries)
+        )
+        self.boundary_result_filter_action.blockSignals(False)
+        self._clear_rssi_results()
+        self._update_rssi_legend()
+        self.draw_floor()
+
+        saved_text = ""
+        if dialog.save_global_defaults.isChecked():
+            try:
+                self._save_performance_defaults(dialog.global_settings_path)
+                saved_text = f" Global defaults saved to {dialog.global_settings_path.name}."
+            except Exception as exc:
+                QMessageBox.warning(self, "Performance defaults not saved", str(exc))
+        changed = before != after or before_propagation != after_propagation
+        workers = int(self.heatmap_settings.max_rf_worker_processes)
+        worker_text = "automatic" if workers == 0 else str(workers)
+        boundary_note = ""
+        if self.heatmap_settings.ignore_results_outside_planner_boundaries and not self.planner_boundaries:
+            boundary_note = " Boundary limiting is enabled but will not take effect until a planner boundary exists."
+        self.statusBar().showMessage(
+            f"Performance settings {'updated' if changed else 'unchanged'}: "
+            f"{self.heatmap_settings.rf_calculation_profile} profile, {worker_text} RF workers, "
+            f"{self.heatmap_settings.heatmap_render_mode} rendering.{boundary_note}{saved_text}"
+        )
 
     def show_propagation_settings(self):
         dialog = PropagationSettingsDialog(self, self.heatmap_settings)
@@ -11011,6 +11856,8 @@ class MainWindow(QMainWindow):
             assigned.append(ap)
 
     def run_auto_planner(self):
+        self._invalidate_interactive_preview_requests()
+        self._rssi_result_stale = False
         if not self.floor:
             QMessageBox.information(self, "No floor selected", "Load an IFC and select a floor before predicting AP locations.")
             return
@@ -11393,8 +12240,10 @@ class MainWindow(QMainWindow):
         finally:
             progress.close()
 
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.rssi_results_by_frequency = {}
+        self._rssi_result_stale = False
         self._refresh_rssi_frequency_dropdown()
         self.populate_ap_table()
         self.draw_floor()
@@ -11837,6 +12686,7 @@ class MainWindow(QMainWindow):
         saved_rotation = float(data.get("view_rotation_deg", 0.0))
         if abs(saved_rotation) > 1e-9:
             self.rotate_view(saved_rotation)
+        self._invalidate_interactive_preview_requests()
         self.last_result = None; self.rssi_results_by_frequency = {}
         self._refresh_rssi_frequency_dropdown()
         self.populate_ap_table(); self.populate_wall_table(); self.draw_floor()
@@ -11878,6 +12728,7 @@ class MainWindow(QMainWindow):
         if freq is not None and freq in getattr(self, "rssi_results_by_frequency", {}):
             self.last_result = self.rssi_results_by_frequency[freq]
         else:
+            self._invalidate_interactive_preview_requests()
             self.last_result = None
         self.draw_floor()
 
@@ -11995,6 +12846,9 @@ class MainWindow(QMainWindow):
         return value
 
     def update_rssi_hover_readout(self, scene_pos: QPointF, viewport_pos):
+        if bool(getattr(self, "_rssi_result_stale", False)):
+            self.view.hide_rssi_hover()
+            return
         result = getattr(self, "last_result", None)
         frequency = self._selected_rssi_view_frequency()
         if result is None or frequency is None or not self.floor:
@@ -12492,6 +13346,7 @@ class MainWindow(QMainWindow):
             ap.y = d * old_x + e * old_y + yoff
         composed = AlignmentTransform._compose(delta, self.ifc_alignment.matrix())
         self.ifc_alignment = AlignmentTransform.from_matrix(composed)
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.draw_floor()
         self.populate_ap_table()
@@ -12698,6 +13553,7 @@ class MainWindow(QMainWindow):
             self.aps.clear()
             self.planner_boundaries.clear()
             self.excluded_ifc_elements.clear()
+            self._invalidate_interactive_preview_requests()
             self.last_result = None
             self.ifc_alignment = AlignmentTransform()
         self.alignment_pick_mode: Optional[str] = None
@@ -13044,6 +13900,8 @@ class MainWindow(QMainWindow):
         self.floor_combo.setEnabled(not loading)
 
     def select_floor(self, name: str):
+        self._invalidate_interactive_preview_requests()
+        self._rssi_result_stale = False
         if getattr(self, "wall_draw_mode", False) or getattr(self, "_wall_draw_start", None) is not None:
             self.cancel_user_wall_drawing()
         if getattr(self, "space_draw_mode", False) or bool(getattr(self, "_space_polygon_points", [])):
@@ -13068,6 +13926,7 @@ class MainWindow(QMainWindow):
             self.floor = None
             return
         self.floor = dict.get(self.floors, str(name), None)
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self._load_slab_attenuation_to_ui()
         self.draw_floor()
@@ -13130,8 +13989,10 @@ class MainWindow(QMainWindow):
             radios=default_radios, max_clients=int(self.auto_planner_settings.clients_per_ap), planned=bool(planned),
         )
         self.aps.append(ap)
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.rssi_results_by_frequency = {}
+        self._rssi_result_stale = False
         self._refresh_rssi_frequency_dropdown()
         if redraw:
             self.draw_floor()
@@ -13140,8 +14001,10 @@ class MainWindow(QMainWindow):
 
     def clear_aps(self):
         self.aps = [a for a in self.aps if not self.floor or a.floor != self.floor.name]
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.rssi_results_by_frequency = {}
+        self._rssi_result_stale = False
         self._refresh_rssi_frequency_dropdown()
         self.draw_floor()
         self.populate_ap_table()
@@ -13282,22 +14145,6 @@ class MainWindow(QMainWindow):
             same_floor = ap.floor == self.floor.name
             radius = 0.75 if same_floor else 0.45
             colour = colours["ap_same_floor"] if same_floor else colours["ap_other_floor"]
-            if self.heatmap_settings.show_ap_cutoff_zones and same_floor:
-                active_radii = []
-                for radio in ap.active_radios():
-                    r = RFEngine.cutoff_radius_m_for_radio(radio, self.heatmap_settings)
-                    if r > 0:
-                        active_radii.append(r)
-                for r in sorted(set(round(v, 3) for v in active_radii)):
-                    cut_colour = QColor(colours.get("ap_cutoff_zone", colour))
-                    cut_colour.setAlpha(self.heatmap_settings.ap_cutoff_zone_alpha)
-                    cut_pen = QPen(cut_colour, self.heatmap_settings.ap_cutoff_zone_line_width)
-                    cut_pen.setCosmetic(True)
-                    cut_item = QGraphicsEllipseItem(ap.x - r, ap.y - r, r * 2.0, r * 2.0)
-                    cut_item.setPen(cut_pen)
-                    cut_item.setBrush(QBrush(Qt.NoBrush))
-                    cut_item.setZValue(Z_CONTOUR_LINE - 2)
-                    scene.addItem(cut_item)
 
             if same_floor:
                 dot = AccessPointGraphicsItem(self, ap, radius, colour)
@@ -13315,6 +14162,25 @@ class MainWindow(QMainWindow):
                 dot.setZValue(Z_AP - 5)
                 scene.addItem(dot)
 
+            if self.heatmap_settings.show_ap_cutoff_zones and same_floor:
+                active_radii = []
+                for radio in ap.active_radios():
+                    r = RFEngine.cutoff_radius_m_for_radio(radio, self.heatmap_settings)
+                    if r > 0:
+                        active_radii.append(r)
+                for r in sorted(set(round(v, 3) for v in active_radii)):
+                    cut_colour = QColor(colours.get("ap_cutoff_zone", colour))
+                    cut_colour.setAlpha(self.heatmap_settings.ap_cutoff_zone_alpha)
+                    cut_pen = QPen(cut_colour, self.heatmap_settings.ap_cutoff_zone_line_width)
+                    cut_pen.setCosmetic(True)
+                    cut_item = QGraphicsEllipseItem(ap.x - r, ap.y - r, r * 2.0, r * 2.0)
+                    cut_item.setPen(cut_pen)
+                    cut_item.setBrush(QBrush(Qt.NoBrush))
+                    cut_item.setZValue(Z_CONTOUR_LINE - 2)
+                    cut_item.setAcceptedMouseButtons(Qt.NoButton)
+                    scene.addItem(cut_item)
+                    dot.add_move_follower(cut_item)
+
             # Keep the boresight arrow parented to the AP symbol so it follows live drag movement.
             length = 5.0 if same_floor else 3.0
             ang = math.radians(ap.azimuth_deg)
@@ -13329,10 +14195,12 @@ class MainWindow(QMainWindow):
             arrow.setZValue(1.0)
             type_short = AP_TYPE_PRESETS.get(ap.ap_type, AP_TYPE_PRESETS["Ceiling AP"]).get("short", "AP")
             label = f"{ap.name} [{type_short}]" if same_floor else f"{ap.floor}: {ap.name} [{type_short}]"
-            self._add_upright_text(
+            label_item = self._add_upright_text(
                 scene, label, ap.x + radius + 0.25, ap.y + radius + 0.25,
                 colour, self.heatmap_settings.ap_label_font_size, Z_AP_LABEL, bold=same_floor,
             )
+            if same_floor:
+                dot.add_move_follower(label_item)
 
         self._pending_ap_selection_ids = set()
         self._drawing_floor = False
@@ -13956,6 +14824,7 @@ class MainWindow(QMainWindow):
                 ap.antenna_pattern = ap.radios[0].antenna_pattern
         except (ValueError, IndexError):
             return
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.rssi_results_by_frequency = {}
         self.draw_floor()
@@ -14032,6 +14901,7 @@ class MainWindow(QMainWindow):
                 obj.rf_customised = True
         else:
             return
+        self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.rssi_results_by_frequency = {}
         self.draw_floor()
@@ -14063,6 +14933,8 @@ class MainWindow(QMainWindow):
         self.slab_att_6.blockSignals(False)
 
     def simulate(self):
+        self._invalidate_interactive_preview_requests()
+        self._rssi_result_stale = False
         if not self.floor:
             return
         self._sync_slab_attenuation_from_ui()
@@ -14168,8 +15040,10 @@ class MainWindow(QMainWindow):
                 self.rssi_view_frequency.setCurrentIndex(idx)
                 self.rssi_view_frequency.blockSignals(False)
         else:
+            self._invalidate_interactive_preview_requests()
             self.last_result = None
 
+        self._rssi_result_stale = False
         self.statusBar().showMessage("Rendering RSSI heatmap...")
         QApplication.processEvents()
         self.draw_floor()
@@ -14206,6 +15080,14 @@ class MainWindow(QMainWindow):
             ), "")
             if fallback:
                 QMessageBox.warning(self, "RF multiprocessing fallback", fallback)
+
+    def closeEvent(self, event):
+        self._invalidate_interactive_preview_requests()
+        self._interactive_preview_poll_timer.stop()
+        self._interactive_preview_thread = None
+        self._shutdown_ifc_process_executor()
+        _shutdown_rf_process_executor(wait=False)
+        super().closeEvent(event)
 
     def load_pattern_csv_path(self, path: Path) -> str:
         """Load one antenna pattern CSV and return the pattern name."""
