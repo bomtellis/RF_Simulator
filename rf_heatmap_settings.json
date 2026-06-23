@@ -279,7 +279,7 @@
     "exterior",
     "outer",
     "facade",
-    "fa\u00e7ade",
+    "façade",
     "curtain",
     "envelope",
     "perimeter"
@@ -303,6 +303,95 @@
   "max_rf_worker_processes": 0,
   "rf_multiprocessing_min_points": 5000,
   "rf_tile_rows": 16,
+  "rf_tiles_per_worker": 2,
+  "reuse_rf_process_pool": true,
+  "rf_worker_index_cache_entries": 1,
+  "propagation_model": {
+    "enable_multipath_reflections": true,
+    "max_reflection_order": 1,
+    "max_reflection_surfaces": 6,
+    "max_reflection_paths": 8,
+    "reflection_search_radius_m": 18.0,
+    "minimum_reflection_coefficient": 0.025,
+    "enable_corner_diffraction": true,
+    "max_diffraction_paths": 3,
+    "diffraction_search_radius_m": 5.0,
+    "minimum_diffraction_loss_db": 6.0,
+    "enable_small_scale_fading": true,
+    "small_scale_fading_sigma_db": 1.5,
+    "fading_correlation_distance_m": 0.75,
+    "fading_seed": 1729,
+    "calculate_delay_spread": true,
+    "combined_ap_mode": "strongest",
+    "reflection_material_properties": {
+      "default": {
+        "relative_permittivity": 4.0,
+        "conductivity_s_per_m": 0.02,
+        "roughness_m": 0.003,
+        "reflection_scale": 1.0
+      },
+      "concrete": {
+        "relative_permittivity": 6.0,
+        "conductivity_s_per_m": 0.05,
+        "roughness_m": 0.006,
+        "reflection_scale": 1.0
+      },
+      "brick": {
+        "relative_permittivity": 4.4,
+        "conductivity_s_per_m": 0.03,
+        "roughness_m": 0.006,
+        "reflection_scale": 0.95
+      },
+      "masonry": {
+        "relative_permittivity": 5.0,
+        "conductivity_s_per_m": 0.04,
+        "roughness_m": 0.007,
+        "reflection_scale": 0.95
+      },
+      "plasterboard": {
+        "relative_permittivity": 2.5,
+        "conductivity_s_per_m": 0.01,
+        "roughness_m": 0.003,
+        "reflection_scale": 0.85
+      },
+      "partition": {
+        "relative_permittivity": 2.5,
+        "conductivity_s_per_m": 0.01,
+        "roughness_m": 0.003,
+        "reflection_scale": 0.85
+      },
+      "glass": {
+        "relative_permittivity": 6.5,
+        "conductivity_s_per_m": 0.004,
+        "roughness_m": 0.001,
+        "reflection_scale": 1.0
+      },
+      "metal": {
+        "relative_permittivity": 80.0,
+        "conductivity_s_per_m": 1000000.0,
+        "roughness_m": 0.001,
+        "reflection_scale": 1.0
+      },
+      "steel": {
+        "relative_permittivity": 80.0,
+        "conductivity_s_per_m": 1000000.0,
+        "roughness_m": 0.001,
+        "reflection_scale": 1.0
+      },
+      "timber": {
+        "relative_permittivity": 2.0,
+        "conductivity_s_per_m": 0.01,
+        "roughness_m": 0.004,
+        "reflection_scale": 0.75
+      },
+      "wood": {
+        "relative_permittivity": 2.0,
+        "conductivity_s_per_m": 0.01,
+        "roughness_m": 0.004,
+        "reflection_scale": 0.75
+      }
+    }
+  },
   "ifc_load_timeout_seconds": 900,
   "ifc_batch_completion_guard": true,
   "dxf_auto_unit_scale": true,
