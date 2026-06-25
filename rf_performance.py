@@ -18,13 +18,14 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 try:  # Optional acceleration; the simulator remains fully functional without it.
-    from numba import njit  # type: ignore
+    from numba import njit, prange  # type: ignore
 except Exception:  # pragma: no cover
     njit = None
+    prange = range
 
 
 if njit is not None:
-    @njit(cache=True, nogil=True)
+    @njit(cache=True, nogil=True, parallel=True, fastmath=True)
     def _best_case_rssi_kernel(
         xs: np.ndarray,
         ys: np.ndarray,
@@ -35,16 +36,19 @@ if njit is not None:
         exponent: float,
         eirp_dbm: float,
     ) -> np.ndarray:
-        output = np.empty((ys.size, xs.size), dtype=np.float64)
-        for iy in range(ys.size):
+        rows = ys.size
+        cols = xs.size
+        output = np.empty(rows * cols, dtype=np.float64)
+        for gid in prange(rows * cols):
+            iy = gid // cols
+            ix = gid - iy * cols
             dy = ys[iy] - ap_y
-            for ix in range(xs.size):
-                dx = xs[ix] - ap_x
-                d = math.sqrt(dx * dx + dy * dy + dz * dz)
-                if d < 1.0:
-                    d = 1.0
-                output[iy, ix] = eirp_dbm - reference_loss - 10.0 * exponent * math.log10(d)
-        return output
+            dx = xs[ix] - ap_x
+            d = math.sqrt(dx * dx + dy * dy + dz * dz)
+            if d < 1.0:
+                d = 1.0
+            output[gid] = eirp_dbm - reference_loss - 10.0 * exponent * math.log10(d)
+        return output.reshape((rows, cols))
 else:
     _best_case_rssi_kernel = None
 

@@ -62,6 +62,7 @@ from rf_performance import (
     stable_digest,
 )
 from rf_gpu import (
+    GPUExecutionError,
     discover_opencl_devices,
     gpu_colourise,
     gpu_influence_mask,
@@ -962,14 +963,18 @@ class HeatmapSettings:
     enable_numba_rf_kernels: bool = True
     use_shared_memory_rf_results: bool = True
     # Optional GPU acceleration. NVIDIA adapters use Numba CUDA JIT kernels;
-    # Intel/AMD adapters may use OpenCL. IFC geometry/ray discovery remains on
-    # the CPU; dense influence, resampling, AP-field aggregation and raster
-    # colour mapping are offloaded. Force mode ignores the workload threshold.
+    # Intel/AMD adapters may use OpenCL. IFC/Shapely model extraction remains
+    # on the CPU, while direct RSSI/barrier paths and all dense grid operations
+    # are offloaded. Force mode ignores the workload threshold.
     enable_opencl_gpu: bool = True
     force_gpu_when_available: bool = True
     opencl_device_preference: str = "auto"
     opencl_allow_cpu_device: bool = False
     opencl_min_work_items: int = 100000
+    # Large GPU/Numba chunks keep kernels efficient while still allowing the
+    # calculation worker to observe Cancel between launches.
+    cuda_chunk_points: int = 262144
+    numba_chunk_points: int = 262144
     opencl_accelerate_influence: bool = True
     opencl_accelerate_field_combine: bool = True
     opencl_accelerate_resampling: bool = True
@@ -1265,6 +1270,8 @@ class HeatmapSettings:
         settings.opencl_device_preference = str(performance.get("opencl_device_preference", settings.opencl_device_preference) or "auto")
         settings.opencl_allow_cpu_device = bool(performance.get("opencl_allow_cpu_device", settings.opencl_allow_cpu_device))
         settings.opencl_min_work_items = max(1, int(performance.get("opencl_min_work_items", settings.opencl_min_work_items)))
+        settings.cuda_chunk_points = max(65536, int(performance.get("cuda_chunk_points", settings.cuda_chunk_points)))
+        settings.numba_chunk_points = max(65536, int(performance.get("numba_chunk_points", settings.numba_chunk_points)))
         settings.opencl_accelerate_influence = bool(performance.get("opencl_accelerate_influence", settings.opencl_accelerate_influence))
         settings.opencl_accelerate_field_combine = bool(performance.get("opencl_accelerate_field_combine", settings.opencl_accelerate_field_combine))
         settings.opencl_accelerate_resampling = bool(performance.get("opencl_accelerate_resampling", settings.opencl_accelerate_resampling))
@@ -1401,6 +1408,8 @@ class HeatmapSettings:
             "opencl_device_preference": str(self.opencl_device_preference),
             "opencl_allow_cpu_device": bool(self.opencl_allow_cpu_device),
             "opencl_min_work_items": int(self.opencl_min_work_items),
+            "cuda_chunk_points": int(self.cuda_chunk_points),
+            "numba_chunk_points": int(self.numba_chunk_points),
             "opencl_accelerate_influence": bool(self.opencl_accelerate_influence),
             "opencl_accelerate_field_combine": bool(self.opencl_accelerate_field_combine),
             "opencl_accelerate_resampling": bool(self.opencl_accelerate_resampling),
@@ -1482,6 +1491,8 @@ class HeatmapSettings:
         self.opencl_device_preference = str(data.get("opencl_device_preference", self.opencl_device_preference) or "auto")
         self.opencl_allow_cpu_device = bool(data.get("opencl_allow_cpu_device", self.opencl_allow_cpu_device))
         self.opencl_min_work_items = max(1, int(data.get("opencl_min_work_items", self.opencl_min_work_items)))
+        self.cuda_chunk_points = max(65536, int(data.get("cuda_chunk_points", self.cuda_chunk_points)))
+        self.numba_chunk_points = max(65536, int(data.get("numba_chunk_points", self.numba_chunk_points)))
         self.opencl_accelerate_influence = bool(data.get("opencl_accelerate_influence", self.opencl_accelerate_influence))
         self.opencl_accelerate_field_combine = bool(data.get("opencl_accelerate_field_combine", self.opencl_accelerate_field_combine))
         self.opencl_accelerate_resampling = bool(data.get("opencl_accelerate_resampling", self.opencl_accelerate_resampling))
@@ -3813,7 +3824,11 @@ class RFEngine:
         progress_callback=None,
         progressive_callback=None,
     ) -> Optional[Dict[object, SimulationResult]]:
-        if heatmap_settings is None or not bool(getattr(heatmap_settings, "enable_numba_rf_kernels", True)):
+        if heatmap_settings is None:
+            return None
+        gpu_enabled = bool(getattr(heatmap_settings, "enable_opencl_gpu", True))
+        numba_enabled = bool(getattr(heatmap_settings, "enable_numba_rf_kernels", True))
+        if not gpu_enabled and not numba_enabled:
             return None
         cancel_event = getattr(heatmap_settings, "_cancel_event", None)
         disconnected = float(getattr(heatmap_settings, "disconnected_rssi_dbm", -120.0))
@@ -3835,14 +3850,25 @@ class RFEngine:
             segments = RFEngine._attenuation_segment_rows_for_floor(floor, frequency)
             accelerated = None
             try:
-                accelerated = gpu_direct_rssi_grid(xs, ys, ap_rows, segments, valid, disconnected, combine_mode, heatmap_settings)
+                if gpu_enabled:
+                    accelerated = gpu_direct_rssi_grid(xs, ys, ap_rows, segments, valid, disconnected, combine_mode, heatmap_settings)
+            except GPUExecutionError:
+                # A selected/detected GPU failed. In forced mode this is a real
+                # calculation error and must not be hidden by CPU fallback.
+                raise
+            except RuntimeError as exc:
+                if (cancel_event is not None and cancel_event.is_set()) or "cancel" in str(exc).lower():
+                    raise
+                accelerated = None
             except Exception:
                 accelerated = None
             if accelerated is not None:
                 rssi, counts, gpu_used = accelerated
                 mode = "gpu-direct-rssi"
             else:
-                fallback = numba_direct_rssi_grid(xs, ys, ap_rows, segments, valid, disconnected, combine_mode)
+                if not numba_enabled:
+                    return None
+                fallback = numba_direct_rssi_grid(xs, ys, ap_rows, segments, valid, disconnected, combine_mode, heatmap_settings)
                 if fallback is None:
                     return None
                 rssi, counts = fallback
@@ -3856,9 +3882,9 @@ class RFEngine:
                 delays[~boundary_mask] = np.nan
             elapsed = time.perf_counter() - started
             note = (
-                f"direct RSSI grid calculated on {gpu_used}; Numba CPU fallback not used"
+                f"direct RSSI grid calculated on {gpu_used} using occupancy-sized grid-stride kernels; Numba CPU fallback not used"
                 if gpu_used else
-                "direct RSSI grid calculated with Numba parallel CPU fallback because no compatible GPU was available"
+                "direct RSSI grid calculated with Numba parallel CPU fallback because GPU execution was unavailable or below the configured workload threshold"
             )
             note += "; attenuation uses GPU/Numba ray intersections against IFC/user RF barrier edges"
             results[key] = SimulationResult(
@@ -6436,7 +6462,7 @@ class RFPerformanceSettingsDialog(QDialog):
         self.enable_opencl.setChecked(bool(settings.enable_opencl_gpu))
         self.enable_opencl.setToolTip(
             "NVIDIA adapters use Numba CUDA JIT kernels. Intel and AMD adapters may use OpenCL. "
-            "IFC/Shapely geometry remains CPU-based; dense grid operations run on the selected GPU."
+            "IFC/Shapely model extraction remains CPU-based; direct RSSI, barrier intersections, influence pruning, field aggregation, resampling and raster generation run on the selected GPU."
         )
         form.addRow(self.enable_opencl)
 
@@ -6495,7 +6521,7 @@ class RFPerformanceSettingsDialog(QDialog):
         form.addRow(refresh)
         note = QLabel(
             "For NVIDIA install the current display driver plus the numba-cuda package. CUDA kernels are "
-            "declared with @cuda.jit and cached by Numba. PyOpenCL is retained only for Intel/AMD GPU fallback."
+            "declared with @cuda.jit, use occupancy-sized grid-stride launches, and are cached by Numba. PyOpenCL is retained for Intel/AMD GPU fallback."
         )
         note.setWordWrap(True)
         form.addRow("Driver requirement", note)
