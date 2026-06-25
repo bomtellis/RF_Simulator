@@ -4,7 +4,8 @@ RF Attenuation Simulator - IFC Wi-Fi RSSI planning tool.
 Run:
     pip install PySide6 numpy ifcopenshell shapely contourpy
     pip install numba  # optional compiled RF kernels
-    pip install pyopencl  # optional Intel/AMD/NVIDIA OpenCL acceleration
+    pip install numba-cuda  # NVIDIA CUDA JIT acceleration
+    pip install pyopencl  # optional Intel/AMD OpenCL fallback
     python rf_simulator.py
 """
 from __future__ import annotations
@@ -958,11 +959,12 @@ class HeatmapSettings:
     multipath_relative_power_cutoff_db: float = 30.0
     enable_numba_rf_kernels: bool = True
     use_shared_memory_rf_results: bool = True
-    # Optional hybrid OpenCL acceleration. OpenCL is vendor-neutral and can
-    # use Intel, AMD or NVIDIA GPUs. IFC geometry/ray discovery remains on
+    # Optional GPU acceleration. NVIDIA adapters use Numba CUDA JIT kernels;
+    # Intel/AMD adapters may use OpenCL. IFC geometry/ray discovery remains on
     # the CPU; dense influence, resampling, AP-field aggregation and raster
-    # colour mapping are offloaded when the workload exceeds the threshold.
+    # colour mapping are offloaded. Force mode ignores the workload threshold.
     enable_opencl_gpu: bool = True
+    force_gpu_when_available: bool = True
     opencl_device_preference: str = "auto"
     opencl_allow_cpu_device: bool = False
     opencl_min_work_items: int = 100000
@@ -1257,6 +1259,7 @@ class HeatmapSettings:
         settings.enable_numba_rf_kernels = bool(performance.get("enable_numba_kernels", settings.enable_numba_rf_kernels))
         settings.use_shared_memory_rf_results = bool(performance.get("use_shared_memory_results", settings.use_shared_memory_rf_results))
         settings.enable_opencl_gpu = bool(performance.get("enable_opencl_gpu", settings.enable_opencl_gpu))
+        settings.force_gpu_when_available = bool(performance.get("force_gpu_when_available", settings.force_gpu_when_available))
         settings.opencl_device_preference = str(performance.get("opencl_device_preference", settings.opencl_device_preference) or "auto")
         settings.opencl_allow_cpu_device = bool(performance.get("opencl_allow_cpu_device", settings.opencl_allow_cpu_device))
         settings.opencl_min_work_items = max(1, int(performance.get("opencl_min_work_items", settings.opencl_min_work_items)))
@@ -1392,6 +1395,7 @@ class HeatmapSettings:
             "enable_numba_kernels": bool(self.enable_numba_rf_kernels),
             "use_shared_memory_results": bool(self.use_shared_memory_rf_results),
             "enable_opencl_gpu": bool(self.enable_opencl_gpu),
+            "force_gpu_when_available": bool(self.force_gpu_when_available),
             "opencl_device_preference": str(self.opencl_device_preference),
             "opencl_allow_cpu_device": bool(self.opencl_allow_cpu_device),
             "opencl_min_work_items": int(self.opencl_min_work_items),
@@ -1472,6 +1476,7 @@ class HeatmapSettings:
         self.enable_numba_rf_kernels = bool(data.get("enable_numba_kernels", self.enable_numba_rf_kernels))
         self.use_shared_memory_rf_results = bool(data.get("use_shared_memory_results", self.use_shared_memory_rf_results))
         self.enable_opencl_gpu = bool(data.get("enable_opencl_gpu", self.enable_opencl_gpu))
+        self.force_gpu_when_available = bool(data.get("force_gpu_when_available", self.force_gpu_when_available))
         self.opencl_device_preference = str(data.get("opencl_device_preference", self.opencl_device_preference) or "auto")
         self.opencl_allow_cpu_device = bool(data.get("opencl_allow_cpu_device", self.opencl_allow_cpu_device))
         self.opencl_min_work_items = max(1, int(data.get("opencl_min_work_items", self.opencl_min_work_items)))
@@ -3632,7 +3637,7 @@ class RFEngine:
             strongest_index, gpu_valid, gpu_device = gpu_selection
             strongest = np.take_along_axis(finite_stack, strongest_index[None, :, :], axis=0)[0]
             all_invalid = ~gpu_valid
-            gpu_note = f"; OpenCL AP-field aggregation on {gpu_device}"
+            gpu_note = f"; GPU AP-field aggregation on {gpu_device}"
         else:
             strongest_index = np.argmax(finite_stack, axis=0)
             strongest = np.take_along_axis(finite_stack, strongest_index[None, :, :], axis=0)[0]
@@ -3754,7 +3759,7 @@ class RFEngine:
         delays = {key: initial_delay.copy() for key in group_order}
         counts = {key: np.zeros((rows, cols), dtype=np.int16) for key in group_order}
 
-        # OpenCL performs one conservative whole-grid upper-bound pass before
+        # CUDA/OpenCL performs one conservative whole-grid upper-bound pass before
         # the CPU workers start. This does not replace IFC ray tracing; it removes
         # points at which no AP/radio can possibly reach the active cutoff.
         gpu_prune_note = ""
@@ -6232,36 +6237,46 @@ class RFPerformanceSettingsDialog(QDialog):
 
     def _build_gpu_tab(self, settings: HeatmapSettings):
         page, form = self._page_with_form()
-        self.enable_opencl = QCheckBox("Use OpenCL GPU acceleration when available")
+        self.enable_opencl = QCheckBox("Use GPU acceleration")
         self.enable_opencl.setChecked(bool(settings.enable_opencl_gpu))
         self.enable_opencl.setToolTip(
-            "OpenCL supports Intel, AMD and NVIDIA drivers. IFC/Shapely geometry remains CPU-based; "
-            "dense influence masks, AP-field aggregation, adaptive resampling and raster colour mapping use the GPU."
+            "NVIDIA adapters use Numba CUDA JIT kernels. Intel and AMD adapters may use OpenCL. "
+            "IFC/Shapely geometry remains CPU-based; dense grid operations run on the selected GPU."
         )
         form.addRow(self.enable_opencl)
 
+        self.force_gpu = QCheckBox("Force GPU whenever a compatible GPU is available")
+        self.force_gpu.setChecked(bool(getattr(settings, "force_gpu_when_available", True)))
+        self.force_gpu.setToolTip(
+            "Ignores the minimum-work threshold. If a detected GPU fails during an RF calculation, "
+            "the error is reported instead of silently switching to CPU. CPU fallback is used only "
+            "when no compatible GPU/runtime is available."
+        )
+        form.addRow(self.force_gpu)
+
         self.opencl_device = QComboBox()
-        self.opencl_device.addItem("Automatic GPU selection", "auto")
+        self.opencl_device.addItem("Automatic (prefer NVIDIA CUDA)", "auto")
         known = discover_opencl_devices(include_cpu=True)
         for device in known:
-            token = f"{device.vendor} {device.name}".strip()
-            self.opencl_device.addItem(device.label, token)
+            self.opencl_device.addItem(device.label, getattr(device, "token", f"{device.vendor} {device.name}".strip()))
         preferred = str(settings.opencl_device_preference or "auto")
         index = self.opencl_device.findData(preferred)
         if index < 0 and preferred.lower() != "auto":
             self.opencl_device.addItem(f"Saved preference: {preferred}", preferred)
             index = self.opencl_device.count() - 1
         self.opencl_device.setCurrentIndex(max(0, index))
-        form.addRow("OpenCL device", self.opencl_device)
+        form.addRow("GPU device", self.opencl_device)
 
-        self.opencl_allow_cpu = QCheckBox("Allow an OpenCL CPU device when no GPU is present")
+        self.opencl_allow_cpu = QCheckBox("Allow OpenCL CPU device only when no GPU exists")
         self.opencl_allow_cpu.setChecked(bool(settings.opencl_allow_cpu_device))
         form.addRow(self.opencl_allow_cpu)
         self.opencl_min_work = QSpinBox()
-        self.opencl_min_work.setRange(1_000, 100_000_000)
+        self.opencl_min_work.setRange(1, 100_000_000)
         self.opencl_min_work.setSingleStep(10_000)
         self.opencl_min_work.setValue(int(settings.opencl_min_work_items))
-        self.opencl_min_work.setToolTip("Smaller jobs stay on NumPy/CPU because transfer and kernel-start overhead can exceed the GPU saving.")
+        self.opencl_min_work.setToolTip(
+            "Used only when force-GPU mode is disabled. Force mode launches CUDA/OpenCL for every eligible stage."
+        )
         form.addRow("Minimum GPU work items", self.opencl_min_work)
 
         self.opencl_influence = QCheckBox("GPU whole-grid AP influence and cutoff pruning")
@@ -6280,30 +6295,31 @@ class RFPerformanceSettingsDialog(QDialog):
         self.opencl_status_label = QLabel(opencl_status(settings))
         self.opencl_status_label.setWordWrap(True)
         form.addRow("Detected backend", self.opencl_status_label)
-        refresh = QPushButton("Refresh OpenCL device detection")
+        refresh = QPushButton("Refresh CUDA / OpenCL detection")
         refresh.clicked.connect(self._refresh_opencl_devices)
         form.addRow(refresh)
         note = QLabel(
-            "Install PyOpenCL and the GPU vendor's current OpenCL runtime. The simulator automatically falls back "
-            "to its existing CPU multiprocessing path if the package, driver or selected device is unavailable."
+            "For NVIDIA install the current display driver plus the numba-cuda package. CUDA kernels are "
+            "declared with @cuda.jit and cached by Numba. PyOpenCL is retained only for Intel/AMD GPU fallback."
         )
         note.setWordWrap(True)
         form.addRow("Driver requirement", note)
-        self.tabs.addTab(page, "GPU / OpenCL")
+        self.tabs.addTab(page, "GPU / CUDA")
 
     def _refresh_opencl_devices(self):
         reset_opencl_backends()
         current = str(self.opencl_device.currentData() or "auto")
         self.opencl_device.blockSignals(True)
         self.opencl_device.clear()
-        self.opencl_device.addItem("Automatic GPU selection", "auto")
+        self.opencl_device.addItem("Automatic (prefer NVIDIA CUDA)", "auto")
         for device in discover_opencl_devices(include_cpu=True):
-            self.opencl_device.addItem(device.label, f"{device.vendor} {device.name}".strip())
+            self.opencl_device.addItem(device.label, getattr(device, "token", f"{device.vendor} {device.name}".strip()))
         index = self.opencl_device.findData(current)
         self.opencl_device.setCurrentIndex(max(0, index))
         self.opencl_device.blockSignals(False)
         probe = copy.copy(self.parent().heatmap_settings) if self.parent() is not None else HeatmapSettings.default()
         probe.enable_opencl_gpu = self.enable_opencl.isChecked()
+        probe.force_gpu_when_available = self.force_gpu.isChecked()
         probe.opencl_device_preference = str(self.opencl_device.currentData() or "auto")
         probe.opencl_allow_cpu_device = self.opencl_allow_cpu.isChecked()
         self.opencl_status_label.setText(opencl_status(probe))
@@ -6321,6 +6337,7 @@ class RFPerformanceSettingsDialog(QDialog):
         self.diffraction.toggled.connect(self._update_enabled_state)
         self.quick_cutoff.toggled.connect(self._update_enabled_state)
         self.enable_opencl.toggled.connect(self._update_enabled_state)
+        self.force_gpu.toggled.connect(self._update_enabled_state)
 
     def _apply_quick_cutoff_preset(self, *_):
         value = self.quick_cutoff_preset.currentData()
@@ -6345,8 +6362,9 @@ class RFPerformanceSettingsDialog(QDialog):
         self.diffraction_paths.setEnabled(self.diffraction.isChecked())
         self.quick_cutoff_preset.setEnabled(self.quick_cutoff.isChecked())
         self.quick_cutoff_dbm.setEnabled(self.quick_cutoff.isChecked())
-        for widget in (self.opencl_device, self.opencl_allow_cpu, self.opencl_min_work, self.opencl_influence, self.opencl_combine, self.opencl_resample, self.opencl_raster):
+        for widget in (self.force_gpu, self.opencl_device, self.opencl_allow_cpu, self.opencl_influence, self.opencl_combine, self.opencl_resample, self.opencl_raster):
             widget.setEnabled(self.enable_opencl.isChecked())
+        self.opencl_min_work.setEnabled(self.enable_opencl.isChecked() and not self.force_gpu.isChecked())
         self._update_summary()
 
     def _apply_laptop_preset(self):
@@ -6381,8 +6399,9 @@ class RFPerformanceSettingsDialog(QDialog):
         self.save_results_disk.setChecked(True)
         self.load_results_disk.setChecked(True)
         self.enable_opencl.setChecked(True)
+        self.force_gpu.setChecked(True)
         self.opencl_device.setCurrentIndex(max(0, self.opencl_device.findData("auto")))
-        self.opencl_min_work.setValue(100000)
+        self.opencl_min_work.setValue(1)
         self._update_enabled_state()
 
     def _apply_automatic_preset(self):
@@ -6419,8 +6438,9 @@ class RFPerformanceSettingsDialog(QDialog):
         self.save_results_disk.setChecked(True)
         self.load_results_disk.setChecked(True)
         self.enable_opencl.setChecked(True)
+        self.force_gpu.setChecked(True)
         self.opencl_device.setCurrentIndex(max(0, self.opencl_device.findData("auto")))
-        self.opencl_min_work.setValue(100000)
+        self.opencl_min_work.setValue(1)
         self._update_enabled_state()
 
     def _apply_fast_preset(self):
@@ -6439,7 +6459,7 @@ class RFPerformanceSettingsDialog(QDialog):
         rf_workers = "automatic" if self.rf_workers.value() == 0 else str(self.rf_workers.value())
         ifc_workers = "automatic" if self.ifc_workers.value() == 0 else str(self.ifc_workers.value())
         boundary = "on" if self.boundary_filter.isChecked() else "off"
-        gpu = "off" if not self.enable_opencl.isChecked() else str(self.opencl_device.currentText())
+        gpu = "off" if not self.enable_opencl.isChecked() else ("forced " if self.force_gpu.isChecked() else "threshold ") + str(self.opencl_device.currentText())
         warning = ""
         if self.boundary_filter.isChecked() and not self._has_planner_boundaries:
             warning = " Boundary limiting is selected, but this project currently contains no planner boundaries."
@@ -6483,6 +6503,7 @@ class RFPerformanceSettingsDialog(QDialog):
         settings.enable_numba_rf_kernels = self.numba_kernels.isChecked()
         settings.use_shared_memory_rf_results = self.shared_memory.isChecked()
         settings.enable_opencl_gpu = self.enable_opencl.isChecked()
+        settings.force_gpu_when_available = self.force_gpu.isChecked()
         settings.opencl_device_preference = str(self.opencl_device.currentData() or "auto")
         settings.opencl_allow_cpu_device = self.opencl_allow_cpu.isChecked()
         settings.opencl_min_work_items = int(self.opencl_min_work.value())
@@ -15147,7 +15168,7 @@ class MainWindow(QMainWindow):
             gpu_raster = gpu_colourise(z, self.heatmap_settings.zones, self.heatmap_settings)
             if gpu_raster is not None:
                 rgba, gpu_device = gpu_raster
-                result.render_cache[("opencl_raster_device",)] = gpu_device
+                result.render_cache[("gpu_raster_device",)] = gpu_device
             else:
                 rgba = np.zeros((z.shape[0], z.shape[1], 4), dtype=np.uint8)
             finite = np.isfinite(z)

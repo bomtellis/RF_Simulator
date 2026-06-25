@@ -1,3 +1,7 @@
-# Optional cross-vendor GPU acceleration for Intel, AMD and NVIDIA OpenCL devices.
-# A current vendor OpenCL runtime/driver is also required.
+# NVIDIA CUDA JIT backend (preferred on NVIDIA GPUs).
+# The current NVIDIA display driver is required.
+numba
+numba-cuda
+
+# Optional Intel/AMD OpenCL fallback.
 pyopencl
