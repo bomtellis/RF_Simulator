@@ -4,9 +4,9 @@
   "ifc_paths": [
     "C:\\Users\\tombe\\Downloads\\Leighton Hospital, Crewe_IFC Model_83\\LHC-RYD-CS-ZZ-M3-AR-992000.ifc",
     "C:\\Users\\tombe\\Downloads\\Leighton Hospital, Crewe_IFC Model_83\\LHC-RYD-W1-ZZ-M3-AR-999010.ifc",
+    "C:\\Users\\tombe\\Downloads\\Leighton Hospital, Crewe_IFC Model_83\\LHC-RYD-W4-ZZ-M3-AR-999040.ifc",
     "C:\\Users\\tombe\\Downloads\\Leighton Hospital, Crewe_IFC Model_83\\LHC-RYD-W2-ZZ-M3-AR-999020.ifc",
     "C:\\Users\\tombe\\Downloads\\Leighton Hospital, Crewe_IFC Model_83\\LHC-RYD-W3-ZZ-M3-AR-999030.ifc",
-    "C:\\Users\\tombe\\Downloads\\Leighton Hospital, Crewe_IFC Model_83\\LHC-RYD-W4-ZZ-M3-AR-999040.ifc",
     "C:\\Users\\tombe\\Downloads\\Leighton Hospital, Crewe_IFC Model_83\\LHC-RYD-W5-ZZ-M3-AR-999050.ifc",
     "C:\\Users\\tombe\\Downloads\\Leighton Hospital, Crewe_IFC Model_83\\LHC-RYD-W6-ZZ-M3-AR-999060.ifc",
     "C:\\Users\\tombe\\Downloads\\Leighton Hospital, Crewe_IFC Model_83\\LHC-RYD-MB-ZZ-M3-AR-990004.ifc",
@@ -218,9 +218,17 @@
     "multipath_relative_power_cutoff_db": 25.0,
     "enable_numba_kernels": true,
     "use_shared_memory_results": true,
+    "enable_opencl_gpu": true,
+    "opencl_device_preference": "auto",
+    "opencl_allow_cpu_device": true,
+    "opencl_min_work_items": 100000,
+    "opencl_accelerate_influence": true,
+    "opencl_accelerate_field_combine": true,
+    "opencl_accelerate_resampling": true,
+    "opencl_accelerate_raster": true,
     "progressive_heatmap_updates": false,
     "progressive_update_percent": 20,
-    "heatmap_render_mode": "raster",
+    "heatmap_render_mode": "raster_contours",
     "interactive_preview_enabled": false,
     "interactive_preview_delay_ms": 350,
     "interactive_preview_resolution_m": 4.0,
@@ -64940,6 +64948,13 @@
     "format": "rf-simulation-result-set",
     "version": 1,
     "directory": "rf_plan_rf_results",
-    "files": []
+    "files": [
+      {
+        "floor": "00",
+        "frequency_mhz": 2400.0,
+        "file": "floor_00__frequency_2400MHz.rfsim.npz",
+        "signature": "e76337a87447969c6d93b50e7070e2fe"
+      }
+    ]
   }
 }

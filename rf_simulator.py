@@ -14854,6 +14854,7 @@ class MainWindow(QMainWindow):
         scene = self.view.scene()
         self.view.hide_rssi_hover()
         self._drawing_floor = True
+        pdf_export_rendering = bool(getattr(self, "_pdf_export_rendering", False))
         scene.clear()
         self._heatmap_scene_items = []
         self._ap_ruler_items = []
@@ -14889,7 +14890,12 @@ class MainWindow(QMainWindow):
             else:
                 pen_colour = colours["space_pen"]
                 fill_colour = QColor(colours["space_fill"])
-            if space.ap_planning_selected:
+            if pdf_export_rendering:
+                # The RSSI raster is the primary PDF fill.  Space fills sit above
+                # it in the interactive scene, so make them transparent for the
+                # report while retaining their outlines and labels.
+                fill_colour.setAlpha(0)
+            elif space.ap_planning_selected:
                 fill_colour.setAlpha(115)
             elif space.is_inferred:
                 fill_colour.setAlpha(70)
@@ -14948,6 +14954,10 @@ class MainWindow(QMainWindow):
             else:
                 element_pen_colour = QColor(generic_element_pen_colour)
                 element_fill_colour = QColor(generic_element_fill_colour)
+            if pdf_export_rendering:
+                # Preserve doors, windows and other IFC linework without laying
+                # their translucent/opaque brushes over the RSSI colour field.
+                element_fill_colour.setAlpha(0)
             element_pen = QPen(element_pen_colour, 0.11 if element.is_rf_barrier else 0.08)
             element_pen.setCosmetic(True)
             poly = QPolygonF([QPointF(float(x), float(y)) for x, y in coords])
@@ -14977,7 +14987,11 @@ class MainWindow(QMainWindow):
             wall_pen.setCosmetic(True)
             fill_key = "wall_alt_fill" if getattr(wall, "projected_to_floor", False) else "wall_fill"
             fill_colour = QColor("#FFB45A") if wall.is_user_created else QColor(colours[fill_key])
-            if wall.is_user_created:
+            if pdf_export_rendering:
+                # Keep wall edges above the heatmap, but do not allow wall
+                # polygon brushes to conceal the exported RF raster.
+                fill_colour.setAlpha(0)
+            elif wall.is_user_created:
                 fill_colour.setAlpha(150)
             item = WallGraphicsItem(self, wall, poly, wall_pen, QBrush(fill_colour))
             scene.addItem(item)
@@ -15123,9 +15137,10 @@ class MainWindow(QMainWindow):
         """Render the heatmap as one RGBA pixmap instead of thousands of fill polygons."""
         if len(xs) < 2 or len(ys) < 2 or z.size == 0:
             return
+        pdf_export_rendering = bool(getattr(self, "_pdf_export_rendering", False))
         cache_key = (
             "heatmap_raster", tuple((zone.name, zone.min_dbm, zone.max_dbm, zone.colour, zone.alpha) for zone in self.heatmap_settings.zones),
-            tuple(z.shape), bool(getattr(self, "dark_theme", False)),
+            tuple(z.shape), bool(getattr(self, "dark_theme", False)), pdf_export_rendering,
         )
         image = result.render_cache.get(cache_key)
         if image is None:
@@ -15146,7 +15161,7 @@ class MainWindow(QMainWindow):
                 rgba[mask, 0] = int(colour.red())
                 rgba[mask, 1] = int(colour.green())
                 rgba[mask, 2] = int(colour.blue())
-                rgba[mask, 3] = max(0, min(255, int(zone.alpha)))
+                rgba[mask, 3] = 255 if pdf_export_rendering else max(0, min(255, int(zone.alpha)))
             # Cover values above/below the explicitly bounded zones using the configured end colours.
             if gpu_raster is None and np.any(finite):
                 uncovered = finite & (rgba[:, :, 3] == 0)
@@ -15164,7 +15179,12 @@ class MainWindow(QMainWindow):
                         rgba[mask, 0] = int(colour.red())
                         rgba[mask, 1] = int(colour.green())
                         rgba[mask, 2] = int(colour.blue())
-                        rgba[mask, 3] = max(0, min(255, int(zone.alpha)))
+                        rgba[mask, 3] = 255 if pdf_export_rendering else max(0, min(255, int(zone.alpha)))
+            if pdf_export_rendering:
+                # OpenCL colourisation carries the interactive zone alpha.
+                # Reports use opaque bands so the white page and IFC overlays do
+                # not wash out or hide the RF result.
+                rgba[np.isfinite(z), 3] = 255
             image_format = getattr(QImage, "Format_RGBA8888", None)
             if image_format is None:
                 image_format = QImage.Format.Format_RGBA8888
@@ -16446,6 +16466,22 @@ class MainWindow(QMainWindow):
             return f"{frequency_mhz / 1000.0:g} GHz"
         return f"{frequency_mhz:g} MHz"
 
+    def _apply_pdf_scene_draw_order(self):
+        """Normalise report z-order without changing the interactive scene model.
+
+        PDF pages use an opaque RSSI raster as the principal fill, followed by
+        transparent IFC/space polygons, then IFC/DXF linework, contours, text
+        and AP markers.  The scene is rebuilt after export, so these temporary
+        z-values do not leak back into the editable view.
+        """
+        pdf_heatmap_z = float(Z_IFC_SPACE_FILL) - 1.0
+        for item in list(getattr(self, "_heatmap_scene_items", [])):
+            try:
+                if float(item.zValue()) <= float(Z_HEATMAP_FILL) + 0.5:
+                    item.setZValue(pdf_heatmap_z)
+            except RuntimeError:
+                continue
+
     def _render_pdf_plan_scene(self, painter: QPainter, target_rect: QRectF, source_rect: QRectF):
         """Render the full scene with the same Y-up and view rotation as the GUI."""
         scene = self.view.scene()
@@ -16466,9 +16502,16 @@ class MainWindow(QMainWindow):
         # page-fit scale while retaining that exact orientation.
         export_view.setTransform(QTransform(self.view.transform()))
         export_view.fitInView(source_rect, Qt.KeepAspectRatio)
+        # PySide6 binds QGraphicsView.render() with a QRectF target and a
+        # QRect source.  Passing QRectF for both works in some Qt bindings
+        # but raises a TypeError in PySide6.  The viewport rect is already
+        # the exact integer source rectangle required by the supported
+        # overload.
+        viewport_source_rect = export_view.viewport().rect()
         export_view.render(
-            painter, target_rect,
-            QRectF(0.0, 0.0, float(export_view.viewport().width()), float(export_view.viewport().height())),
+            painter,
+            target_rect,
+            viewport_source_rect,
             Qt.KeepAspectRatio,
         )
         export_view.setScene(None)
@@ -16485,9 +16528,22 @@ class MainWindow(QMainWindow):
         floor_ap_count: int,
     ):
         painter.save()
+        # QGraphicsView.render() can leave a non-identity world transform on
+        # some PySide6/PDF paint-engine combinations.  Draw the report legend
+        # in page-device coordinates so its colour key cannot be transformed
+        # outside the legend panel or reduced to a zero-area rectangle.
+        painter.resetTransform()
+        painter.setClipping(False)
+        painter.setOpacity(1.0)
+        try:
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+        except AttributeError:
+            painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        painter.fillRect(rect, QColor("#FFFFFF"))
         painter.setPen(QPen(QColor("#6B7280"), 1.0))
         painter.setBrush(QBrush(QColor("#F8FAFC")))
         painter.drawRoundedRect(rect, 8.0, 8.0)
+        painter.setClipRect(rect.adjusted(1.0, 1.0, -1.0, -1.0))
 
         pad = max(12.0, rect.width() * 0.045)
         x = rect.left() + pad
@@ -16507,10 +16563,17 @@ class MainWindow(QMainWindow):
         body_font.setPointSize(8)
         painter.setFont(body_font)
 
-        zones = list(self.heatmap_settings.zones)
+        # Always show every configured band, strongest first.  Derive the row
+        # height from the available legend space instead of truncating bands.
+        zones = sorted(
+            list(self.heatmap_settings.zones),
+            key=lambda zone: (float(zone.min_dbm), float(zone.max_dbm)),
+            reverse=True,
+        )
         zone_count = max(1, len(zones))
-        available_zone_height = max(150.0, min(rect.height() * 0.38, 330.0))
-        zone_row_height = max(24.0, available_zone_height / zone_count)
+        metadata_reserve = max(190.0, min(285.0, rect.height() * 0.34))
+        available_zone_height = max(100.0, rect.height() - (2.0 * pad) - 46.0 - metadata_reserve)
+        zone_row_height = max(22.0, min(42.0, available_zone_height / zone_count))
         swatch_width = max(42.0, width * 0.19)
         for zone in zones:
             colour = QColor(zone.colour)
@@ -16520,7 +16583,28 @@ class MainWindow(QMainWindow):
             row_rect = QRectF(x, y, width, zone_row_height - 2.0)
             painter.fillRect(row_rect, QColor("#FFFFFF"))
             swatch = QRectF(x + 2.0, y + 3.0, swatch_width, max(12.0, zone_row_height - 8.0))
-            painter.fillRect(swatch, colour)
+
+            # QPdfWriter has shown inconsistent solid-brush output after a
+            # QGraphicsView render on some Windows/PySide6 combinations.
+            # Embed each colour key as a tiny opaque RGB image instead.  This
+            # guarantees that Intel/AMD/NVIDIA driver choice and PDF viewer
+            # composition behaviour cannot turn the swatches white or clear.
+            image_width = max(2, int(round(swatch.width())))
+            image_height = max(2, int(round(swatch.height())))
+            image_format = getattr(QImage, "Format_RGB32", None)
+            if image_format is None:
+                image_format = QImage.Format.Format_RGB32
+            colour_key_image = QImage(image_width, image_height, image_format)
+            colour_key_image.fill(colour)
+
+            # Put a vector fill underneath the embedded image as a fallback,
+            # then draw only the border above it.  The raster swatch remains the
+            # authoritative colour and cannot be overpainted by a faulty brush.
+            painter.setBrush(QBrush(colour, Qt.SolidPattern))
+            painter.setPen(Qt.NoPen)
+            painter.drawRect(swatch)
+            painter.drawImage(swatch, colour_key_image)
+            painter.setBrush(Qt.NoBrush)
             painter.setPen(QPen(QColor("#334155"), 0.9))
             painter.drawRect(swatch)
             painter.setPen(QColor("#111827"))
@@ -16733,6 +16817,7 @@ class MainWindow(QMainWindow):
             original_ruler = self.ap_ruler_enabled
             original_dark_theme = bool(getattr(self, "dark_theme", False))
             original_cutoff_visibility = bool(self.heatmap_settings.show_ap_cutoff_zones)
+            original_pdf_export_rendering = bool(getattr(self, "_pdf_export_rendering", False))
             original_transform = self.view.transform()
             original_h = self.view.horizontalScrollBar().value()
             original_v = self.view.verticalScrollBar().value()
@@ -16740,6 +16825,7 @@ class MainWindow(QMainWindow):
             self.setUpdatesEnabled(False)
             self.ap_ruler_enabled = False
             self.dark_theme = False
+            self._pdf_export_rendering = True
             self.heatmap_settings.show_ap_cutoff_zones = False
             try:
                 for page_index, (floor_name, floor, frequency_mhz) in enumerate(pages):
@@ -16756,6 +16842,7 @@ class MainWindow(QMainWindow):
                     )
                     self._preserve_view_on_redraw = True
                     self.draw_floor()
+                    self._apply_pdf_scene_draw_order()
                     scene = self.view.scene()
                     scene.clearSelection()
                     # Reports always use a true white drawing background even if
@@ -16862,6 +16949,10 @@ class MainWindow(QMainWindow):
                         )
                     ]
                     floor_ap_count = sum(1 for ap in frequency_aps if ap.floor == floor_name)
+                    # Draw the legend last and outside the plan clip.  This
+                    # guarantees the key remains above every scene element.
+                    painter.setClipping(False)
+                    painter.setOpacity(1.0)
                     self._draw_pdf_rssi_legend(
                         painter,
                         legend_rect,
@@ -16895,6 +16986,7 @@ class MainWindow(QMainWindow):
                 self.rssi_results_by_frequency = original_results
                 self.ap_ruler_enabled = original_ruler
                 self.dark_theme = original_dark_theme
+                self._pdf_export_rendering = original_pdf_export_rendering
                 self.heatmap_settings.show_ap_cutoff_zones = original_cutoff_visibility
                 self._preserve_view_on_redraw = True
                 self.draw_floor()
