@@ -441,7 +441,7 @@ def opencl_status(settings: Any, initialize: bool = False) -> str:
 
 
 def _large_enough(settings: Any, work_items: int) -> bool:
-    return int(work_items) >= max(1, int(_setting(settings, "opencl_min_work_items", 100000) or 100000))
+    return int(work_items) >= max(1, int(_setting(settings, "opencl_min_work_items", 100000) or 0 ))
 
 
 def gpu_influence_mask(xs: np.ndarray, ys: np.ndarray, links: np.ndarray,
