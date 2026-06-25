@@ -67,6 +67,8 @@ from rf_gpu import (
     gpu_influence_mask,
     gpu_resample_regular_grid,
     gpu_strongest_indices,
+    gpu_direct_rssi_grid,
+    numba_direct_rssi_grid,
     opencl_status,
     reset_opencl_backends,
 )
@@ -2446,6 +2448,27 @@ class RFEngine:
         return float(getattr(settings, "default_ap_cutoff_radius_m", 0.0) or 0.0)
 
     @staticmethod
+    def ap_cutoff_radius_for_frequency(frequency_mhz: float, settings: Optional[HeatmapSettings] = None) -> float:
+        """Return the configured AP cut-off radius for a frequency.
+
+        This compatibility helper is used by the accelerated RSSI builders. It
+        mirrors cutoff_radius_m_for_radio() for radios that do not have an
+        explicit per-radio cut-off value.
+        """
+        if settings is None:
+            return 0.0
+        table = getattr(settings, "ap_cutoff_radius_by_frequency_m", {}) or {}
+        if table:
+            try:
+                freq = float(frequency_mhz)
+                bands = sorted(float(k) for k in table.keys())
+                closest = min(bands, key=lambda b: abs(b - freq))
+                return float(table.get(closest, getattr(settings, "default_ap_cutoff_radius_m", 0.0)))
+            except Exception:
+                pass
+        return float(getattr(settings, "default_ap_cutoff_radius_m", 0.0) or 0.0)
+
+    @staticmethod
     def point_is_inside_radio_cutoff(x: float, y: float, receiver_floor: FloorModel, ap: AccessPoint, floors: Dict[str, FloorModel], radio: APRadio, settings: Optional[HeatmapSettings]) -> bool:
         if not settings or not getattr(settings, "enable_ap_cutoff_zones", True):
             return True
@@ -3691,6 +3714,167 @@ class RFEngine:
         )
 
     @staticmethod
+    def _attenuation_segment_rows_for_floor(floor: FloorModel, frequency_mhz: float) -> np.ndarray:
+        """Flatten RF wall/element polygon edges for CUDA/Numba ray tests.
+
+        The GPU path evaluates line-of-sight path loss and adds attenuation for
+        each RF barrier edge crossed by the AP-to-sample ray. This keeps the
+        expensive per-grid RSSI pass on the GPU while preserving user wall and
+        IFC element attenuation as a first-order RF planning approximation.
+        """
+        rows: List[Tuple[float, float, float, float, float, float, float]] = []
+
+        def add_polygon_edges(polygon, z_min: float, z_max: float, loss: float):
+            if polygon is None or getattr(polygon, "is_empty", True) or abs(float(loss)) <= 1e-9:
+                return
+            polygons = [polygon] if getattr(polygon, "geom_type", "") == "Polygon" else list(getattr(polygon, "geoms", []) or [])
+            for poly in polygons:
+                if getattr(poly, "geom_type", "") != "Polygon":
+                    continue
+                rings = [poly.exterior]
+                rings.extend(list(getattr(poly, "interiors", []) or []))
+                for ring in rings:
+                    coords = list(getattr(ring, "coords", []) or [])
+                    for a, b in zip(coords, coords[1:]):
+                        x1, y1 = float(a[0]), float(a[1])
+                        x2, y2 = float(b[0]), float(b[1])
+                        if math.hypot(x2 - x1, y2 - y1) < 1.0e-6:
+                            continue
+                        rows.append((x1, y1, x2, y2, float(z_min), float(z_max), float(loss)))
+
+        for wall in list(getattr(floor, "walls", []) or []):
+            add_polygon_edges(
+                getattr(wall, "polygon", None),
+                float(getattr(wall, "z_min", floor.elevation)),
+                float(getattr(wall, "z_max", floor.elevation + 3.0)),
+                float(wall.attenuation_db_for_frequency(frequency_mhz)),
+            )
+        for element in list(getattr(floor, "elements", []) or []):
+            if not bool(getattr(element, "is_rf_barrier", False)):
+                continue
+            category = str(getattr(element, "rf_category", "other") or "other").lower()
+            if category in {"slab", "roof", "covering"}:
+                continue
+            add_polygon_edges(
+                getattr(element, "polygon", None),
+                float(getattr(element, "z_min", floor.elevation)),
+                float(getattr(element, "z_max", floor.elevation + 3.0)),
+                float(element.attenuation_db_for_frequency(frequency_mhz)),
+            )
+        if not rows:
+            return np.zeros((0, 7), dtype=np.float32)
+        return np.asarray(rows, dtype=np.float32)
+
+    @staticmethod
+    def _direct_accelerator_ap_rows(
+        floor: FloorModel,
+        floors: Dict[str, FloorModel],
+        links: Sequence[Tuple[AccessPoint, APRadio]],
+        heatmap_settings: Optional[HeatmapSettings],
+    ) -> np.ndarray:
+        rows: List[Tuple[float, float, float, float, float, float, float, float, float, float]] = []
+        for ap, radio in links:
+            ap_floor = floors.get(ap.floor)
+            if ap_floor is None:
+                continue
+            frequency = float(radio.frequency_mhz)
+            cutoff = float(getattr(radio, "cutoff_radius_m", 0.0) or 0.0)
+            if cutoff <= 0.0:
+                cutoff = RFEngine.ap_cutoff_radius_for_frequency(frequency, heatmap_settings)
+            cutoff2 = cutoff * cutoff if cutoff > 0.0 else 0.0
+            ap_z = float(ap_floor.elevation) + float(ap.mount_height_m)
+            rx_z = float(floor.elevation) + float(ap.rx_height_m)
+            floor_loss = 0.0
+            if ap_floor.name != floor.name:
+                floor_loss = RFEngine.floor_penetration_loss_db(floor, ap_floor, floors, frequency, [])
+            rows.append((
+                float(ap.x), float(ap.y), ap_z, rx_z,
+                float(radio.tx_power_dbm), float(getattr(radio, "antenna_gain_dbi", 0.0) or 0.0),
+                frequency, float(ap.path_loss_exponent), cutoff2, float(floor_loss),
+            ))
+        if not rows:
+            return np.zeros((0, 10), dtype=np.float32)
+        return np.asarray(rows, dtype=np.float32)
+
+    @staticmethod
+    def _try_accelerated_direct_grid(
+        floor: FloorModel,
+        floors: Dict[str, FloorModel],
+        xs: np.ndarray,
+        ys: np.ndarray,
+        group_order: Sequence[object],
+        radio_links_by_group: Dict[object, Sequence[Tuple[AccessPoint, APRadio]]],
+        work_mask: Optional[np.ndarray],
+        boundary_mask: Optional[np.ndarray],
+        calculation_boundary,
+        ignored: int,
+        heatmap_settings: Optional[HeatmapSettings],
+        started: float,
+        progress_callback=None,
+        progressive_callback=None,
+    ) -> Optional[Dict[object, SimulationResult]]:
+        if heatmap_settings is None or not bool(getattr(heatmap_settings, "enable_numba_rf_kernels", True)):
+            return None
+        cancel_event = getattr(heatmap_settings, "_cancel_event", None)
+        disconnected = float(getattr(heatmap_settings, "disconnected_rssi_dbm", -120.0))
+        combine_mode = 1 if str(getattr(heatmap_settings, "combined_ap_mode", "strongest")).lower() == "power_sum" else 0
+        rows, cols = len(ys), len(xs)
+        valid = np.ones((rows, cols), dtype=np.uint8) if work_mask is None else np.ascontiguousarray(work_mask, dtype=np.uint8)
+        results: Dict[object, SimulationResult] = {}
+        total_groups = max(1, len(group_order))
+        gpu_used = ""
+        cpu_parallel_used = False
+        for index, key in enumerate(group_order):
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("RSSI calculation cancelled")
+            links = radio_links_by_group.get(key, [])
+            ap_rows = RFEngine._direct_accelerator_ap_rows(floor, floors, links, heatmap_settings)
+            if ap_rows.size == 0:
+                continue
+            frequency = float(ap_rows[0, 6])
+            segments = RFEngine._attenuation_segment_rows_for_floor(floor, frequency)
+            accelerated = None
+            try:
+                accelerated = gpu_direct_rssi_grid(xs, ys, ap_rows, segments, valid, disconnected, combine_mode, heatmap_settings)
+            except Exception:
+                accelerated = None
+            if accelerated is not None:
+                rssi, counts, gpu_used = accelerated
+                mode = "gpu-direct-rssi"
+            else:
+                fallback = numba_direct_rssi_grid(xs, ys, ap_rows, segments, valid, disconnected, combine_mode)
+                if fallback is None:
+                    return None
+                rssi, counts = fallback
+                cpu_parallel_used = True
+                mode = "numba-parallel-rssi"
+            if boundary_mask is not None:
+                rssi = np.asarray(rssi, dtype=float)
+                rssi[~boundary_mask] = np.nan
+            delays = np.zeros((rows, cols), dtype=float)
+            if boundary_mask is not None:
+                delays[~boundary_mask] = np.nan
+            elapsed = time.perf_counter() - started
+            note = (
+                f"direct RSSI grid calculated on {gpu_used}; Numba CPU fallback not used"
+                if gpu_used else
+                "direct RSSI grid calculated with Numba parallel CPU fallback because no compatible GPU was available"
+            )
+            note += "; attenuation uses GPU/Numba ray intersections against IFC/user RF barrier edges"
+            results[key] = SimulationResult(
+                xs=xs, ys=ys, rssi=rssi, delay_spread_ns=delays, path_count=counts,
+                valid_mask=None if boundary_mask is None else boundary_mask.copy(),
+                boundary_geometry=calculation_boundary, ignored_point_count=ignored,
+                execution_mode=mode, worker_processes=1, elapsed_seconds=elapsed,
+                performance_note=note, exact_points=int(np.count_nonzero(valid)),
+            )
+            if progress_callback:
+                progress_callback(index + 1, total_groups)
+            if progressive_callback:
+                progressive_callback(dict(results), (index + 1) / total_groups)
+        return results if results else None
+
+    @staticmethod
     def _simulate_groups_uniform(
         floor: FloorModel,
         floors: Dict[str, FloorModel],
@@ -3758,6 +3942,14 @@ class RFEngine:
         grids = {key: initial_rssi.copy() for key in group_order}
         delays = {key: initial_delay.copy() for key in group_order}
         counts = {key: np.zeros((rows, cols), dtype=np.int16) for key in group_order}
+
+        accelerated = RFEngine._try_accelerated_direct_grid(
+            floor, floors, xs, ys, group_order, radio_links_by_group, work_mask,
+            boundary_mask, calculation_boundary, ignored, heatmap_settings, started,
+            progress_callback, progressive_callback,
+        )
+        if accelerated is not None:
+            return accelerated
 
         # CUDA/OpenCL performs one conservative whole-grid upper-bound pass before
         # the CPU workers start. This does not replace IFC ray tracing; it removes
@@ -3936,7 +4128,10 @@ class RFEngine:
         reflection_indexes = RFEngine._build_reflection_indexes(floors, heatmap_settings)
         if progress_callback:
             progress_callback(0, rows)
+        cancel_event = getattr(heatmap_settings, "_cancel_event", None) if heatmap_settings is not None else None
         for iy, yy in enumerate(ys):
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("RSSI calculation cancelled")
             for ix, xx in enumerate(xs):
                 if work_mask is not None and not bool(work_mask[iy, ix]):
                     continue
@@ -9555,6 +9750,7 @@ class MainWindow(QMainWindow):
         floor = self.floor
         aps_snapshot = self._snapshot_rf_access_points(self.aps)
         settings_snapshot = copy.deepcopy(self.heatmap_settings)
+        setattr(settings_snapshot, "_cancel_event", None)
         patterns_snapshot = copy.deepcopy(self.antenna_patterns)
         resolution = max(
             float(self.resolution.value()),
@@ -15973,10 +16169,10 @@ class MainWindow(QMainWindow):
         progress = self._rssi_calculation_progress_dialog
         if progress is not None:
             progress.setLabelText(
-                "Cancelling RSSI calculation after the current worker tile..."
+                "Cancelling RSSI calculation after the current GPU kernel/worker tile..."
             )
         self.statusBar().showMessage(
-            "Cancelling RSSI calculation after the current worker tile..."
+            "Cancelling RSSI calculation after the current GPU kernel/worker tile..."
         )
 
     def _persist_snapshot_results(
@@ -16283,6 +16479,7 @@ class MainWindow(QMainWindow):
         floor = self.floor
         aps_snapshot = self._snapshot_rf_access_points(self.aps)
         settings_snapshot = copy.deepcopy(self.heatmap_settings)
+        setattr(settings_snapshot, "_cancel_event", None)
         patterns_snapshot = copy.deepcopy(self.antenna_patterns)
         resolution_m = float(self.resolution.value())
         include_inter_floor = bool(self.include_inter_floor.isChecked())
@@ -16324,6 +16521,7 @@ class MainWindow(QMainWindow):
 
         cancel_event = threading.Event()
         future: concurrent.futures.Future = concurrent.futures.Future()
+        setattr(settings_snapshot, "_cancel_event", cancel_event)
         self._rssi_calculation_future = future
         self._rssi_calculation_cancel_event = cancel_event
         self._rssi_calculation_progress_dialog = progress

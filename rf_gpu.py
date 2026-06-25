@@ -14,6 +14,12 @@ from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+try:
+    from numba import njit, prange  # type: ignore
+except Exception:  # pragma: no cover
+    njit = None
+    prange = range
+
 try:  # Current NVIDIA-supported CUDA target for Numba.
     from numba import cuda  # type: ignore
 except Exception:  # pragma: no cover - normal without numba-cuda/CUDA driver
@@ -281,11 +287,84 @@ if cuda is not None:
         output[gid, 1] = colours[selected, 1]
         output[gid, 2] = colours[selected, 2]
         output[gid, 3] = colours[selected, 3]
+
+
+    @cuda.jit(cache=True, fastmath=True)
+    def _cuda_direct_rssi_grid(xs, ys, valid, ap_data, segments, disconnected, combine_mode, out_rssi, out_counts, cols, rows):
+        gid = cuda.grid(1)
+        total = cols * rows
+        if gid >= total:
+            return
+        if valid[gid] == 0:
+            out_rssi[gid] = math.nan
+            out_counts[gid] = 0
+            return
+        ix = gid % cols
+        iy = gid // cols
+        x = xs[ix]
+        y = ys[iy]
+        best = disconnected
+        power_sum_mw = 0.0
+        path_count = 0
+        ap_count = ap_data.shape[0]
+        seg_count = segments.shape[0]
+        for ai in range(ap_count):
+            ax = ap_data[ai, 0]
+            ay = ap_data[ai, 1]
+            az = ap_data[ai, 2]
+            rz = ap_data[ai, 3]
+            tx = ap_data[ai, 4]
+            gain = ap_data[ai, 5]
+            freq_mhz = ap_data[ai, 6]
+            ple = ap_data[ai, 7]
+            cutoff2 = ap_data[ai, 8]
+            floor_loss = ap_data[ai, 9]
+            dx = x - ax
+            dy = y - ay
+            dz = rz - az
+            d2xy = dx * dx + dy * dy
+            if cutoff2 > 0.0 and d2xy > cutoff2:
+                continue
+            d3 = math.sqrt(d2xy + dz * dz)
+            if d3 < 1.0:
+                d3 = 1.0
+            fspl_1m = 20.0 * math.log10(freq_mhz) - 27.55
+            wall_loss = 0.0
+            for si in range(seg_count):
+                x1 = segments[si, 0]
+                y1 = segments[si, 1]
+                x2 = segments[si, 2]
+                y2 = segments[si, 3]
+                den = (x - ax) * (y2 - y1) - (y - ay) * (x2 - x1)
+                if den > -1.0e-7 and den < 1.0e-7:
+                    continue
+                t = ((x1 - ax) * (y2 - y1) - (y1 - ay) * (x2 - x1)) / den
+                u = ((x1 - ax) * (y - ay) - (y1 - ay) * (x - ax)) / den
+                if t >= 0.0 and t <= 1.0 and u >= 0.0 and u <= 1.0:
+                    zhit = az + (rz - az) * t
+                    if zhit >= segments[si, 4] and zhit <= segments[si, 5]:
+                        wall_loss += segments[si, 6]
+            rssi = tx + gain - fspl_1m - 10.0 * ple * math.log10(d3) - floor_loss - wall_loss
+            if rssi < disconnected:
+                rssi = disconnected
+            path_count += 1
+            if combine_mode == 1:
+                power_sum_mw += math.pow(10.0, rssi / 10.0)
+            elif rssi > best:
+                best = rssi
+        if combine_mode == 1 and power_sum_mw > 0.0:
+            best = 10.0 * math.log10(power_sum_mw)
+        if path_count == 0:
+            best = disconnected
+        out_rssi[gid] = best
+        out_counts[gid] = path_count
+
 else:  # pragma: no cover
     _cuda_influence_mask = None
     _cuda_strongest_index = None
     _cuda_resample_bilinear = None
     _cuda_colourise = None
+    _cuda_direct_rssi_grid = None
 
 
 class NumbaCUDARFAccelerator:
@@ -517,6 +596,100 @@ class OpenCLRFAccelerator:
             self._colour_kernel.set_args(src,np.int32(source.size),mb,xb,cb,np.int32(len(zones)),np.int32(int(np.argmax(maxs))),np.int32(int(np.argmin(mins))),out)
             cl.enqueue_nd_range_kernel(self.queue,self._colour_kernel,(source.size,),None);cl.enqueue_copy(self.queue,output,out).wait();return output.reshape((*source.shape,4))
         finally:self._lock.release()
+
+
+
+# ------------------------- Direct RSSI grid helpers -------------------------
+if njit is not None:
+    @njit(parallel=True, fastmath=True, cache=True)
+    def _numba_direct_rssi_grid(xs, ys, valid, ap_data, segments, disconnected, combine_mode):
+        rows = ys.shape[0]
+        cols = xs.shape[0]
+        out = np.empty((rows, cols), dtype=np.float64)
+        counts = np.zeros((rows, cols), dtype=np.int16)
+        for iy in prange(rows):
+            for ix in range(cols):
+                if valid[iy, ix] == 0:
+                    out[iy, ix] = np.nan
+                    counts[iy, ix] = 0
+                    continue
+                x = xs[ix]
+                y = ys[iy]
+                best = disconnected
+                power_sum_mw = 0.0
+                pc = 0
+                for ai in range(ap_data.shape[0]):
+                    ax = ap_data[ai, 0]; ay = ap_data[ai, 1]; az = ap_data[ai, 2]; rz = ap_data[ai, 3]
+                    tx = ap_data[ai, 4]; gain = ap_data[ai, 5]; freq_mhz = ap_data[ai, 6]; ple = ap_data[ai, 7]
+                    cutoff2 = ap_data[ai, 8]; floor_loss = ap_data[ai, 9]
+                    dx = x - ax; dy = y - ay; dz = rz - az
+                    d2xy = dx * dx + dy * dy
+                    if cutoff2 > 0.0 and d2xy > cutoff2:
+                        continue
+                    d3 = math.sqrt(d2xy + dz * dz)
+                    if d3 < 1.0:
+                        d3 = 1.0
+                    fspl_1m = 20.0 * math.log10(freq_mhz) - 27.55
+                    wall_loss = 0.0
+                    for si in range(segments.shape[0]):
+                        x1 = segments[si, 0]; y1 = segments[si, 1]; x2 = segments[si, 2]; y2 = segments[si, 3]
+                        den = (x - ax) * (y2 - y1) - (y - ay) * (x2 - x1)
+                        if den > -1.0e-7 and den < 1.0e-7:
+                            continue
+                        t = ((x1 - ax) * (y2 - y1) - (y1 - ay) * (x2 - x1)) / den
+                        u = ((x1 - ax) * (y - ay) - (y1 - ay) * (x - ax)) / den
+                        if t >= 0.0 and t <= 1.0 and u >= 0.0 and u <= 1.0:
+                            zhit = az + (rz - az) * t
+                            if zhit >= segments[si, 4] and zhit <= segments[si, 5]:
+                                wall_loss += segments[si, 6]
+                    rssi = tx + gain - fspl_1m - 10.0 * ple * math.log10(d3) - floor_loss - wall_loss
+                    if rssi < disconnected:
+                        rssi = disconnected
+                    pc += 1
+                    if combine_mode == 1:
+                        power_sum_mw += math.pow(10.0, rssi / 10.0)
+                    elif rssi > best:
+                        best = rssi
+                if combine_mode == 1 and power_sum_mw > 0.0:
+                    best = 10.0 * math.log10(power_sum_mw)
+                if pc == 0:
+                    best = disconnected
+                out[iy, ix] = best
+                counts[iy, ix] = pc
+        return out, counts
+else:
+    _numba_direct_rssi_grid = None
+
+
+def gpu_direct_rssi_grid(xs: np.ndarray, ys: np.ndarray, ap_data: np.ndarray, segments: np.ndarray,
+                         valid_mask: Optional[np.ndarray], disconnected: float, combine_mode: int,
+                         settings: Any) -> Optional[Tuple[np.ndarray, np.ndarray, str]]:
+    if not _enabled(settings):
+        return None
+    if np.asarray(ap_data).size == 0:
+        return None
+    result = _execute_gpu(
+        settings,
+        "direct RSSI grid calculation",
+        lambda backend: (backend.direct_rssi_grid(xs, ys, ap_data, segments, valid_mask, disconnected, combine_mode), backend.info.label, backend.backend_name)
+        if hasattr(backend, "direct_rssi_grid") else None,
+    )
+    if result is None:
+        return None
+    (rssi, counts), label, backend_name = result
+    return rssi, counts, f"{backend_name}: {label}"
+
+
+def numba_direct_rssi_grid(xs: np.ndarray, ys: np.ndarray, ap_data: np.ndarray, segments: np.ndarray,
+                           valid_mask: Optional[np.ndarray], disconnected: float, combine_mode: int) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    if _numba_direct_rssi_grid is None or np.asarray(ap_data).size == 0:
+        return None
+    xs64 = np.ascontiguousarray(xs, dtype=np.float64)
+    ys64 = np.ascontiguousarray(ys, dtype=np.float64)
+    aps64 = np.ascontiguousarray(ap_data, dtype=np.float64).reshape(-1, 10)
+    seg64 = np.ascontiguousarray(segments, dtype=np.float64).reshape(-1, 7)
+    valid = np.ones((len(ys64), len(xs64)), dtype=np.uint8) if valid_mask is None else np.ascontiguousarray(valid_mask, dtype=np.uint8)
+    return _numba_direct_rssi_grid(xs64, ys64, valid, aps64, seg64, float(disconnected), int(combine_mode))
 
 
 _BACKEND_LOCK = threading.RLock()
