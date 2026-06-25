@@ -973,7 +973,12 @@ class HeatmapSettings:
     opencl_min_work_items: int = 100000
     # Large GPU/Numba chunks keep kernels efficient while still allowing the
     # calculation worker to observe Cancel between launches.
-    cuda_chunk_points: int = 262144
+    cuda_chunk_points: int = 1048576
+    cuda_memory_fraction: float = 0.45
+    cuda_block_segment_threshold: int = 48
+    cuda_queue_depth: int = 3
+    cuda_max_barrier_checks_per_launch: int = 200000000
+    cuda_blocks_per_sm: int = 24
     numba_chunk_points: int = 262144
     opencl_accelerate_influence: bool = True
     opencl_accelerate_field_combine: bool = True
@@ -1271,6 +1276,11 @@ class HeatmapSettings:
         settings.opencl_allow_cpu_device = bool(performance.get("opencl_allow_cpu_device", settings.opencl_allow_cpu_device))
         settings.opencl_min_work_items = max(1, int(performance.get("opencl_min_work_items", settings.opencl_min_work_items)))
         settings.cuda_chunk_points = max(65536, int(performance.get("cuda_chunk_points", settings.cuda_chunk_points)))
+        settings.cuda_memory_fraction = max(0.10, min(0.75, float(performance.get("cuda_memory_fraction", settings.cuda_memory_fraction))))
+        settings.cuda_block_segment_threshold = max(1, int(performance.get("cuda_block_segment_threshold", settings.cuda_block_segment_threshold)))
+        settings.cuda_queue_depth = max(1, min(8, int(performance.get("cuda_queue_depth", settings.cuda_queue_depth))))
+        settings.cuda_max_barrier_checks_per_launch = max(10000000, int(performance.get("cuda_max_barrier_checks_per_launch", settings.cuda_max_barrier_checks_per_launch)))
+        settings.cuda_blocks_per_sm = max(4, min(64, int(performance.get("cuda_blocks_per_sm", settings.cuda_blocks_per_sm))))
         settings.numba_chunk_points = max(65536, int(performance.get("numba_chunk_points", settings.numba_chunk_points)))
         settings.opencl_accelerate_influence = bool(performance.get("opencl_accelerate_influence", settings.opencl_accelerate_influence))
         settings.opencl_accelerate_field_combine = bool(performance.get("opencl_accelerate_field_combine", settings.opencl_accelerate_field_combine))
@@ -1409,6 +1419,11 @@ class HeatmapSettings:
             "opencl_allow_cpu_device": bool(self.opencl_allow_cpu_device),
             "opencl_min_work_items": int(self.opencl_min_work_items),
             "cuda_chunk_points": int(self.cuda_chunk_points),
+            "cuda_memory_fraction": float(self.cuda_memory_fraction),
+            "cuda_block_segment_threshold": int(self.cuda_block_segment_threshold),
+            "cuda_queue_depth": int(self.cuda_queue_depth),
+            "cuda_max_barrier_checks_per_launch": int(self.cuda_max_barrier_checks_per_launch),
+            "cuda_blocks_per_sm": int(self.cuda_blocks_per_sm),
             "numba_chunk_points": int(self.numba_chunk_points),
             "opencl_accelerate_influence": bool(self.opencl_accelerate_influence),
             "opencl_accelerate_field_combine": bool(self.opencl_accelerate_field_combine),
@@ -1492,6 +1507,11 @@ class HeatmapSettings:
         self.opencl_allow_cpu_device = bool(data.get("opencl_allow_cpu_device", self.opencl_allow_cpu_device))
         self.opencl_min_work_items = max(1, int(data.get("opencl_min_work_items", self.opencl_min_work_items)))
         self.cuda_chunk_points = max(65536, int(data.get("cuda_chunk_points", self.cuda_chunk_points)))
+        self.cuda_memory_fraction = max(0.10, min(0.75, float(data.get("cuda_memory_fraction", self.cuda_memory_fraction))))
+        self.cuda_block_segment_threshold = max(1, int(data.get("cuda_block_segment_threshold", self.cuda_block_segment_threshold)))
+        self.cuda_queue_depth = max(1, min(8, int(data.get("cuda_queue_depth", self.cuda_queue_depth))))
+        self.cuda_max_barrier_checks_per_launch = max(10000000, int(data.get("cuda_max_barrier_checks_per_launch", self.cuda_max_barrier_checks_per_launch)))
+        self.cuda_blocks_per_sm = max(4, min(64, int(data.get("cuda_blocks_per_sm", self.cuda_blocks_per_sm))))
         self.numba_chunk_points = max(65536, int(data.get("numba_chunk_points", self.numba_chunk_points)))
         self.opencl_accelerate_influence = bool(data.get("opencl_accelerate_influence", self.opencl_accelerate_influence))
         self.opencl_accelerate_field_combine = bool(data.get("opencl_accelerate_field_combine", self.opencl_accelerate_field_combine))
@@ -5959,7 +5979,7 @@ class AutoPlannerSettingsDialog(QDialog):
 
         form = QFormLayout()
         self.target = QDoubleSpinBox(); self.target.setRange(1.0, 100.0); self.target.setSuffix(" %"); self.target.setValue(settings.target_coverage_percent)
-        self.coverage_mode = QComboBox(); self.coverage_mode.addItem("Each selected frequency", "all"); self.coverage_mode.addItem("Any selected frequency", "any"); self.coverage_mode.setCurrentIndex(1 if settings.coverage_mode == "any" else 0)
+        self.coverage_mode = QComboBox(); self.coverage_mode.addItem("Each selected radio", "all"); self.coverage_mode.addItem("Any selected radio", "any"); self.coverage_mode.setCurrentIndex(1 if settings.coverage_mode == "any" else 0)
         self.handover_enabled = QCheckBox("Require overlapping service from a second AP for handover")
         self.handover_enabled.setChecked(settings.handover_enabled)
         self.handover_target = QDoubleSpinBox(); self.handover_target.setRange(0.0, 100.0); self.handover_target.setSuffix(" %"); self.handover_target.setValue(settings.target_handover_percent)
@@ -6021,8 +6041,8 @@ class AutoPlannerSettingsDialog(QDialog):
         self.table.setHorizontalHeaderLabels(self.HEADERS)
         layout.addWidget(self.table, 1)
         row_buttons = QHBoxLayout()
-        add_btn = QPushButton("Add frequency")
-        remove_btn = QPushButton("Remove selected frequency")
+        add_btn = QPushButton("Add radio")
+        remove_btn = QPushButton("Remove selected radio")
         add_btn.clicked.connect(lambda: self._add_radio(PlannerRadioRequirement(name="New radio", frequency_mhz=5000.0)))
         remove_btn.clicked.connect(self._remove_selected)
         row_buttons.addWidget(add_btn); row_buttons.addWidget(remove_btn); row_buttons.addStretch(1)
@@ -6753,6 +6773,299 @@ class RFPerformanceSettingsDialog(QDialog):
         settings.quick_rssi_cutoff_dbm = float(self.quick_cutoff_dbm.value())
         settings.save_simulation_results_to_disk = self.save_results_disk.isChecked()
         settings.load_saved_simulation_results = self.load_results_disk.isChecked()
+
+
+
+class RSSISimulationSelectionDialog(QDialog):
+    """Choose floors and active frequencies for an RSSI simulation run."""
+
+    def __init__(
+        self,
+        parent,
+        floor_items: Sequence[Tuple[str, FloorModel]],
+        frequencies_mhz: Sequence[float],
+        current_floor_name: str = "",
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Simulate RSSI - floors and frequencies")
+        self.resize(720, 570)
+        self._current_floor_name = str(current_floor_name or "")
+
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "Select every floor and radio frequency to calculate. Floors are processed in elevation order. "
+            "Each selected frequency uses every enabled AP radio operating at that frequency, including "
+            "inter-floor APs when inter-floor propagation is enabled."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        columns = QHBoxLayout()
+        layout.addLayout(columns, 1)
+
+        floor_column = QVBoxLayout()
+        floor_column.addWidget(QLabel("Floors"))
+        self.floor_list = QListWidget()
+        self.floor_list.setAlternatingRowColors(True)
+        for floor_name, floor in floor_items:
+            item = QListWidgetItem(f"{floor_name}  —  elevation {float(floor.elevation):g} m")
+            item.setData(Qt.UserRole, str(floor_name))
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if str(floor_name) == self._current_floor_name else Qt.Unchecked)
+            self.floor_list.addItem(item)
+        if not self.selected_floor_names() and self.floor_list.count():
+            self.floor_list.item(0).setCheckState(Qt.Checked)
+        floor_column.addWidget(self.floor_list, 1)
+        floor_buttons = QHBoxLayout()
+        floor_all = QPushButton("All")
+        floor_all.clicked.connect(lambda: self._set_all_checked(self.floor_list, True))
+        floor_current = QPushButton("Current only")
+        floor_current.clicked.connect(self._select_current_floor)
+        floor_none = QPushButton("None")
+        floor_none.clicked.connect(lambda: self._set_all_checked(self.floor_list, False))
+        floor_buttons.addWidget(floor_all)
+        floor_buttons.addWidget(floor_current)
+        floor_buttons.addWidget(floor_none)
+        floor_column.addLayout(floor_buttons)
+        columns.addLayout(floor_column, 1)
+
+        frequency_column = QVBoxLayout()
+        frequency_column.addWidget(QLabel("Active radio frequencies"))
+        self.frequency_list = QListWidget()
+        self.frequency_list.setAlternatingRowColors(True)
+        for frequency in sorted({float(value) for value in frequencies_mhz}):
+            item = QListWidgetItem(MainWindow._pdf_frequency_label(frequency))
+            item.setData(Qt.UserRole, float(frequency))
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked)
+            self.frequency_list.addItem(item)
+        frequency_column.addWidget(self.frequency_list, 1)
+        frequency_buttons = QHBoxLayout()
+        frequency_all = QPushButton("All")
+        frequency_all.clicked.connect(lambda: self._set_all_checked(self.frequency_list, True))
+        frequency_none = QPushButton("None")
+        frequency_none.clicked.connect(lambda: self._set_all_checked(self.frequency_list, False))
+        frequency_buttons.addWidget(frequency_all)
+        frequency_buttons.addWidget(frequency_none)
+        frequency_buttons.addStretch(1)
+        frequency_column.addLayout(frequency_buttons)
+        columns.addLayout(frequency_column, 1)
+
+        self.summary = QLabel()
+        self.summary.setWordWrap(True)
+        layout.addWidget(self.summary)
+        self.floor_list.itemChanged.connect(self._update_summary)
+        self.frequency_list.itemChanged.connect(self._update_summary)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self._update_summary()
+
+    def _set_all_checked(self, list_widget: QListWidget, checked: bool):
+        state = Qt.Checked if checked else Qt.Unchecked
+        list_widget.blockSignals(True)
+        try:
+            for index in range(list_widget.count()):
+                list_widget.item(index).setCheckState(state)
+        finally:
+            list_widget.blockSignals(False)
+        self._update_summary()
+
+    def _select_current_floor(self):
+        self.floor_list.blockSignals(True)
+        try:
+            for index in range(self.floor_list.count()):
+                item = self.floor_list.item(index)
+                item.setCheckState(
+                    Qt.Checked if str(item.data(Qt.UserRole)) == self._current_floor_name else Qt.Unchecked
+                )
+        finally:
+            self.floor_list.blockSignals(False)
+        if not self.selected_floor_names() and self.floor_list.count():
+            self.floor_list.item(0).setCheckState(Qt.Checked)
+        self._update_summary()
+
+    def selected_floor_names(self) -> List[str]:
+        return [
+            str(self.floor_list.item(index).data(Qt.UserRole))
+            for index in range(self.floor_list.count())
+            if self.floor_list.item(index).checkState() == Qt.Checked
+        ]
+
+    def selected_frequencies(self) -> List[float]:
+        return [
+            float(self.frequency_list.item(index).data(Qt.UserRole))
+            for index in range(self.frequency_list.count())
+            if self.frequency_list.item(index).checkState() == Qt.Checked
+        ]
+
+    def _update_summary(self, *_):
+        floor_count = len(self.selected_floor_names())
+        frequency_count = len(self.selected_frequencies())
+        combinations = floor_count * frequency_count
+        self.summary.setText(
+            f"Selected: {floor_count} floor{'s' if floor_count != 1 else ''}, "
+            f"{frequency_count} frequenc{'ies' if frequency_count != 1 else 'y'}, "
+            f"{combinations} floor/frequency calculation{'s' if combinations != 1 else ''}."
+        )
+
+    def accept(self):
+        if not self.selected_floor_names():
+            QMessageBox.warning(self, "No floors selected", "Select at least one floor to simulate.")
+            return
+        if not self.selected_frequencies():
+            QMessageBox.warning(self, "No frequencies selected", "Select at least one active radio frequency.")
+            return
+        super().accept()
+
+
+class PlannerRunSelectionDialog(QDialog):
+    """Choose floors and planner radio definitions for predictive placement."""
+
+    def __init__(
+        self,
+        parent,
+        floor_items: Sequence[Tuple[str, FloorModel]],
+        radio_items: Sequence[Tuple[int, PlannerRadioRequirement]],
+        current_floor_name: str = "",
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Predict AP locations - floors and radios")
+        self.resize(820, 600)
+        self._current_floor_name = str(current_floor_name or "")
+
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "Select the floors to plan and the radio definitions to install in each predicted AP. "
+            "A planned AP can contain several selected radios operating at different frequencies. "
+            "Coverage, handover and client-capacity targets are evaluated independently on each floor."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        columns = QHBoxLayout()
+        layout.addLayout(columns, 1)
+
+        floor_column = QVBoxLayout()
+        floor_column.addWidget(QLabel("Floors"))
+        self.floor_list = QListWidget()
+        self.floor_list.setAlternatingRowColors(True)
+        for floor_name, floor in floor_items:
+            item = QListWidgetItem(f"{floor_name}  —  elevation {float(floor.elevation):g} m")
+            item.setData(Qt.UserRole, str(floor_name))
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if str(floor_name) == self._current_floor_name else Qt.Unchecked)
+            self.floor_list.addItem(item)
+        if not self.selected_floor_names() and self.floor_list.count():
+            self.floor_list.item(0).setCheckState(Qt.Checked)
+        floor_column.addWidget(self.floor_list, 1)
+        floor_buttons = QHBoxLayout()
+        floor_all = QPushButton("All")
+        floor_all.clicked.connect(lambda: self._set_all_checked(self.floor_list, True))
+        floor_current = QPushButton("Current only")
+        floor_current.clicked.connect(self._select_current_floor)
+        floor_none = QPushButton("None")
+        floor_none.clicked.connect(lambda: self._set_all_checked(self.floor_list, False))
+        floor_buttons.addWidget(floor_all)
+        floor_buttons.addWidget(floor_current)
+        floor_buttons.addWidget(floor_none)
+        floor_column.addLayout(floor_buttons)
+        columns.addLayout(floor_column, 1)
+
+        radio_column = QVBoxLayout()
+        radio_column.addWidget(QLabel("Radios fitted to predicted APs"))
+        self.radio_list = QListWidget()
+        self.radio_list.setAlternatingRowColors(True)
+        for source_index, requirement in radio_items:
+            channel_text = ", ".join(str(value) for value in requirement.channels) or "automatic"
+            item = QListWidgetItem(
+                f"{requirement.name} — {float(requirement.frequency_mhz):g} MHz — "
+                f"{requirement.antenna_pattern} — channels {channel_text}"
+            )
+            item.setData(Qt.UserRole, int(source_index))
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked)
+            self.radio_list.addItem(item)
+        radio_column.addWidget(self.radio_list, 1)
+        radio_buttons = QHBoxLayout()
+        radio_all = QPushButton("All")
+        radio_all.clicked.connect(lambda: self._set_all_checked(self.radio_list, True))
+        radio_none = QPushButton("None")
+        radio_none.clicked.connect(lambda: self._set_all_checked(self.radio_list, False))
+        radio_buttons.addWidget(radio_all)
+        radio_buttons.addWidget(radio_none)
+        radio_buttons.addStretch(1)
+        radio_column.addLayout(radio_buttons)
+        columns.addLayout(radio_column, 1)
+
+        self.summary = QLabel()
+        self.summary.setWordWrap(True)
+        layout.addWidget(self.summary)
+        self.floor_list.itemChanged.connect(self._update_summary)
+        self.radio_list.itemChanged.connect(self._update_summary)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self._update_summary()
+
+    def _set_all_checked(self, list_widget: QListWidget, checked: bool):
+        state = Qt.Checked if checked else Qt.Unchecked
+        list_widget.blockSignals(True)
+        try:
+            for index in range(list_widget.count()):
+                list_widget.item(index).setCheckState(state)
+        finally:
+            list_widget.blockSignals(False)
+        self._update_summary()
+
+    def _select_current_floor(self):
+        self.floor_list.blockSignals(True)
+        try:
+            for index in range(self.floor_list.count()):
+                item = self.floor_list.item(index)
+                item.setCheckState(
+                    Qt.Checked if str(item.data(Qt.UserRole)) == self._current_floor_name else Qt.Unchecked
+                )
+        finally:
+            self.floor_list.blockSignals(False)
+        if not self.selected_floor_names() and self.floor_list.count():
+            self.floor_list.item(0).setCheckState(Qt.Checked)
+        self._update_summary()
+
+    def selected_floor_names(self) -> List[str]:
+        return [
+            str(self.floor_list.item(index).data(Qt.UserRole))
+            for index in range(self.floor_list.count())
+            if self.floor_list.item(index).checkState() == Qt.Checked
+        ]
+
+    def selected_radio_indices(self) -> List[int]:
+        return [
+            int(self.radio_list.item(index).data(Qt.UserRole))
+            for index in range(self.radio_list.count())
+            if self.radio_list.item(index).checkState() == Qt.Checked
+        ]
+
+    def _update_summary(self, *_):
+        floor_count = len(self.selected_floor_names())
+        radio_count = len(self.selected_radio_indices())
+        self.summary.setText(
+            f"Selected: {floor_count} floor{'s' if floor_count != 1 else ''}; "
+            f"each predicted AP will contain {radio_count} radio{'s' if radio_count != 1 else ''}."
+        )
+
+    def accept(self):
+        if not self.selected_floor_names():
+            QMessageBox.warning(self, "No floors selected", "Select at least one floor for AP prediction.")
+            return
+        if not self.selected_radio_indices():
+            QMessageBox.warning(self, "No radios selected", "Select at least one planner radio.")
+            return
+        super().accept()
 
 
 class PDFExportSelectionDialog(QDialog):
@@ -8244,8 +8557,12 @@ class MainWindow(QMainWindow):
         self._rssi_calculation_partial_applied: float = 0.0
         self._rssi_calculation_request_token: str = ""
         self._rssi_calculation_floor_name: str = ""
+        self._rssi_calculation_floor_names: List[str] = []
+        self._rssi_calculation_request_tokens: Dict[str, str] = {}
+        self._rssi_calculation_partial_floor_name: str = ""
         self._rssi_calculation_signature_context: Optional[Dict[str, object]] = None
         self._rssi_calculation_frequencies: List[float] = []
+        self._rssi_memory_results: Dict[str, Dict[str, object]] = {}
         self._rssi_calculation_previous_results: Dict[float, SimulationResult] = {}
         self._rssi_calculation_previous_last_result: Optional[SimulationResult] = None
         self._rssi_calculation_results_persisted: bool = False
@@ -8753,7 +9070,7 @@ class MainWindow(QMainWindow):
                 "SP_DialogDiscardButton", ""
             ),
             "sim_action": (
-                "Simulate RSSI", "Calculate RF coverage for all applicable frequencies and redraw the selected result.",
+                "Simulate RSSI", "Choose floors and active radio frequencies, calculate each selected RSSI grid, and retain the results for floor switching and export.",
                 "SP_MediaPlay", "F5"
             ),
             "export_action": (
@@ -8833,7 +9150,7 @@ class MainWindow(QMainWindow):
                 "SP_FileDialogDetailedView", ""
             ),
             "predict_aps_action": (
-                "Predict AP locations", "Automatically place and configure access points within the permitted planning area.",
+                "Predict AP locations", "Choose multiple floors and planner radios, then place and configure multi-radio access points within each permitted planning area.",
                 "SP_DialogApplyButton", "Ctrl+P"
             ),
             "draw_wall_action": (
@@ -12079,6 +12396,7 @@ class MainWindow(QMainWindow):
         self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.rssi_results_by_frequency = {}
+        self._rssi_memory_results.clear()
 
     def toggle_boundary_result_filter(self, enabled: bool):
         self.heatmap_settings.ignore_results_outside_planner_boundaries = bool(enabled)
@@ -12666,13 +12984,135 @@ class MainWindow(QMainWindow):
             assigned.append(ap)
 
     def run_auto_planner(self):
+        if not self.floor or not self.floors:
+            QMessageBox.information(
+                self, "No floor selected",
+                "Load an IFC and select a floor before predicting AP locations.",
+            )
+            return
+        settings = self.auto_planner_settings
+        enabled_radio_items = [
+            (index, requirement)
+            for index, requirement in enumerate(settings.radio_requirements)
+            if requirement.enabled
+        ]
+        if not enabled_radio_items:
+            QMessageBox.information(
+                self, "No planner radios",
+                "Enable at least one radio in Planner settings.",
+            )
+            return
+
+        floor_items = sorted(
+            self.floors.items(), key=lambda item: (float(item[1].elevation), item[0])
+        )
+        selection = PlannerRunSelectionDialog(
+            self, floor_items, enabled_radio_items, self.floor.name
+        )
+        if selection.exec() != QDialog.Accepted:
+            return
+        selected_floor_names = set(selection.selected_floor_names())
+        selected_radio_indices = set(selection.selected_radio_indices())
+        selected_requirements = [
+            copy.deepcopy(requirement)
+            for index, requirement in enumerate(settings.radio_requirements)
+            if index in selected_radio_indices and requirement.enabled
+        ]
+        selected_floors = [
+            floor for floor_name, floor in floor_items
+            if floor_name in selected_floor_names
+        ]
+        if not selected_floors or not selected_requirements:
+            return
+
+        original_floor = self.floor
+        reports: List[Dict[str, object]] = []
+        failed_floors: List[str] = []
+        cancelled = False
+        try:
+            for floor_index, floor in enumerate(selected_floors, start=1):
+                self.floor = floor
+                self.statusBar().showMessage(
+                    f"Predicting AP locations on {floor.name} "
+                    f"({floor_index}/{len(selected_floors)})..."
+                )
+                report = self._run_auto_planner_current_floor(
+                    requirements_override=selected_requirements,
+                    refresh_ui=False,
+                    show_summary=False,
+                )
+                if report is None:
+                    message = self.statusBar().currentMessage().lower()
+                    if "cancel" in message:
+                        cancelled = True
+                        break
+                    failed_floors.append(str(floor.name))
+                    continue
+                reports.append(report)
+        finally:
+            self.floor = original_floor
+
+        self._invalidate_interactive_preview_requests()
+        self.last_result = None
+        self.rssi_results_by_frequency = {}
+        self._rssi_memory_results.clear()
+        self._rssi_result_stale = False
+        self._refresh_rssi_frequency_dropdown()
+        self.populate_ap_table()
+        self.populate_wall_table()
+        self.draw_floor()
+
+        if cancelled:
+            self.statusBar().showMessage(
+                f"Predictive AP planning cancelled after completing {len(reports)} floor(s)."
+            )
+        if not reports:
+            return
+
+        total_added = sum(int(report.get("added_aps", 0)) for report in reports)
+        radio_text = ", ".join(
+            f"{req.name} ({float(req.frequency_mhz):g} MHz)"
+            for req in selected_requirements
+        )
+        floor_lines = []
+        for report in reports:
+            floor_lines.append(
+                f"{report.get('floor', 'Floor')}: added {int(report.get('added_aps', 0))} AP(s); "
+                f"coverage {float(report.get('overall_pct', 0.0)):.1f}%; "
+                f"handover {float(report.get('handover_pct', 0.0)):.1f}%"
+            )
+        failure_text = (
+            "\n\nNo plan was produced for: " + ", ".join(failed_floors)
+            if failed_floors else ""
+        )
+        cancelled_text = "\n\nPlanning was cancelled before all selected floors completed." if cancelled else ""
+        QMessageBox.information(
+            self,
+            "Predictive AP plan complete",
+            f"Added {total_added} RSSI-predicted AP(s) across {len(reports)} floor(s).\n"
+            f"Selected radios fitted to each new AP: {radio_text}.\n\n"
+            + "\n".join(floor_lines)
+            + failure_text
+            + cancelled_text,
+        )
+
+    def _run_auto_planner_current_floor(
+        self,
+        requirements_override: Optional[Sequence[PlannerRadioRequirement]] = None,
+        refresh_ui: bool = True,
+        show_summary: bool = True,
+    ) -> Optional[Dict[str, object]]:
         self._invalidate_interactive_preview_requests()
         self._rssi_result_stale = False
         if not self.floor:
             QMessageBox.information(self, "No floor selected", "Load an IFC and select a floor before predicting AP locations.")
             return
         settings = self.auto_planner_settings
-        requirements = [r for r in settings.radio_requirements if r.enabled]
+        requirements = (
+            [copy.deepcopy(r) for r in requirements_override]
+            if requirements_override is not None
+            else [copy.deepcopy(r) for r in settings.radio_requirements if r.enabled]
+        )
         if not requirements:
             QMessageBox.information(self, "No planner radios", "Enable at least one frequency in Planner settings.")
             return
@@ -12749,8 +13189,11 @@ class MainWindow(QMainWindow):
             indices = np.linspace(0, len(candidate_specs) - 1, candidate_spec_limit, dtype=int)
             candidate_specs = [candidate_specs[int(i)] for i in indices]
 
-        progress = QProgressDialog("Building RSSI-driven AP coverage...", "Cancel", 0, max(1, settings.maximum_aps), self)
-        progress.setWindowTitle("Predictive AP planner")
+        progress = QProgressDialog(
+            f"Building RSSI-driven AP coverage for {self.floor.name}...",
+            "Cancel", 0, max(1, settings.maximum_aps), self
+        )
+        progress.setWindowTitle(f"Predictive AP planner - {self.floor.name}")
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
         progress.show()
@@ -13055,8 +13498,10 @@ class MainWindow(QMainWindow):
         self.rssi_results_by_frequency = {}
         self._rssi_result_stale = False
         self._refresh_rssi_frequency_dropdown()
-        self.populate_ap_table()
-        self.draw_floor()
+        if refresh_ui:
+            self.populate_ap_table()
+            self.populate_wall_table()
+            self.draw_floor()
         overall_pct = 100.0 * float(np.count_nonzero(overall)) / max(1, len(overall))
         handover_pct = 100.0 * float(np.count_nonzero(handover_overall)) / max(1, len(handover_overall))
         band_lines = []
@@ -13082,15 +13527,31 @@ class MainWindow(QMainWindow):
             if settings.handover_enabled else
             "Handover overlap requirement: disabled.\n"
         )
-        QMessageBox.information(
-            self, "Predictive AP plan complete",
+        summary_text = (
             f"Added {len(new_aps)} RSSI-predicted AP(s) on {self.floor.name}.\n"
             f"Planning area: {getattr(self, '_planner_area_source_label', 'selected floor geometry')}.\n"
-            f"Overall coverage ({'every band' if settings.coverage_mode == 'all' else 'any band'}): {overall_pct:.1f}%\n"
+            f"Overall coverage ({'every selected radio' if settings.coverage_mode == 'all' else 'any selected radio'}): {overall_pct:.1f}%\n"
             + handover_summary
             + f"Effective client capacity after {average_occupancy:.1f}% average spectrum occupancy: approximately {available_capacity} clients.\n\n"
-            + "\n".join(band_lines) + warning,
+            + "\n".join(band_lines) + warning
         )
+        if show_summary:
+            QMessageBox.information(
+                self, "Predictive AP plan complete", summary_text
+            )
+        return {
+            "floor": str(self.floor.name),
+            "added_aps": int(len(new_aps)),
+            "overall_pct": float(overall_pct),
+            "handover_pct": float(handover_pct),
+            "available_capacity": int(available_capacity),
+            "planning_area": str(getattr(
+                self, "_planner_area_source_label", "selected floor geometry"
+            )),
+            "band_lines": list(band_lines),
+            "warnings": list(warnings),
+            "summary": summary_text,
+        }
 
     # ----------------------------- RF plan persistence -----------------------------
 
@@ -13443,8 +13904,33 @@ class MainWindow(QMainWindow):
                     except Exception:
                         pass
         signature_context = self._simulation_signature_context()
-        if self.floor is not None and self.rssi_results_by_frequency:
-            self._persist_simulation_results(self.floor, self.rssi_results_by_frequency, plan_path, signature_context)
+        persisted_floor_names = set()
+        for floor_name, memory_entry in list(self._rssi_memory_results.items()):
+            floor = self.floors.get(str(floor_name))
+            memory_results = memory_entry.get("results", {})
+            frequencies = [float(value) for value in memory_entry.get("frequencies", [])]
+            token = str(memory_entry.get("token", ""))
+            if floor is None or not isinstance(memory_results, dict) or not memory_results:
+                continue
+            try:
+                valid = bool(frequencies) and self._current_rssi_request_token(floor, frequencies) == token
+            except Exception:
+                valid = False
+            if not valid:
+                continue
+            self._persist_simulation_results(
+                floor, {float(key): value for key, value in memory_results.items()},
+                plan_path, signature_context
+            )
+            persisted_floor_names.add(str(floor.name))
+        if (
+            self.floor is not None
+            and self.rssi_results_by_frequency
+            and str(self.floor.name) not in persisted_floor_names
+        ):
+            self._persist_simulation_results(
+                self.floor, self.rssi_results_by_frequency, plan_path, signature_context
+            )
         self._saved_simulation_root = new_root
         files = sorted(self._saved_simulation_entries.values(), key=lambda item: (str(item.get("floor", "")), float(item.get("frequency_mhz", 0.0))))
         return {
@@ -14999,15 +15485,33 @@ class MainWindow(QMainWindow):
         self._invalidate_interactive_preview_requests()
         self.last_result = None
         self.rssi_results_by_frequency = {}
-        if (
-            self.floor is not None
-            and self.current_rf_plan_path is not None
-            and self.aps
-            and self._pending_plan_data is None
-            and not self._suppress_saved_result_restore
-        ):
-            frequencies = sorted({float(radio.frequency_mhz) for ap in self.aps for radio in ap.active_radios()})
-            restored = self._load_saved_results_for_floor(self.floor, frequencies, self._simulation_signature_context())
+        restored: Dict[float, SimulationResult] = {}
+        if self.floor is not None and self.aps and not self._suppress_saved_result_restore:
+            memory_entry = self._rssi_memory_results.get(str(self.floor.name), {})
+            memory_frequencies = [float(value) for value in memory_entry.get("frequencies", [])]
+            memory_token = str(memory_entry.get("token", ""))
+            memory_results = memory_entry.get("results", {})
+            if memory_frequencies and isinstance(memory_results, dict):
+                try:
+                    current_token = self._current_rssi_request_token(self.floor, memory_frequencies)
+                except Exception:
+                    current_token = ""
+                if current_token == memory_token:
+                    restored = {float(key): value for key, value in memory_results.items()}
+                else:
+                    self._rssi_memory_results.pop(str(self.floor.name), None)
+            if (
+                not restored
+                and self.current_rf_plan_path is not None
+                and self._pending_plan_data is None
+            ):
+                frequencies = sorted({
+                    float(radio.frequency_mhz)
+                    for ap in self.aps for radio in ap.active_radios()
+                })
+                restored = self._load_saved_results_for_floor(
+                    self.floor, frequencies, self._simulation_signature_context()
+                )
             if restored:
                 self.rssi_results_by_frequency = restored
                 selected_frequency = self._selected_rssi_view_frequency()
@@ -16364,6 +16868,7 @@ class MainWindow(QMainWindow):
             state = dict(self._rssi_calculation_progress_state)
             partial = self._rssi_calculation_partial_results
             partial_fraction = float(self._rssi_calculation_partial_fraction)
+            partial_floor_name = str(self._rssi_calculation_partial_floor_name or "")
             if partial is not None:
                 self._rssi_calculation_partial_results = None
 
@@ -16378,9 +16883,12 @@ class MainWindow(QMainWindow):
         if (
             partial is not None
             and partial_fraction > self._rssi_calculation_partial_applied
-            and not (self._rssi_calculation_cancel_event and self._rssi_calculation_cancel_event.is_set())
+            and not (
+                self._rssi_calculation_cancel_event
+                and self._rssi_calculation_cancel_event.is_set()
+            )
             and self.floor is not None
-            and str(self.floor.name) == self._rssi_calculation_floor_name
+            and str(self.floor.name) == partial_floor_name
         ):
             self._rssi_calculation_partial_applied = partial_fraction
             converted = {float(key): value for key, value in partial.items()}
@@ -16388,7 +16896,9 @@ class MainWindow(QMainWindow):
                 value.render_mode_override = "raster"
             self.rssi_results_by_frequency = converted
             selected = self._selected_rssi_view_frequency()
-            self.last_result = converted.get(selected) or (converted[sorted(converted)[0]] if converted else None)
+            self.last_result = converted.get(selected) or (
+                converted[sorted(converted)[0]] if converted else None
+            )
             self._rssi_result_stale = False
             self._replace_heatmap_only(self.last_result)
 
@@ -16397,16 +16907,20 @@ class MainWindow(QMainWindow):
 
         self._rssi_calculation_poll_timer.stop()
         error: Optional[BaseException] = None
-        results: Dict[float, SimulationResult] = {}
+        results_by_floor: Dict[str, Dict[float, SimulationResult]] = {}
         try:
-            results = future.result()
+            raw_results = future.result()
+            results_by_floor = {
+                str(floor_name): {float(key): value for key, value in floor_results.items()}
+                for floor_name, floor_results in raw_results.items()
+            }
         except concurrent.futures.CancelledError as exc:
             error = exc
         except BaseException as exc:
             error = exc
 
-        job_floor_name = self._rssi_calculation_floor_name
-        request_token = self._rssi_calculation_request_token
+        job_floor_names = list(self._rssi_calculation_floor_names)
+        request_tokens = dict(self._rssi_calculation_request_tokens)
         signature_context = self._rssi_calculation_signature_context
         requested_frequencies = list(self._rssi_calculation_frequencies)
         previous_results = self._rssi_calculation_previous_results
@@ -16421,6 +16935,9 @@ class MainWindow(QMainWindow):
         self._rssi_calculation_cancel_event = None
         self._rssi_calculation_progress_dialog = None
         self._rssi_calculation_partial_results = None
+        self._rssi_calculation_partial_floor_name = ""
+        self._rssi_calculation_floor_names = []
+        self._rssi_calculation_request_tokens = {}
         self._rssi_calculation_frequencies = []
         self._rssi_calculation_previous_results = {}
         self._rssi_calculation_previous_last_result = None
@@ -16449,22 +16966,62 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "RSSI calculation failed", message)
                 self.statusBar().showMessage("RSSI calculation failed")
             return
-        if self.floor is None or str(self.floor.name) != job_floor_name:
-            self.statusBar().showMessage(
-                "RSSI calculation completed, but the selected floor changed; result was not applied."
+
+        valid_results: Dict[str, Dict[float, SimulationResult]] = {}
+        stale_floors: List[str] = []
+        for floor_name in job_floor_names:
+            floor = self.floors.get(floor_name)
+            floor_results = results_by_floor.get(floor_name, {})
+            if floor is None or not floor_results:
+                continue
+            try:
+                current_token = self._current_rssi_request_token(
+                    floor, requested_frequencies
+                )
+            except Exception:
+                current_token = ""
+            if current_token != request_tokens.get(floor_name, ""):
+                stale_floors.append(floor_name)
+                continue
+            valid_results[floor_name] = floor_results
+            self._rssi_memory_results[floor_name] = {
+                "frequencies": list(requested_frequencies),
+                "token": current_token,
+                "results": floor_results,
+            }
+
+        current_floor_name = str(self.floor.name) if self.floor is not None else ""
+        current_results = valid_results.get(current_floor_name)
+        if current_results is not None and self.floor is not None:
+            self._apply_rssi_results(
+                current_results, self.floor, signature_context, results_persisted
             )
-            return
-        current_token = self._current_rssi_request_token(self.floor, requested_frequencies)
-        if current_token != request_token:
-            self.rssi_results_by_frequency = {}
-            self.last_result = None
-            self._rssi_result_stale = True
-            self._replace_heatmap_only(None)
-            self.statusBar().showMessage(
-                "RSSI inputs changed while calculating; stale background result was discarded."
-            )
-            return
-        self._apply_rssi_results(results, self.floor, signature_context, results_persisted)
+        else:
+            self.rssi_results_by_frequency = previous_results
+            self.last_result = previous_last_result
+            self._rssi_result_stale = False
+            self._replace_heatmap_only(self.last_result)
+
+        completed_count = len(valid_results)
+        combination_count = completed_count * len(requested_frequencies)
+        persisted_text = (
+            " Results were saved by floor and frequency."
+            if results_persisted
+            else ""
+        )
+        stale_text = (
+            f" {len(stale_floors)} floor result(s) were discarded because inputs changed."
+            if stale_floors
+            else ""
+        )
+        self.statusBar().showMessage(
+            f"RSSI simulation complete for {completed_count} floor"
+            f"{'s' if completed_count != 1 else ''} and "
+            f"{len(requested_frequencies)} frequenc"
+            f"{'ies' if len(requested_frequencies) != 1 else 'y'} "
+            f"({combination_count} result grid{'s' if combination_count != 1 else ''})."
+            f"{persisted_text}{stale_text}"
+        )
 
     def simulate(self):
         running = self._rssi_calculation_future
@@ -16479,7 +17036,10 @@ class MainWindow(QMainWindow):
 
         self._invalidate_interactive_preview_requests()
         self._rssi_result_stale = False
-        if not self.floor:
+        if not self.floor or not self.floors:
+            QMessageBox.information(
+                self, "No floor selected", "Load an IFC and select a floor before simulating RSSI."
+            )
             return
         self._sync_slab_attenuation_from_ui()
         if not self.aps:
@@ -16493,7 +17053,9 @@ class MainWindow(QMainWindow):
 
         active_freqs = sorted({
             float(radio.frequency_mhz)
-            for ap in self.aps for radio in ap.active_radios()
+            for ap in self.aps
+            for radio in ap.active_radios()
+            if getattr(radio, "enabled", True)
         })
         if not active_freqs:
             QMessageBox.information(
@@ -16502,7 +17064,24 @@ class MainWindow(QMainWindow):
             )
             return
 
-        floor = self.floor
+        all_floor_items = sorted(
+            self.floors.items(), key=lambda item: (float(item[1].elevation), item[0])
+        )
+        selection = RSSISimulationSelectionDialog(
+            self, all_floor_items, active_freqs, self.floor.name
+        )
+        if selection.exec() != QDialog.Accepted:
+            return
+        selected_floor_names = set(selection.selected_floor_names())
+        selected_frequencies = sorted(selection.selected_frequencies())
+        floor_items = [
+            (floor_name, floor)
+            for floor_name, floor in all_floor_items
+            if floor_name in selected_floor_names
+        ]
+        if not floor_items or not selected_frequencies:
+            return
+
         aps_snapshot = self._snapshot_rf_access_points(self.aps)
         settings_snapshot = copy.deepcopy(self.heatmap_settings)
         setattr(settings_snapshot, "_cancel_event", None)
@@ -16518,12 +17097,19 @@ class MainWindow(QMainWindow):
             "include_inter_floor": include_inter_floor,
             "heatmap_settings": settings_snapshot,
             "calculation_boundary": calculation_boundary,
-            "plan_path": Path(self.current_rf_plan_path) if self.current_rf_plan_path is not None else None,
+            "plan_path": (
+                Path(self.current_rf_plan_path)
+                if self.current_rf_plan_path is not None else None
+            ),
         }
-        request_token = self._rssi_request_token_for(
-            floor, active_freqs, aps_snapshot, resolution_m, patterns_snapshot,
-            include_inter_floor, settings_snapshot, calculation_boundary,
-        )
+        request_tokens = {
+            str(floor.name): self._rssi_request_token_for(
+                floor, selected_frequencies, aps_snapshot, resolution_m,
+                patterns_snapshot, include_inter_floor, settings_snapshot,
+                calculation_boundary,
+            )
+            for _, floor in floor_items
+        }
         signature_context = {
             "format": 1,
             "resolution_m": round(resolution_m, 6),
@@ -16534,7 +17120,7 @@ class MainWindow(QMainWindow):
         }
 
         progress = QProgressDialog(
-            "Preparing background RSSI calculation...", "Cancel", 0, 100, self
+            "Preparing multi-floor RSSI calculation...", "Cancel", 0, 100, self
         )
         progress.setWindowTitle("RSSI calculation")
         progress.setWindowModality(Qt.NonModal)
@@ -16551,18 +17137,28 @@ class MainWindow(QMainWindow):
         self._rssi_calculation_future = future
         self._rssi_calculation_cancel_event = cancel_event
         self._rssi_calculation_progress_dialog = progress
-        self._rssi_calculation_request_token = request_token
-        self._rssi_calculation_floor_name = str(floor.name)
+        self._rssi_calculation_request_token = request_tokens.get(
+            str(floor_items[0][0]), ""
+        )
+        self._rssi_calculation_floor_name = str(floor_items[0][0])
+        self._rssi_calculation_floor_names = [str(name) for name, _ in floor_items]
+        self._rssi_calculation_request_tokens = dict(request_tokens)
         self._rssi_calculation_signature_context = signature_context
-        self._rssi_calculation_frequencies = list(active_freqs)
+        self._rssi_calculation_frequencies = list(selected_frequencies)
         self._rssi_calculation_previous_results = dict(self.rssi_results_by_frequency)
         self._rssi_calculation_previous_last_result = self.last_result
         self._rssi_calculation_results_persisted = False
         self._rssi_calculation_partial_applied = 0.0
+        self._rssi_calculation_partial_floor_name = ""
+        total_progress_units = max(1, len(floor_items) * 1000)
         with self._rssi_calculation_state_lock:
             self._rssi_calculation_progress_state = {
-                "done": 0, "total": 1,
-                "label": f"Calculating {len(active_freqs)} RSSI band(s) in the background...",
+                "done": 0,
+                "total": total_progress_units,
+                "label": (
+                    f"Calculating {len(floor_items)} floor(s) × "
+                    f"{len(selected_frequencies)} frequency band(s)..."
+                ),
             }
             self._rssi_calculation_partial_results = None
             self._rssi_calculation_partial_fraction = 0.0
@@ -16575,68 +17171,99 @@ class MainWindow(QMainWindow):
                 settings_snapshot, "progressive_update_percent", 20
             )) / 100.0)
         )
-        worker_progressive_fraction = {"value": 0.0}
-
-        def update_progress(done, total):
-            if cancel_event.is_set():
-                raise RuntimeError("RSSI calculation cancelled")
-            with self._rssi_calculation_state_lock:
-                self._rssi_calculation_progress_state = {
-                    "done": int(done), "total": max(1, int(total)),
-                    "label": f"Calculating RSSI heatmap... {int((float(done) / max(1.0, float(total))) * 100.0)}%",
-                }
-
-        def update_progressive_heatmap(partial_results, fraction):
-            if cancel_event.is_set():
-                raise RuntimeError("RSSI calculation cancelled")
-            if not progressive_enabled:
-                return
-            fraction = max(0.0, min(1.0, float(fraction)))
-            if (
-                fraction < 1.0
-                and fraction - worker_progressive_fraction["value"] < progressive_step
-            ):
-                return
-            worker_progressive_fraction["value"] = fraction
-            converted = {float(key): value for key, value in partial_results.items()}
-            with self._rssi_calculation_state_lock:
-                self._rssi_calculation_partial_results = converted
-                self._rssi_calculation_partial_fraction = fraction
-                self._rssi_calculation_progress_state["label"] = (
-                    f"Calculating RSSI heatmap... {int(fraction * 100)}% field available"
-                )
 
         def calculate_background():
             if not future.set_running_or_notify_cancel():
                 return
+            all_results: Dict[str, Dict[float, SimulationResult]] = {}
+            persisted_any = False
             try:
-                result = self._simulate_rssi_frequencies_for_floor(
-                    floor, active_freqs, progress_callback=update_progress,
-                    progressive_callback=update_progressive_heatmap,
-                    simulation_context=simulation_context,
-                )
-                if cancel_event.is_set():
-                    raise RuntimeError("RSSI calculation cancelled")
-                with self._rssi_calculation_state_lock:
-                    self._rssi_calculation_progress_state["label"] = (
-                        "Saving reusable floor/frequency results..."
+                for floor_index, (floor_name, floor) in enumerate(floor_items):
+                    if cancel_event.is_set():
+                        raise RuntimeError("RSSI calculation cancelled")
+                    worker_progressive_fraction = {"value": 0.0}
+
+                    def update_progress(done, total, *, _index=floor_index, _name=floor_name):
+                        if cancel_event.is_set():
+                            raise RuntimeError("RSSI calculation cancelled")
+                        local_fraction = float(done) / max(1.0, float(total))
+                        overall_done = int((_index + local_fraction) * 1000.0)
+                        with self._rssi_calculation_state_lock:
+                            self._rssi_calculation_progress_state = {
+                                "done": overall_done,
+                                "total": total_progress_units,
+                                "label": (
+                                    f"Calculating {_name} ({_index + 1}/{len(floor_items)})... "
+                                    f"{int(local_fraction * 100.0)}%"
+                                ),
+                            }
+
+                    def update_progressive_heatmap(
+                        partial_results, fraction, *, _index=floor_index, _name=floor_name
+                    ):
+                        if cancel_event.is_set():
+                            raise RuntimeError("RSSI calculation cancelled")
+                        if not progressive_enabled:
+                            return
+                        fraction = max(0.0, min(1.0, float(fraction)))
+                        if (
+                            fraction < 1.0
+                            and fraction - worker_progressive_fraction["value"] < progressive_step
+                        ):
+                            return
+                        worker_progressive_fraction["value"] = fraction
+                        converted = {
+                            float(key): value for key, value in partial_results.items()
+                        }
+                        with self._rssi_calculation_state_lock:
+                            self._rssi_calculation_partial_results = converted
+                            self._rssi_calculation_partial_floor_name = str(_name)
+                            self._rssi_calculation_partial_fraction = float(_index) + fraction
+                            self._rssi_calculation_progress_state["label"] = (
+                                f"Calculating {_name} ({_index + 1}/{len(floor_items)})... "
+                                f"{int(fraction * 100)}% field available"
+                            )
+
+                    floor_results = self._simulate_rssi_frequencies_for_floor(
+                        floor,
+                        selected_frequencies,
+                        progress_callback=update_progress,
+                        progressive_callback=update_progressive_heatmap,
+                        simulation_context=simulation_context,
                     )
-                persisted = self._persist_snapshot_results(
-                    floor, result, simulation_context, signature_context
-                )
+                    all_results[str(floor_name)] = floor_results
+                    if cancel_event.is_set():
+                        raise RuntimeError("RSSI calculation cancelled")
+                    with self._rssi_calculation_state_lock:
+                        self._rssi_calculation_progress_state["label"] = (
+                            f"Saving {floor_name} reusable floor/frequency results..."
+                        )
+                    persisted_any = bool(
+                        self._persist_snapshot_results(
+                            floor, floor_results, simulation_context, signature_context
+                        )
+                    ) or persisted_any
+                    with self._rssi_calculation_state_lock:
+                        self._rssi_calculation_progress_state["done"] = (
+                            (floor_index + 1) * 1000
+                        )
                 with self._rssi_calculation_state_lock:
-                    self._rssi_calculation_results_persisted = bool(persisted)
+                    self._rssi_calculation_results_persisted = persisted_any
             except BaseException as exc:
                 future.set_exception(exc)
             else:
-                future.set_result(result)
+                future.set_result(all_results)
 
         self._set_rssi_calculation_ui(True)
         self.statusBar().showMessage(
-            f"Calculating {len(active_freqs)} RSSI band(s) in the background; pan and zoom remain available..."
+            f"Calculating {len(floor_items)} floor(s) and "
+            f"{len(selected_frequencies)} frequency band(s) in the background; "
+            "pan and zoom remain available..."
         )
         self._rssi_calculation_thread = threading.Thread(
-            target=calculate_background, name="rf-full-calculation", daemon=True
+            target=calculate_background,
+            name="rf-multi-floor-calculation",
+            daemon=True,
         )
         self._rssi_calculation_thread.start()
         self._rssi_calculation_poll_timer.start()
