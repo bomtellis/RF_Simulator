@@ -361,34 +361,62 @@ def built_in_antenna_patterns() -> Dict[str, AntennaPattern]:
     }
 
 
-AP_TYPE_PRESETS: Dict[str, Dict[str, str]] = {
+AP_TYPE_PRESETS: Dict[str, Dict[str, object]] = {
     "Ceiling AP": {
         "symbol": "circle_cross", "short": "C", "pattern": "Omni ceiling AP",
-        "description": "Ceiling-mounted omnidirectional wireless access point.",
+        "description": "General-purpose ceiling-mounted omnidirectional wireless access point.",
+    },
+    "High-Density Ceiling AP": {
+        "symbol": "star_circle", "short": "HD", "pattern": "Omni ceiling AP",
+        "description": "High-capacity ceiling AP for busy clinical, public or meeting areas.",
+    },
+    "Low-Profile Ceiling AP": {
+        "symbol": "ring_dot", "short": "LP", "pattern": "Omni ceiling AP",
+        "description": "Compact low-profile ceiling AP for visually sensitive spaces.",
     },
     "Wall AP": {
         "symbol": "square", "short": "W", "pattern": "Wall patch 60 degree",
         "description": "Wall-mounted access point with a forward-facing coverage pattern.",
     },
+    "In-Wall AP": {
+        "symbol": "rounded_square", "short": "IW", "pattern": "Wall patch 60 degree",
+        "description": "Room-facing in-wall AP, commonly used for individual rooms or bays.",
+    },
     "Directional AP": {
         "symbol": "triangle", "short": "D", "pattern": "Directional sector 90 degree",
-        "description": "Directional access point or sector antenna.",
+        "description": "Directional access point or sector antenna for controlled coverage.",
+    },
+    "Outdoor Directional AP": {
+        "symbol": "arrow_hex", "short": "OD", "pattern": "Directional sector 90 degree",
+        "description": "Weather-resistant directional AP for external areas and point-to-area coverage.",
+    },
+    "Wireless Bridge": {
+        "symbol": "bowtie", "short": "B", "pattern": "Wall patch 60 degree",
+        "description": "Point-to-point or point-to-multipoint wireless bridge radio.",
     },
     "Outdoor AP": {
         "symbol": "hexagon", "short": "O", "pattern": "Omni ceiling AP",
-        "description": "Weather-resistant outdoor access point.",
+        "description": "Weather-resistant omnidirectional outdoor access point.",
     },
     "Industrial AP": {
         "symbol": "octagon", "short": "I", "pattern": "Omni ceiling AP",
-        "description": "Rugged or industrial wireless access point.",
+        "description": "Rugged access point for plant rooms, workshops and harsh environments.",
+    },
+    "Mesh AP": {
+        "symbol": "mesh", "short": "M", "pattern": "Omni ceiling AP",
+        "description": "Mesh-capable AP or wireless backhaul node.",
     },
     "IoT Gateway": {
         "symbol": "diamond", "short": "G", "pattern": "Omni ceiling AP",
-        "description": "Low-power or sub-GHz IoT/BLE/Zigbee gateway.",
+        "description": "Low-power or sub-GHz IoT, BLE, Zigbee or LoRa gateway.",
+    },
+    "Distributed Antenna Node": {
+        "symbol": "antenna", "short": "DA", "pattern": "Omni ceiling AP",
+        "description": "Distributed antenna system node or remote radio head.",
     },
     "Cellular Small Cell": {
         "symbol": "double_circle", "short": "S", "pattern": "Omni ceiling AP",
-        "description": "Indoor private-LTE/5G small cell.",
+        "description": "Indoor private-LTE or 5G small cell.",
     },
 }
 
@@ -917,17 +945,20 @@ class HeatmapSettings:
     # paths and last-file batch completion issues.
     enable_ifc_multiprocessing: bool = True
     max_ifc_loader_processes: int = 0
+    # Threads used by IfcOpenShell's native geometry iterator inside each file
+    # worker. Zero divides the available logical cores between active IFC files.
+    max_ifc_loader_threads: int = 0
     # Safety watchdog for process-based IFC loading. Large files can legitimately
     # take time, so this is intentionally generous. Set to 0 to disable.
     ifc_load_timeout_seconds: int = 900
-    # For very large single IFC files, do a lightweight index pass and split
-    # geometry extraction into GlobalId chunks processed by multiple processes.
-    enable_chunked_ifc_geometry_extraction: bool = True
+    # Legacy compatibility switch. Chunked GUID extraction is disabled because
+    # each chunk reopened the complete IFC; native iterator threads are faster.
+    enable_chunked_ifc_geometry_extraction: bool = False
     chunk_ifc_files_over_mb: float = 100.0
     ifc_geometry_chunk_size: int = 250
-    # Large IFC safety guard. Chunking by GlobalId can improve smaller/medium
-    # models, but for 500-1000 MB IFCs it is unsafe because every worker process
-    # reopens the entire model. That multiplies RAM and can crash ifcopenshell/OCC.
+    # Large IFC safety guard. Files above this size are loaded with restricted
+    # file-level concurrency, while native geometry threads remain available
+    # inside the one process that owns each parsed IFC model.
     huge_ifc_single_process_threshold_mb: float = 512.0
     max_parallel_huge_ifc_processes: int = 1
     # Keep all IFC parsing out of the GUI process by default. If a worker dies,
@@ -958,6 +989,8 @@ class HeatmapSettings:
     precompute_reflection_candidates_per_tile: bool = True
     enable_tile_influence_pruning: bool = True
     tile_influence_margin_db: float = 8.0
+    enable_strongest_ap_early_exit: bool = True
+    strongest_ap_early_exit_margin_db: float = 12.0
     enable_tile_local_geometry: bool = True
     multipath_relative_power_cutoff_db: float = 30.0
     enable_numba_rf_kernels: bool = True
@@ -977,8 +1010,9 @@ class HeatmapSettings:
     cuda_memory_fraction: float = 0.45
     cuda_block_segment_threshold: int = 48
     cuda_queue_depth: int = 3
-    cuda_max_barrier_checks_per_launch: int = 200000000
+    cuda_max_barrier_checks_per_launch: int = 1000000000
     cuda_blocks_per_sm: int = 24
+    cuda_angular_bins: int = 128
     numba_chunk_points: int = 262144
     opencl_accelerate_influence: bool = True
     opencl_accelerate_field_combine: bool = True
@@ -1223,8 +1257,9 @@ class HeatmapSettings:
         settings.contour_line_width = float(data.get("contour_line_width", 1.25))
         settings.enable_ifc_multiprocessing = bool(data.get("enable_ifc_multiprocessing", data.get("ifc_loading_multiprocessing", True)))
         settings.max_ifc_loader_processes = max(0, int(data.get("max_ifc_loader_processes", data.get("ifc_loader_processes", 0))))
+        settings.max_ifc_loader_threads = max(0, int(data.get("max_ifc_loader_threads", data.get("ifc_loader_threads", 0))))
         settings.ifc_load_timeout_seconds = max(0, int(data.get("ifc_load_timeout_seconds", data.get("ifc_loader_timeout_seconds", 900))))
-        settings.enable_chunked_ifc_geometry_extraction = bool(data.get("enable_chunked_ifc_geometry_extraction", data.get("chunked_ifc_geometry_extraction", True)))
+        settings.enable_chunked_ifc_geometry_extraction = bool(data.get("enable_chunked_ifc_geometry_extraction", data.get("chunked_ifc_geometry_extraction", False)))
         settings.chunk_ifc_files_over_mb = max(0.0, float(data.get("chunk_ifc_files_over_mb", data.get("ifc_chunk_files_over_mb", 100.0))))
         settings.ifc_geometry_chunk_size = max(25, int(data.get("ifc_geometry_chunk_size", data.get("ifc_chunk_size", 250))))
         settings.huge_ifc_single_process_threshold_mb = max(0.0, float(data.get("huge_ifc_single_process_threshold_mb", data.get("ifc_huge_file_single_process_threshold_mb", 512.0))))
@@ -1242,6 +1277,7 @@ class HeatmapSettings:
             performance = {}
         settings.enable_ifc_multiprocessing = bool(performance.get("enable_ifc_multiprocessing", settings.enable_ifc_multiprocessing))
         settings.max_ifc_loader_processes = max(0, int(performance.get("max_ifc_loader_processes", settings.max_ifc_loader_processes)))
+        settings.max_ifc_loader_threads = max(0, int(performance.get("max_ifc_loader_threads", settings.max_ifc_loader_threads)))
         settings.max_parallel_huge_ifc_processes = max(1, int(performance.get("max_parallel_huge_ifc_processes", settings.max_parallel_huge_ifc_processes)))
         settings.enable_rf_multiprocessing = bool(performance.get("enable_rf_multiprocessing", settings.enable_rf_multiprocessing))
         settings.max_rf_worker_processes = max(0, int(performance.get("max_rf_worker_processes", settings.max_rf_worker_processes)))
@@ -1266,6 +1302,8 @@ class HeatmapSettings:
         settings.precompute_reflection_candidates_per_tile = bool(performance.get("precompute_reflection_candidates_per_tile", settings.precompute_reflection_candidates_per_tile))
         settings.enable_tile_influence_pruning = bool(performance.get("enable_tile_influence_pruning", settings.enable_tile_influence_pruning))
         settings.tile_influence_margin_db = max(0.0, float(performance.get("tile_influence_margin_db", settings.tile_influence_margin_db)))
+        settings.enable_strongest_ap_early_exit = bool(performance.get("enable_strongest_ap_early_exit", settings.enable_strongest_ap_early_exit))
+        settings.strongest_ap_early_exit_margin_db = max(0.0, float(performance.get("strongest_ap_early_exit_margin_db", settings.strongest_ap_early_exit_margin_db)))
         settings.enable_tile_local_geometry = bool(performance.get("enable_tile_local_geometry", settings.enable_tile_local_geometry))
         settings.multipath_relative_power_cutoff_db = max(0.0, min(80.0, float(performance.get("multipath_relative_power_cutoff_db", settings.multipath_relative_power_cutoff_db))))
         settings.enable_numba_rf_kernels = bool(performance.get("enable_numba_kernels", settings.enable_numba_rf_kernels))
@@ -1281,6 +1319,7 @@ class HeatmapSettings:
         settings.cuda_queue_depth = max(1, min(8, int(performance.get("cuda_queue_depth", settings.cuda_queue_depth))))
         settings.cuda_max_barrier_checks_per_launch = max(10000000, int(performance.get("cuda_max_barrier_checks_per_launch", settings.cuda_max_barrier_checks_per_launch)))
         settings.cuda_blocks_per_sm = max(4, min(64, int(performance.get("cuda_blocks_per_sm", settings.cuda_blocks_per_sm))))
+        settings.cuda_angular_bins = max(32, min(512, int(performance.get("cuda_angular_bins", settings.cuda_angular_bins))))
         settings.numba_chunk_points = max(65536, int(performance.get("numba_chunk_points", settings.numba_chunk_points)))
         settings.opencl_accelerate_influence = bool(performance.get("opencl_accelerate_influence", settings.opencl_accelerate_influence))
         settings.opencl_accelerate_field_combine = bool(performance.get("opencl_accelerate_field_combine", settings.opencl_accelerate_field_combine))
@@ -1386,6 +1425,7 @@ class HeatmapSettings:
         return {
             "enable_ifc_multiprocessing": bool(self.enable_ifc_multiprocessing),
             "max_ifc_loader_processes": int(self.max_ifc_loader_processes),
+            "max_ifc_loader_threads": int(self.max_ifc_loader_threads),
             "max_parallel_huge_ifc_processes": int(self.max_parallel_huge_ifc_processes),
             "enable_rf_multiprocessing": bool(self.enable_rf_multiprocessing),
             "max_rf_worker_processes": int(self.max_rf_worker_processes),
@@ -1409,6 +1449,8 @@ class HeatmapSettings:
             "precompute_reflection_candidates_per_tile": bool(self.precompute_reflection_candidates_per_tile),
             "enable_tile_influence_pruning": bool(self.enable_tile_influence_pruning),
             "tile_influence_margin_db": float(self.tile_influence_margin_db),
+            "enable_strongest_ap_early_exit": bool(self.enable_strongest_ap_early_exit),
+            "strongest_ap_early_exit_margin_db": float(self.strongest_ap_early_exit_margin_db),
             "enable_tile_local_geometry": bool(self.enable_tile_local_geometry),
             "multipath_relative_power_cutoff_db": float(self.multipath_relative_power_cutoff_db),
             "enable_numba_kernels": bool(self.enable_numba_rf_kernels),
@@ -1424,6 +1466,7 @@ class HeatmapSettings:
             "cuda_queue_depth": int(self.cuda_queue_depth),
             "cuda_max_barrier_checks_per_launch": int(self.cuda_max_barrier_checks_per_launch),
             "cuda_blocks_per_sm": int(self.cuda_blocks_per_sm),
+            "cuda_angular_bins": int(self.cuda_angular_bins),
             "numba_chunk_points": int(self.numba_chunk_points),
             "opencl_accelerate_influence": bool(self.opencl_accelerate_influence),
             "opencl_accelerate_field_combine": bool(self.opencl_accelerate_field_combine),
@@ -1473,6 +1516,7 @@ class HeatmapSettings:
             return
         self.enable_ifc_multiprocessing = bool(data.get("enable_ifc_multiprocessing", self.enable_ifc_multiprocessing))
         self.max_ifc_loader_processes = max(0, int(data.get("max_ifc_loader_processes", self.max_ifc_loader_processes)))
+        self.max_ifc_loader_threads = max(0, int(data.get("max_ifc_loader_threads", self.max_ifc_loader_threads)))
         self.max_parallel_huge_ifc_processes = max(1, int(data.get("max_parallel_huge_ifc_processes", self.max_parallel_huge_ifc_processes)))
         self.enable_rf_multiprocessing = bool(data.get("enable_rf_multiprocessing", self.enable_rf_multiprocessing))
         self.max_rf_worker_processes = max(0, int(data.get("max_rf_worker_processes", self.max_rf_worker_processes)))
@@ -1512,6 +1556,7 @@ class HeatmapSettings:
         self.cuda_queue_depth = max(1, min(8, int(data.get("cuda_queue_depth", self.cuda_queue_depth))))
         self.cuda_max_barrier_checks_per_launch = max(10000000, int(data.get("cuda_max_barrier_checks_per_launch", self.cuda_max_barrier_checks_per_launch)))
         self.cuda_blocks_per_sm = max(4, min(64, int(data.get("cuda_blocks_per_sm", self.cuda_blocks_per_sm))))
+        self.cuda_angular_bins = max(32, min(512, int(data.get("cuda_angular_bins", self.cuda_angular_bins))))
         self.numba_chunk_points = max(65536, int(data.get("numba_chunk_points", self.numba_chunk_points)))
         self.opencl_accelerate_influence = bool(data.get("opencl_accelerate_influence", self.opencl_accelerate_influence))
         self.opencl_accelerate_field_combine = bool(data.get("opencl_accelerate_field_combine", self.opencl_accelerate_field_combine))
@@ -1631,7 +1676,8 @@ class IFCModelLoader:
 
     def __init__(self, path: Path, dx: float = 0.0, dy: float = 0.0, dz: float = 0.0,
                  project_external_walls_across_floors: bool = True,
-                 external_wall_keywords: Optional[List[str]] = None):
+                 external_wall_keywords: Optional[List[str]] = None,
+                 geometry_threads: int = 0):
         if ifcopenshell is None:
             raise RuntimeError("ifcopenshell is not installed. Run: pip install ifcopenshell")
         self.path = path
@@ -1650,6 +1696,11 @@ class IFCModelLoader:
                 "external", "exterior", "outer", "facade", "façade", "curtain", "envelope", "perimeter"
             ]) if str(v).strip()
         ]
+        requested_threads = int(geometry_threads or 0)
+        self.geometry_threads = max(
+            1,
+            min(32, requested_threads if requested_threads > 0 else (os.cpu_count() or 1)),
+        )
         self.settings = ifcopenshell.geom.settings()
         self.settings.set(self.settings.USE_WORLD_COORDS, True)
 
@@ -1663,12 +1714,15 @@ class IFCModelLoader:
         element_guids: Optional[Iterable[str]] = None,
         storeys_override: Optional[Dict[str, float]] = None,
     ) -> Dict[str, FloorModel]:
-        """Load only selected wall/space GlobalIds.
+        """Load selected IFC objects using one batched native geometry pass.
 
-        This is used by the large-file multiprocessing path. Each worker
-        reopens the same IFC and extracts geometry only for its assigned
-        GlobalIds, while the initial index/storey pass remains lightweight.
+        IfcOpenShell/OCC startup and model parsing are expensive. The previous
+        large-file path reopened and rescanned the complete IFC for every small
+        GUID chunk, then tessellated most non-wall objects one at a time. This
+        loader resolves metadata once and sends walls, spaces and remaining
+        elements through a single multithreaded geometry iterator.
         """
+        started = time.perf_counter()
         storeys = dict(storeys_override or self._storeys())
         floors = {name: FloorModel(name=name, elevation=elev) for name, elev in storeys.items()}
         if not floors:
@@ -1677,30 +1731,72 @@ class IFCModelLoader:
         wanted_walls = set(wall_guids or [])
         wanted_spaces = set(space_guids or [])
         wanted_elements = set(element_guids or [])
-        filter_walls = bool(wall_guids is not None)
-        filter_spaces = bool(space_guids is not None)
-        filter_elements = bool(element_guids is not None)
+        filter_walls = wall_guids is not None
+        filter_spaces = space_guids is not None
+        filter_elements = element_guids is not None
 
         seen_wall_guids = set()
-        wall_entities = []
+        wall_entities: List[object] = []
         for wall in list(self.ifc.by_type("IfcWall")) + list(self.ifc.by_type("IfcWallStandardCase")):
-            guid = getattr(wall, "GlobalId", "") or ""
-            if guid in seen_wall_guids:
+            guid = str(getattr(wall, "GlobalId", "") or "")
+            if not guid or guid in seen_wall_guids:
                 continue
             seen_wall_guids.add(guid)
             if filter_walls and guid not in wanted_walls:
                 continue
             wall_entities.append(wall)
 
-        wall_geometry = self._plan_polygons_from_geometry_iterator(
-            wall_entities,
-            max_threads=(1 if filter_walls else min(8, os.cpu_count() or 1)),
+        handled_wall_guids = set(seen_wall_guids)
+        seen_element_guids = set()
+        element_entities: List[object] = []
+        for element in self.ifc.by_type("IfcElement"):
+            if element.is_a("IfcWall") or element.is_a("IfcWallStandardCase") or element.is_a("IfcOpeningElement"):
+                continue
+            guid = str(getattr(element, "GlobalId", "") or "")
+            if not guid or guid in handled_wall_guids or guid in seen_element_guids:
+                continue
+            seen_element_guids.add(guid)
+            if filter_elements and guid not in wanted_elements:
+                continue
+            element_entities.append(element)
+
+        seen_space_guids = set()
+        space_entities: List[object] = []
+        for space in self.ifc.by_type("IfcSpace"):
+            guid = str(getattr(space, "GlobalId", "") or "")
+            if not guid or guid in seen_space_guids:
+                continue
+            seen_space_guids.add(guid)
+            if filter_spaces and guid not in wanted_spaces:
+                continue
+            space_entities.append(space)
+
+        # Doors/windows usually expose reliable overall dimensions and placement.
+        # Avoiding their detailed symbolic meshes is especially valuable in large
+        # architectural models. All other products are tessellated in one iterator.
+        fast_element_geometry: Dict[str, Tuple[Polygon, float, float]] = {}
+        geometry_products: List[object] = list(wall_entities)
+        for element in element_entities:
+            guid = str(getattr(element, "GlobalId", "") or "")
+            fast = self._fast_panel_footprint(element)
+            if fast is not None:
+                fast_element_geometry[guid] = fast
+            else:
+                geometry_products.append(element)
+        geometry_products.extend(space_entities)
+
+        geometry_by_guid = self._plan_polygons_from_geometry_iterator(
+            geometry_products,
+            max_threads=self.geometry_threads,
         )
+
+        fallback_shapes = 0
         for wall in wall_entities:
-            guid = getattr(wall, "GlobalId", "") or ""
+            guid = str(getattr(wall, "GlobalId", "") or "")
             source_floor = self._container_storey_name(wall)
-            geom = wall_geometry.get(guid)
+            geom = geometry_by_guid.get(guid)
             if geom is None:
+                fallback_shapes += 1
                 geom = self._plan_polygon_from_geometry(wall)
             if geom is None:
                 continue
@@ -1734,17 +1830,13 @@ class IFCModelLoader:
                     )
                 )
 
-        handled_wall_guids = set(seen_wall_guids)
-        for element in self.ifc.by_type("IfcElement"):
-            if element.is_a("IfcWall") or element.is_a("IfcWallStandardCase") or element.is_a("IfcOpeningElement"):
-                continue
-            guid = getattr(element, "GlobalId", "") or ""
-            if not guid or guid in handled_wall_guids:
-                continue
-            if filter_elements and guid not in wanted_elements:
-                continue
+        for element in element_entities:
+            guid = str(getattr(element, "GlobalId", "") or "")
             source_floor = self._container_storey_name(element)
-            geom = self._plan_polygon_from_element(element)
+            geom = fast_element_geometry.get(guid) or geometry_by_guid.get(guid)
+            if geom is None:
+                fallback_shapes += 1
+                geom = self._plan_polygon_from_geometry(element)
             if geom is None:
                 continue
             poly, z_min, z_max = geom
@@ -1786,32 +1878,40 @@ class IFCModelLoader:
                     )
                 )
 
-        for space in self.ifc.by_type("IfcSpace"):
-            guid = getattr(space, "GlobalId", "") or ""
-            if filter_spaces and guid not in wanted_spaces:
-                continue
+        for space in space_entities:
+            guid = str(getattr(space, "GlobalId", "") or "")
             source_floor = self._container_storey_name(space)
-            geom = self._plan_polygon_from_geometry(space)
+            geom = geometry_by_guid.get(guid)
+            if geom is None:
+                fallback_shapes += 1
+                geom = self._plan_polygon_from_geometry(space)
             if geom is None:
                 continue
             poly, z_min, z_max = geom
             if poly is None or poly.area <= 0:
                 continue
             assigned_floor = self._assigned_floor_name(space, floors, z_min, z_max, source_floor)
-            floor_names = [assigned_floor]
-            for floor_name in floor_names:
-                floors.setdefault(floor_name, FloorModel(name=floor_name, elevation=0.0)).spaces.append(
-                    Space2D(
-                        guid=guid,
-                        name=getattr(space, "LongName", None) or getattr(space, "Name", "") or "Space",
-                        floor=floor_name,
-                        source_file=self.path.name,
-                        polygon=poly,
-                        z_min=z_min,
-                        z_max=z_max,
-                        source_storey=source_floor or "",
-                    )
+            floors.setdefault(assigned_floor, FloorModel(name=assigned_floor, elevation=0.0)).spaces.append(
+                Space2D(
+                    guid=guid,
+                    name=getattr(space, "LongName", None) or getattr(space, "Name", "") or "Space",
+                    floor=assigned_floor,
+                    source_file=self.path.name,
+                    polygon=poly,
+                    z_min=z_min,
+                    z_max=z_max,
+                    source_storey=source_floor or "",
                 )
+            )
+
+        self.load_stats = {
+            "elapsed_seconds": float(time.perf_counter() - started),
+            "geometry_threads": int(self.geometry_threads),
+            "batched_products": int(len(geometry_products)),
+            "iterator_shapes": int(len(geometry_by_guid)),
+            "fast_panel_shapes": int(len(fast_element_geometry)),
+            "fallback_shapes": int(fallback_shapes),
+        }
         return floors
 
     def _storeys(self) -> Dict[str, float]:
@@ -1952,18 +2052,66 @@ class IFCModelLoader:
 
     @staticmethod
     def _plan_polygon_from_vertices(verts: np.ndarray) -> Optional[Tuple[Polygon, float, float]]:
-        z_min = float(np.min(verts[:, 2]))
-        z_max = float(np.max(verts[:, 2]))
-        xy = verts[:, :2]
-        # Use oriented min rectangle if possible; it is more useful than axis-aligned bbox.
-        hull = Polygon(xy).convex_hull
-        if hull.is_empty:
+        """Create a compact plan footprint without convex-hulling huge meshes.
+
+        Detailed IFC objects can contain tens of thousands of tessellated
+        vertices. Their RF/display representation is already an oriented
+        rectangle, so a NumPy PCA bounding rectangle gives the same practical
+        abstraction in linear time and avoids an expensive Shapely hull.
+        """
+        verts = np.asarray(verts)
+        if verts.ndim != 2 or verts.shape[0] == 0 or verts.shape[1] < 3:
             return None
-        rect = hull.minimum_rotated_rectangle
-        if rect.area <= 0:
-            minx, miny = xy.min(axis=0)
-            maxx, maxy = xy.max(axis=0)
+        z_values = np.asarray(verts[:, 2], dtype=np.float64)
+        finite_z = z_values[np.isfinite(z_values)]
+        if finite_z.size == 0:
+            return None
+        z_min = float(np.min(finite_z))
+        z_max = float(np.max(finite_z))
+        xy = np.asarray(verts[:, :2], dtype=np.float64)
+        xy = xy[np.isfinite(xy).all(axis=1)]
+        if xy.shape[0] == 0:
+            return None
+
+        # Small meshes are cheap enough to preserve the previous minimum-area
+        # rectangle. Large meshes use PCA and avoid constructing a huge GEOS hull.
+        if xy.shape[0] <= 96:
+            try:
+                hull = Polygon(xy).convex_hull
+                if hull.is_empty:
+                    return None
+                rect = hull.minimum_rotated_rectangle
+                if rect.area > 0:
+                    return rect, z_min, z_max
+            except Exception:
+                pass
+
+        centre = np.mean(xy, axis=0)
+        centred = xy - centre
+        try:
+            covariance = centred.T @ centred
+            eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+            order = np.argsort(eigenvalues)[::-1]
+            axes = eigenvectors[:, order]
+            if not np.isfinite(axes).all() or abs(float(np.linalg.det(axes))) < 1.0e-8:
+                raise ValueError("degenerate PCA axes")
+            projected = centred @ axes
+            mins = np.min(projected, axis=0)
+            maxs = np.max(projected, axis=0)
+            corners_local = np.array([
+                [mins[0], mins[1]],
+                [maxs[0], mins[1]],
+                [maxs[0], maxs[1]],
+                [mins[0], maxs[1]],
+            ], dtype=np.float64)
+            corners = corners_local @ axes.T + centre
+            rect = Polygon(corners)
+        except Exception:
+            minx, miny = np.min(xy, axis=0)
+            maxx, maxy = np.max(xy, axis=0)
             rect = Polygon([(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy)])
+        if rect.is_empty or float(rect.area) <= 1.0e-12:
+            return None
         return rect, z_min, z_max
 
     def _plan_polygon_from_element(self, product) -> Optional[Tuple[Polygon, float, float]]:
@@ -3562,6 +3710,10 @@ class RFEngine:
                 getattr(settings, "enable_quick_rssi_cutoff", False),
                 getattr(settings, "quick_rssi_cutoff_dbm", -80.0),
             ],
+            "strongest_ap_early_exit": [
+                getattr(settings, "enable_strongest_ap_early_exit", True),
+                getattr(settings, "strongest_ap_early_exit_margin_db", 12.0),
+            ],
             "adaptive": [
                 getattr(settings, "enable_adaptive_rf_grid", True),
                 getattr(settings, "adaptive_coarse_resolution_m", 3.0),
@@ -3625,6 +3777,10 @@ class RFEngine:
         envelope,
     ):
         """Build compact STRtrees containing only objects in an AP-to-tile envelope."""
+        try:
+            from shapely.strtree import STRtree
+        except Exception:
+            return wall_indexes, opening_indexes
         local_walls = {}
         local_openings = {}
         for floor_name in floor_names:
@@ -3871,7 +4027,17 @@ class RFEngine:
             accelerated = None
             try:
                 if gpu_enabled:
-                    accelerated = gpu_direct_rssi_grid(xs, ys, ap_rows, segments, valid, disconnected, combine_mode, heatmap_settings)
+                    def gpu_group_progress(done, total, *, _index=index):
+                        if progress_callback:
+                            progress_callback(
+                                float(_index) + (float(done) / max(1.0, float(total))),
+                                float(total_groups),
+                            )
+
+                    accelerated = gpu_direct_rssi_grid(
+                        xs, ys, ap_rows, segments, valid, disconnected, combine_mode,
+                        heatmap_settings, progress_callback=gpu_group_progress,
+                    )
             except GPUExecutionError:
                 # A selected/detected GPU failed. In forced mode this is a real
                 # calculation error and must not be hidden by CPU fallback.
@@ -5080,7 +5246,9 @@ def _logical_process_count(requested_count: int = 0) -> int:
 
 def _load_ifc_file_in_process(args):
     """Top-level IFC worker so it is pickleable on Windows spawn."""
-    path_str, dx, dy, dz, project_external_walls, external_keywords = args
+    started = time.perf_counter()
+    path_str, dx, dy, dz, project_external_walls, external_keywords = args[:6]
+    geometry_threads = int(args[6]) if len(args) > 6 else 0
     path = Path(path_str)
     loader = IFCModelLoader(
         path,
@@ -5089,6 +5257,7 @@ def _load_ifc_file_in_process(args):
         float(dz),
         project_external_walls_across_floors=bool(project_external_walls),
         external_wall_keywords=list(external_keywords or []),
+        geometry_threads=geometry_threads,
     )
     floors = loader.load()
     origin_info = _extract_ifc_origin_information(loader.ifc, path)
@@ -5136,7 +5305,7 @@ def _load_ifc_geometry_chunk_in_process(args):
     """Extract geometry for one GlobalId chunk from a large IFC file."""
     (
         path_str, dx, dy, dz, project_external_walls, external_keywords,
-        storeys, wall_guids, space_guids, element_guids, chunk_index, chunk_count,
+        storeys, wall_guids, space_guids, element_guids, chunk_index, chunk_count, *optional,
     ) = args
     path = Path(path_str)
     floors = IFCModelLoader(
@@ -5146,6 +5315,7 @@ def _load_ifc_geometry_chunk_in_process(args):
         float(dz),
         project_external_walls_across_floors=bool(project_external_walls),
         external_wall_keywords=list(external_keywords or []),
+        geometry_threads=(int(optional[0]) if optional else 1),
     ).load_filtered(
         wall_guids=list(wall_guids or []),
         space_guids=list(space_guids or []),
@@ -5297,7 +5467,18 @@ def _rf_grid_multi_tile_worker(args):
     # Vectorised unobstructed upper-bound masks remove AP/radio links that cannot
     # contribute even before any Shapely intersection or ray work starts.
     influence_masks: Dict[Tuple[int, int], np.ndarray] = {}
-    if bool(getattr(heatmap_settings, "enable_tile_influence_pruning", True)):
+    influence_upper_bounds: Dict[Tuple[int, int], np.ndarray] = {}
+    combination_mode = str(getattr(heatmap_settings, "combined_ap_mode", "strongest") or "strongest").lower()
+    strongest_early_exit = (
+        combination_mode != "power_sum"
+        and bool(getattr(heatmap_settings, "enable_strongest_ap_early_exit", True))
+    )
+    strongest_early_exit_margin = max(
+        0.0,
+        float(getattr(heatmap_settings, "strongest_ap_early_exit_margin_db", 12.0) or 0.0),
+    )
+    if bool(getattr(heatmap_settings, "enable_tile_influence_pruning", True)) or strongest_early_exit:
+        grid_xx = grid_yy = None
         for group_index, key in enumerate(group_order):
             for link_index, (ap, radio) in enumerate(radio_links_by_group.get(key, [])):
                 ap_floor = floors.get(ap.floor)
@@ -5315,6 +5496,7 @@ def _rf_grid_multi_tile_worker(args):
                     ap.path_loss_exponent, eirp,
                     bool(getattr(heatmap_settings, "enable_numba_rf_kernels", True)),
                 )
+                influence_upper_bounds[(group_index, link_index)] = upper
                 absolute_cutoff = (
                     float(getattr(heatmap_settings, "quick_rssi_cutoff_dbm", -80.0))
                     if bool(getattr(heatmap_settings, "enable_quick_rssi_cutoff", False))
@@ -5329,8 +5511,9 @@ def _rf_grid_multi_tile_worker(args):
                 mask = upper >= cutoff
                 radius = RFEngine.cutoff_radius_m_for_radio(radio, heatmap_settings)
                 if radius > 0.0:
-                    xx, yy = np.meshgrid(xs, ys_slice)
-                    mask &= ((xx - ap.x) ** 2 + (yy - ap.y) ** 2 + dz * dz) <= radius * radius
+                    if grid_xx is None or grid_yy is None:
+                        grid_xx, grid_yy = np.meshgrid(xs, ys_slice)
+                    mask &= ((grid_xx - ap.x) ** 2 + (grid_yy - ap.y) ** 2 + dz * dz) <= radius * radius
                 influence_masks[(group_index, link_index)] = mask
 
     tile_bounds = (
@@ -5404,27 +5587,68 @@ def _rf_grid_multi_tile_worker(args):
                     getattr(heatmap_settings, "reuse_path_geometry_across_frequencies", True)
                 ) else None
                 for group_index, key in enumerate(group_order):
-                    samples: List[PropagationSample] = []
-                    for link_index, (ap, radio) in enumerate(radio_links_by_group.get(key, [])):
-                        influence = influence_masks.get((group_index, link_index))
-                        if influence is not None and not bool(influence[iy, ix]):
-                            continue
-                        if not RFEngine.point_is_inside_radio_cutoff(
-                            xx_value, yy_value, floor, ap, floors, radio, heatmap_settings
-                        ):
-                            continue
-                        ap_key = (str(ap.name), round(float(ap.x), 5), round(float(ap.y), 5))
-                        local_wall_indexes, local_opening_indexes = local_indexes_by_ap.get(
-                            ap_key, (wall_indexes, opening_indexes)
-                        )
-                        samples.append(RFEngine.propagation_at(
-                            xx_value, yy_value, floor, ap, floors, patterns, radio,
-                            include_inter_floor, heatmap_settings, local_wall_indexes,
-                            local_opening_indexes, reflection_indexes, geometry_cache,
-                            reflection_subsets.get(ap_key),
-                            reflection_sequences_by_ap.get(ap_key),
-                        ))
-                    combined = RFEngine.combine_ap_samples(samples, heatmap_settings, float(disconnected))
+                    links = radio_links_by_group.get(key, [])
+                    if strongest_early_exit:
+                        link_records = []
+                        for link_index, link in enumerate(links):
+                            influence = influence_masks.get((group_index, link_index))
+                            if influence is not None and not bool(influence[iy, ix]):
+                                continue
+                            upper_grid = influence_upper_bounds.get((group_index, link_index))
+                            upper_value = (
+                                float(upper_grid[iy, ix])
+                                if upper_grid is not None and np.isfinite(upper_grid[iy, ix])
+                                else float("inf")
+                            )
+                            link_records.append((upper_value, link_index, link))
+                        link_records.sort(key=lambda item: item[0], reverse=True)
+                        best_sample: Optional[PropagationSample] = None
+                        best_rssi = -float("inf")
+                        for upper_value, link_index, (ap, radio) in link_records:
+                            if best_sample is not None and np.isfinite(upper_value):
+                                if upper_value + strongest_early_exit_margin <= best_rssi:
+                                    break
+                            if not RFEngine.point_is_inside_radio_cutoff(
+                                xx_value, yy_value, floor, ap, floors, radio, heatmap_settings
+                            ):
+                                continue
+                            ap_key = (str(ap.name), round(float(ap.x), 5), round(float(ap.y), 5))
+                            local_wall_indexes, local_opening_indexes = local_indexes_by_ap.get(
+                                ap_key, (wall_indexes, opening_indexes)
+                            )
+                            sample = RFEngine.propagation_at(
+                                xx_value, yy_value, floor, ap, floors, patterns, radio,
+                                include_inter_floor, heatmap_settings, local_wall_indexes,
+                                local_opening_indexes, reflection_indexes, geometry_cache,
+                                reflection_subsets.get(ap_key),
+                                reflection_sequences_by_ap.get(ap_key),
+                            )
+                            if best_sample is None or sample.rssi_dbm > best_rssi:
+                                best_sample = sample
+                                best_rssi = float(sample.rssi_dbm)
+                        combined = best_sample or PropagationSample(float(disconnected), 0.0, 0, float(disconnected))
+                    else:
+                        samples: List[PropagationSample] = []
+                        for link_index, (ap, radio) in enumerate(links):
+                            influence = influence_masks.get((group_index, link_index))
+                            if influence is not None and not bool(influence[iy, ix]):
+                                continue
+                            if not RFEngine.point_is_inside_radio_cutoff(
+                                xx_value, yy_value, floor, ap, floors, radio, heatmap_settings
+                            ):
+                                continue
+                            ap_key = (str(ap.name), round(float(ap.x), 5), round(float(ap.y), 5))
+                            local_wall_indexes, local_opening_indexes = local_indexes_by_ap.get(
+                                ap_key, (wall_indexes, opening_indexes)
+                            )
+                            samples.append(RFEngine.propagation_at(
+                                xx_value, yy_value, floor, ap, floors, patterns, radio,
+                                include_inter_floor, heatmap_settings, local_wall_indexes,
+                                local_opening_indexes, reflection_indexes, geometry_cache,
+                                reflection_subsets.get(ap_key),
+                                reflection_sequences_by_ap.get(ap_key),
+                            ))
+                        combined = RFEngine.combine_ap_samples(samples, heatmap_settings, float(disconnected))
                     if shared_specs:
                         rssi_stack[group_index, global_iy, ix] = combined.rssi_dbm
                         delay_stack[group_index, global_iy, ix] = combined.delay_spread_ns
@@ -5900,7 +6124,10 @@ class BulkAccessPointDialog(QDialog):
             self.fields[key] = (check, widget)
             form.addRow(check, widget)
 
-        ap_type = QComboBox(); ap_type.addItems(list(AP_TYPE_PRESETS.keys()))
+        ap_type = QComboBox()
+        for ap_type_name, definition in AP_TYPE_PRESETS.items():
+            ap_type.addItem(_access_point_type_icon(ap_type_name, 28), ap_type_name)
+            ap_type.setItemData(ap_type.count() - 1, definition.get("description", ""), Qt.ToolTipRole)
         add_field("ap_type", "AP type / symbol", ap_type)
         radio_profile = QComboBox(); radio_profile.addItem("Project default radios"); radio_profile.addItems(list(RADIO_PROFILE_PRESETS.keys()))
         add_field("radio_profile", "Replace radio profile", radio_profile)
@@ -6197,6 +6424,7 @@ class RFPerformanceSettingsDialog(QDialog):
             self.profile,
             self.rf_workers,
             self.ifc_workers,
+            self.ifc_geometry_threads,
             self.boundary_filter,
             self.render_mode,
             self.progressive_updates,
@@ -6210,6 +6438,7 @@ class RFPerformanceSettingsDialog(QDialog):
             self.enable_opencl,
             self.opencl_device,
             self.opencl_min_work,
+            self.cuda_angular_bins,
         ):
             if isinstance(widget, QComboBox):
                 widget.currentIndexChanged.connect(self._update_summary)
@@ -6282,7 +6511,16 @@ class RFPerformanceSettingsDialog(QDialog):
         form.addRow(self.enable_ifc_mp)
         self.ifc_workers = self._automatic_spin(64)
         self.ifc_workers.setValue(int(settings.max_ifc_loader_processes))
-        form.addRow("Maximum IFC loader processes", self.ifc_workers)
+        self.ifc_workers.setToolTip(
+            "Use one process per IFC file. A single large IFC is parsed once and uses native geometry threads instead of being reopened in many processes."
+        )
+        form.addRow("Maximum IFC file processes", self.ifc_workers)
+        self.ifc_geometry_threads = self._automatic_spin(32)
+        self.ifc_geometry_threads.setValue(int(getattr(settings, "max_ifc_loader_threads", 0)))
+        self.ifc_geometry_threads.setToolTip(
+            "Native IfcOpenShell geometry threads used inside each file process. Automatic divides logical CPU cores across concurrently loaded IFC files."
+        )
+        form.addRow("Geometry threads per IFC file", self.ifc_geometry_threads)
         self.huge_ifc_workers = QSpinBox()
         self.huge_ifc_workers.setRange(1, 8)
         self.huge_ifc_workers.setValue(int(settings.max_parallel_huge_ifc_processes))
@@ -6519,6 +6757,14 @@ class RFPerformanceSettingsDialog(QDialog):
             "Used only when force-GPU mode is disabled. Force mode launches CUDA/OpenCL for every eligible stage."
         )
         form.addRow("Minimum GPU work items", self.opencl_min_work)
+        self.cuda_angular_bins = QSpinBox()
+        self.cuda_angular_bins.setRange(32, 512)
+        self.cuda_angular_bins.setSingleStep(32)
+        self.cuda_angular_bins.setValue(int(getattr(settings, "cuda_angular_bins", 128)))
+        self.cuda_angular_bins.setToolTip(
+            "AP-relative barrier direction bins used by the fused CUDA RSSI kernel. 128 is a balanced default; larger values reduce candidate wall checks but use more index memory."
+        )
+        form.addRow("CUDA barrier angular bins", self.cuda_angular_bins)
 
         self.opencl_influence = QCheckBox("GPU whole-grid AP influence and cutoff pruning")
         self.opencl_influence.setChecked(bool(settings.opencl_accelerate_influence))
@@ -6588,7 +6834,7 @@ class RFPerformanceSettingsDialog(QDialog):
     def _update_enabled_state(self, *_):
         for widget in (self.rf_workers, self.rf_min_points, self.tile_rows, self.tiles_per_worker, self.reuse_pool, self.worker_index_cache):
             widget.setEnabled(self.enable_rf_mp.isChecked())
-        for widget in (self.ifc_workers, self.huge_ifc_workers):
+        for widget in (self.ifc_workers, self.ifc_geometry_threads, self.huge_ifc_workers):
             widget.setEnabled(self.enable_ifc_mp.isChecked())
         for widget in (self.coarse_resolution, self.gradient_threshold, self.threshold_margin, self.geometry_buffer, self.ap_refine_radius):
             widget.setEnabled(self.adaptive_grid.isChecked())
@@ -6606,6 +6852,7 @@ class RFPerformanceSettingsDialog(QDialog):
         for widget in (self.force_gpu, self.opencl_device, self.opencl_allow_cpu, self.opencl_influence, self.opencl_combine, self.opencl_resample, self.opencl_raster):
             widget.setEnabled(self.enable_opencl.isChecked())
         self.opencl_min_work.setEnabled(self.enable_opencl.isChecked() and not self.force_gpu.isChecked())
+        self.cuda_angular_bins.setEnabled(self.enable_opencl.isChecked())
         self._update_summary()
 
     def _apply_laptop_preset(self):
@@ -6613,7 +6860,8 @@ class RFPerformanceSettingsDialog(QDialog):
         self.enable_rf_mp.setChecked(True)
         self.rf_workers.setValue(4)
         self.enable_ifc_mp.setChecked(True)
-        self.ifc_workers.setValue(4)
+        self.ifc_workers.setValue(2)
+        self.ifc_geometry_threads.setValue(0)
         self.huge_ifc_workers.setValue(1)
         self.boundary_filter.setChecked(True)
         self.adaptive_grid.setChecked(True)
@@ -6643,6 +6891,7 @@ class RFPerformanceSettingsDialog(QDialog):
         self.force_gpu.setChecked(True)
         self.opencl_device.setCurrentIndex(max(0, self.opencl_device.findData("auto")))
         self.opencl_min_work.setValue(1)
+        self.cuda_angular_bins.setValue(128)
         self._update_enabled_state()
 
     def _apply_automatic_preset(self):
@@ -6657,6 +6906,7 @@ class RFPerformanceSettingsDialog(QDialog):
         self.worker_index_cache.setValue(defaults.rf_worker_index_cache_entries)
         self.enable_ifc_mp.setChecked(True)
         self.ifc_workers.setValue(0)
+        self.ifc_geometry_threads.setValue(0)
         self.huge_ifc_workers.setValue(1)
         self.adaptive_grid.setChecked(True)
         self.coarse_resolution.setValue(3.0)
@@ -6682,6 +6932,7 @@ class RFPerformanceSettingsDialog(QDialog):
         self.force_gpu.setChecked(True)
         self.opencl_device.setCurrentIndex(max(0, self.opencl_device.findData("auto")))
         self.opencl_min_work.setValue(1)
+        self.cuda_angular_bins.setValue(128)
         self._update_enabled_state()
 
     def _apply_fast_preset(self):
@@ -6699,13 +6950,14 @@ class RFPerformanceSettingsDialog(QDialog):
     def _update_summary(self, *_):
         rf_workers = "automatic" if self.rf_workers.value() == 0 else str(self.rf_workers.value())
         ifc_workers = "automatic" if self.ifc_workers.value() == 0 else str(self.ifc_workers.value())
+        ifc_threads = "automatic" if self.ifc_geometry_threads.value() == 0 else str(self.ifc_geometry_threads.value())
         boundary = "on" if self.boundary_filter.isChecked() else "off"
         gpu = "off" if not self.enable_opencl.isChecked() else ("forced " if self.force_gpu.isChecked() else "threshold ") + str(self.opencl_device.currentText())
         warning = ""
         if self.boundary_filter.isChecked() and not self._has_planner_boundaries:
             warning = " Boundary limiting is selected, but this project currently contains no planner boundaries."
         self.summary.setText(
-            f"Current selection: {self.profile.currentText()}, RF workers {rf_workers}, IFC workers {ifc_workers}, "
+            f"Current selection: {self.profile.currentText()}, RF workers {rf_workers}, IFC file processes {ifc_workers}, geometry threads {ifc_threads}, "
             f"{self.render_mode.currentText().lower()}, boundary filter {boundary}, "
             f"quick cutoff {self.quick_cutoff_dbm.value():.0f} dBm if enabled, GPU {gpu}." + warning
         )
@@ -6725,6 +6977,7 @@ class RFPerformanceSettingsDialog(QDialog):
         settings.rf_worker_index_cache_entries = int(self.worker_index_cache.value())
         settings.enable_ifc_multiprocessing = self.enable_ifc_mp.isChecked()
         settings.max_ifc_loader_processes = int(self.ifc_workers.value())
+        settings.max_ifc_loader_threads = int(self.ifc_geometry_threads.value())
         settings.max_parallel_huge_ifc_processes = int(self.huge_ifc_workers.value())
         settings.ignore_results_outside_planner_boundaries = self.boundary_filter.isChecked()
         settings.enable_adaptive_rf_grid = self.adaptive_grid.isChecked()
@@ -6748,6 +7001,7 @@ class RFPerformanceSettingsDialog(QDialog):
         settings.opencl_device_preference = str(self.opencl_device.currentData() or "auto")
         settings.opencl_allow_cpu_device = self.opencl_allow_cpu.isChecked()
         settings.opencl_min_work_items = int(self.opencl_min_work.value())
+        settings.cuda_angular_bins = int(self.cuda_angular_bins.value())
         settings.opencl_accelerate_influence = self.opencl_influence.isChecked()
         settings.opencl_accelerate_field_combine = self.opencl_combine.isChecked()
         settings.opencl_accelerate_resampling = self.opencl_resample.isChecked()
@@ -6922,7 +7176,7 @@ class RSSISimulationSelectionDialog(QDialog):
 
 
 class PlannerRunSelectionDialog(QDialog):
-    """Choose floors and planner radio definitions for predictive placement."""
+    """Choose floors, physical AP type and planner radios for predictive placement."""
 
     def __init__(
         self,
@@ -6930,17 +7184,18 @@ class PlannerRunSelectionDialog(QDialog):
         floor_items: Sequence[Tuple[str, FloorModel]],
         radio_items: Sequence[Tuple[int, PlannerRadioRequirement]],
         current_floor_name: str = "",
+        current_ap_type: str = "Ceiling AP",
     ):
         super().__init__(parent)
-        self.setWindowTitle("Predict AP locations - floors and radios")
-        self.resize(820, 600)
+        self.setWindowTitle("Predict AP locations - floors, AP type and radios")
+        self.resize(1160, 680)
         self._current_floor_name = str(current_floor_name or "")
 
         layout = QVBoxLayout(self)
         intro = QLabel(
-            "Select the floors to plan and the radio definitions to install in each predicted AP. "
-            "A planned AP can contain several selected radios operating at different frequencies. "
-            "Coverage, handover and client-capacity targets are evaluated independently on each floor."
+            "Select the floors to plan, the physical access-point type to place, and the radio definitions "
+            "fitted to every predicted AP. A planned AP can contain several radios operating at different "
+            "frequencies. Coverage, handover and client-capacity targets are evaluated independently on each floor."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -6974,8 +7229,34 @@ class PlannerRunSelectionDialog(QDialog):
         floor_column.addLayout(floor_buttons)
         columns.addLayout(floor_column, 1)
 
+        type_column = QVBoxLayout()
+        type_column.addWidget(QLabel("Access-point type and drawing symbol"))
+        self.ap_type_list = QListWidget()
+        self.ap_type_list.setAlternatingRowColors(True)
+        self.ap_type_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.ap_type_list.setIconSize(QSize(40, 40))
+        current_type = str(current_ap_type or "Ceiling AP")
+        current_row = 0
+        for row, (ap_type, definition) in enumerate(AP_TYPE_PRESETS.items()):
+            description = str(definition.get("description", ""))
+            pattern = str(definition.get("pattern", ""))
+            item = QListWidgetItem(_access_point_type_icon(ap_type, 40), ap_type)
+            item.setData(Qt.UserRole, ap_type)
+            item.setToolTip(f"{description}\nDefault pattern: {pattern}")
+            self.ap_type_list.addItem(item)
+            if ap_type == current_type:
+                current_row = row
+        if self.ap_type_list.count():
+            self.ap_type_list.setCurrentRow(current_row)
+        type_column.addWidget(self.ap_type_list, 1)
+        self.ap_type_description = QLabel()
+        self.ap_type_description.setWordWrap(True)
+        self.ap_type_description.setMinimumHeight(62)
+        type_column.addWidget(self.ap_type_description)
+        columns.addLayout(type_column, 1)
+
         radio_column = QVBoxLayout()
-        radio_column.addWidget(QLabel("Radios fitted to predicted APs"))
+        radio_column.addWidget(QLabel("Radios fitted to each predicted AP"))
         self.radio_list = QListWidget()
         self.radio_list.setAlternatingRowColors(True)
         for source_index, requirement in radio_items:
@@ -7005,11 +7286,13 @@ class PlannerRunSelectionDialog(QDialog):
         layout.addWidget(self.summary)
         self.floor_list.itemChanged.connect(self._update_summary)
         self.radio_list.itemChanged.connect(self._update_summary)
+        self.ap_type_list.currentItemChanged.connect(self._ap_type_changed)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        self._ap_type_changed(self.ap_type_list.currentItem(), None)
         self._update_summary()
 
     def _set_all_checked(self, list_widget: QListWidget, checked: bool):
@@ -7036,6 +7319,16 @@ class PlannerRunSelectionDialog(QDialog):
             self.floor_list.item(0).setCheckState(Qt.Checked)
         self._update_summary()
 
+    def _ap_type_changed(self, current, _previous):
+        ap_type = str(current.data(Qt.UserRole)) if current is not None else ""
+        definition = AP_TYPE_PRESETS.get(ap_type, {})
+        description = str(definition.get("description", "Select the physical AP type to place."))
+        pattern = str(definition.get("pattern", ""))
+        self.ap_type_description.setText(
+            description + (f"\nDefault symbol profile: {pattern}." if pattern else "")
+        )
+        self._update_summary()
+
     def selected_floor_names(self) -> List[str]:
         return [
             str(self.floor_list.item(index).data(Qt.UserRole))
@@ -7050,17 +7343,27 @@ class PlannerRunSelectionDialog(QDialog):
             if self.radio_list.item(index).checkState() == Qt.Checked
         ]
 
+    def selected_ap_type(self) -> str:
+        item = self.ap_type_list.currentItem()
+        ap_type = str(item.data(Qt.UserRole)) if item is not None else ""
+        return ap_type if ap_type in AP_TYPE_PRESETS else "Ceiling AP"
+
     def _update_summary(self, *_):
         floor_count = len(self.selected_floor_names())
         radio_count = len(self.selected_radio_indices())
+        ap_type = self.selected_ap_type()
         self.summary.setText(
             f"Selected: {floor_count} floor{'s' if floor_count != 1 else ''}; "
-            f"each predicted AP will contain {radio_count} radio{'s' if radio_count != 1 else ''}."
+            f"AP type: {ap_type}; each predicted AP will contain "
+            f"{radio_count} radio{'s' if radio_count != 1 else ''}."
         )
 
     def accept(self):
         if not self.selected_floor_names():
             QMessageBox.warning(self, "No floors selected", "Select at least one floor for AP prediction.")
+            return
+        if not self.selected_ap_type():
+            QMessageBox.warning(self, "No AP type selected", "Select an access-point type.")
             return
         if not self.selected_radio_indices():
             QMessageBox.warning(self, "No radios selected", "Select at least one planner radio.")
@@ -7923,19 +8226,26 @@ class APSpacePlacementDialog(QDialog):
 
 def _access_point_symbol_path(ap_type: str, radius: float) -> QPainterPath:
     definition = AP_TYPE_PRESETS.get(ap_type, AP_TYPE_PRESETS["Ceiling AP"])
-    symbol = definition.get("symbol", "circle_cross")
+    symbol = str(definition.get("symbol", "circle_cross"))
     r = float(radius)
     path = QPainterPath()
     if symbol == "square":
         path.addRect(-r, -r, 2.0 * r, 2.0 * r)
         path.moveTo(-r, 0.0); path.lineTo(r, 0.0)
+    elif symbol == "rounded_square":
+        path.addRoundedRect(-r, -r, 2.0 * r, 2.0 * r, 0.32 * r, 0.32 * r)
+        path.moveTo(0.0, -0.62 * r); path.lineTo(0.0, 0.62 * r)
+        path.moveTo(-0.42 * r, 0.0); path.lineTo(0.42 * r, 0.0)
     elif symbol == "triangle":
         path.moveTo(r, 0.0); path.lineTo(-0.75 * r, 0.85 * r); path.lineTo(-0.75 * r, -0.85 * r); path.closeSubpath()
-    elif symbol == "hexagon":
+    elif symbol == "hexagon" or symbol == "arrow_hex":
         points = [QPointF(r * math.cos(math.radians(a)), r * math.sin(math.radians(a))) for a in range(0, 360, 60)]
         path.moveTo(points[0])
         for point in points[1:]: path.lineTo(point)
         path.closeSubpath()
+        if symbol == "arrow_hex":
+            path.moveTo(-0.52 * r, 0.0); path.lineTo(0.55 * r, 0.0)
+            path.moveTo(0.18 * r, -0.34 * r); path.lineTo(0.58 * r, 0.0); path.lineTo(0.18 * r, 0.34 * r)
     elif symbol == "octagon":
         points = [QPointF(r * math.cos(math.radians(22.5 + a)), r * math.sin(math.radians(22.5 + a))) for a in range(0, 360, 45)]
         path.moveTo(points[0])
@@ -7948,11 +8258,71 @@ def _access_point_symbol_path(ap_type: str, radius: float) -> QPainterPath:
     elif symbol == "double_circle":
         path.addEllipse(-r, -r, 2.0 * r, 2.0 * r)
         path.addEllipse(-0.5 * r, -0.5 * r, r, r)
+    elif symbol == "ring_dot":
+        path.addEllipse(-r, -r, 2.0 * r, 2.0 * r)
+        path.addEllipse(-0.17 * r, -0.17 * r, 0.34 * r, 0.34 * r)
+    elif symbol == "star_circle":
+        path.addEllipse(-r, -r, 2.0 * r, 2.0 * r)
+        for angle in range(0, 360, 45):
+            rad = math.radians(angle)
+            path.moveTo(0.28 * r * math.cos(rad), 0.28 * r * math.sin(rad))
+            path.lineTo(0.75 * r * math.cos(rad), 0.75 * r * math.sin(rad))
+    elif symbol == "mesh":
+        path.addEllipse(-r, -r, 2.0 * r, 2.0 * r)
+        nodes = [
+            QPointF(0.0, -0.55 * r),
+            QPointF(-0.5 * r, 0.36 * r),
+            QPointF(0.5 * r, 0.36 * r),
+        ]
+        path.moveTo(nodes[0]); path.lineTo(nodes[1]); path.lineTo(nodes[2]); path.closeSubpath()
+        for node in nodes:
+            path.addEllipse(node.x() - 0.12 * r, node.y() - 0.12 * r, 0.24 * r, 0.24 * r)
+    elif symbol == "bowtie":
+        path.moveTo(-r, -0.75 * r); path.lineTo(0.0, 0.0); path.lineTo(-r, 0.75 * r); path.closeSubpath()
+        path.moveTo(r, -0.75 * r); path.lineTo(0.0, 0.0); path.lineTo(r, 0.75 * r); path.closeSubpath()
+        path.addEllipse(-0.14 * r, -0.14 * r, 0.28 * r, 0.28 * r)
+    elif symbol == "antenna":
+        path.moveTo(0.0, 0.85 * r); path.lineTo(0.0, -0.35 * r)
+        path.moveTo(-0.42 * r, 0.85 * r); path.lineTo(0.42 * r, 0.85 * r)
+        path.addEllipse(-0.13 * r, -0.58 * r, 0.26 * r, 0.26 * r)
+        path.moveTo(-0.45 * r, -0.45 * r); path.arcTo(-0.65 * r, -0.82 * r, 1.3 * r, 0.82 * r, 205.0, 130.0)
+        path.moveTo(-0.72 * r, -0.35 * r); path.arcTo(-0.98 * r, -1.02 * r, 1.96 * r, 1.35 * r, 205.0, 130.0)
     else:
         path.addEllipse(-r, -r, 2.0 * r, 2.0 * r)
         path.moveTo(-0.65 * r, 0.0); path.lineTo(0.65 * r, 0.0)
         path.moveTo(0.0, -0.65 * r); path.lineTo(0.0, 0.65 * r)
     return path
+
+
+def _access_point_type_icon(ap_type: str, size: int = 36) -> QIcon:
+    """Create a crisp vector-derived icon for AP type selectors and menus."""
+    size = max(20, int(size))
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.translate(size / 2.0, size / 2.0)
+    painter.setPen(QPen(QColor("#0F172A"), max(1.2, size / 22.0)))
+    painter.setBrush(QBrush(QColor("#7DD3FC")))
+    painter.drawPath(_access_point_symbol_path(ap_type, size * 0.32))
+    painter.end()
+    return QIcon(pixmap)
+
+
+def _draw_access_point_type_symbol(
+    painter: QPainter,
+    ap_type: str,
+    centre: QPointF,
+    radius: float,
+    fill: Optional[QColor] = None,
+):
+    """Draw one AP type symbol in the current painter coordinate system."""
+    painter.save()
+    painter.translate(centre)
+    painter.setPen(QPen(QColor("#0F172A"), max(0.8, radius * 0.09)))
+    painter.setBrush(QBrush(fill or QColor("#7DD3FC")))
+    painter.drawPath(_access_point_symbol_path(ap_type, radius))
+    painter.restore()
 
 
 class AccessPointGraphicsItem(QGraphicsPathItem):
@@ -8128,7 +8498,10 @@ class AccessPointGraphicsItem(QGraphicsPathItem):
         copy_action = menu.addAction("Copy selected access point(s)    Ctrl+C")
         paste_action = menu.addAction("Paste access point(s)    Ctrl+V")
         type_menu = menu.addMenu("Change access point type")
-        type_actions = {type_menu.addAction(name): name for name in AP_TYPE_PRESETS}
+        type_actions = {}
+        for name in AP_TYPE_PRESETS:
+            action = type_menu.addAction(_access_point_type_icon(name, 28), name)
+            type_actions[action] = name
         profile_menu = menu.addMenu("Apply radio profile")
         profile_names = ["Project default radios"] + list(RADIO_PROFILE_PRESETS.keys())
         profile_actions = {profile_menu.addAction(name): name for name in profile_names}
@@ -8574,7 +8947,7 @@ class MainWindow(QMainWindow):
         self.pattern_combo.addItems(list(self.antenna_patterns.keys()))
         self.ap_type_combo = QComboBox()
         for ap_type, definition in AP_TYPE_PRESETS.items():
-            self.ap_type_combo.addItem(ap_type)
+            self.ap_type_combo.addItem(_access_point_type_icon(ap_type, 28), ap_type)
             self.ap_type_combo.setItemData(self.ap_type_combo.count() - 1, definition.get("description", ""), Qt.ToolTipRole)
         self.ap_type_combo.currentTextChanged.connect(self._new_ap_type_changed)
         self.radio_profile_combo = QComboBox()
@@ -13007,12 +13380,19 @@ class MainWindow(QMainWindow):
             self.floors.items(), key=lambda item: (float(item[1].elevation), item[0])
         )
         selection = PlannerRunSelectionDialog(
-            self, floor_items, enabled_radio_items, self.floor.name
+            self,
+            floor_items,
+            enabled_radio_items,
+            self.floor.name,
+            self.ap_type_combo.currentText() if hasattr(self, "ap_type_combo") else "Ceiling AP",
         )
         if selection.exec() != QDialog.Accepted:
             return
         selected_floor_names = set(selection.selected_floor_names())
         selected_radio_indices = set(selection.selected_radio_indices())
+        selected_ap_type = selection.selected_ap_type()
+        if hasattr(self, "ap_type_combo"):
+            self.ap_type_combo.setCurrentText(selected_ap_type)
         selected_requirements = [
             copy.deepcopy(requirement)
             for index, requirement in enumerate(settings.radio_requirements)
@@ -13038,6 +13418,7 @@ class MainWindow(QMainWindow):
                 )
                 report = self._run_auto_planner_current_floor(
                     requirements_override=selected_requirements,
+                    ap_type_override=selected_ap_type,
                     refresh_ui=False,
                     show_summary=False,
                 )
@@ -13089,7 +13470,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             "Predictive AP plan complete",
-            f"Added {total_added} RSSI-predicted AP(s) across {len(reports)} floor(s).\n"
+            f"Added {total_added} RSSI-predicted {selected_ap_type} unit(s) across {len(reports)} floor(s).\n"
             f"Selected radios fitted to each new AP: {radio_text}.\n\n"
             + "\n".join(floor_lines)
             + failure_text
@@ -13099,6 +13480,7 @@ class MainWindow(QMainWindow):
     def _run_auto_planner_current_floor(
         self,
         requirements_override: Optional[Sequence[PlannerRadioRequirement]] = None,
+        ap_type_override: Optional[str] = None,
         refresh_ui: bool = True,
         show_summary: bool = True,
     ) -> Optional[Dict[str, object]]:
@@ -13116,6 +13498,14 @@ class MainWindow(QMainWindow):
         if not requirements:
             QMessageBox.information(self, "No planner radios", "Enable at least one frequency in Planner settings.")
             return
+
+        selected_ap_type = str(ap_type_override or "")
+        if selected_ap_type not in AP_TYPE_PRESETS:
+            selected_ap_type = (
+                self.ap_type_combo.currentText()
+                if hasattr(self, "ap_type_combo") and self.ap_type_combo.currentText() in AP_TYPE_PRESETS
+                else "Ceiling AP"
+            )
 
         if settings.remove_previous_planned_aps:
             self.aps = [ap for ap in self.aps if not (ap.floor == self.floor.name and ap.planned)]
@@ -13181,7 +13571,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No planner points", "The selected floor did not produce usable coverage samples and AP candidates.")
             return
 
-        directional = any(not req.antenna_pattern.lower().startswith("omni") for req in requirements)
+        type_pattern = str(AP_TYPE_PRESETS.get(selected_ap_type, {}).get("pattern", ""))
+        directional = (
+            not type_pattern.lower().startswith("omni")
+            or any(not req.antenna_pattern.lower().startswith("omni") for req in requirements)
+        )
         azimuths = list(range(0, 360, 45)) if directional else [0]
         candidate_specs = [(x, y, float(az)) for x, y in candidates for az in azimuths]
         candidate_spec_limit = min(20_000, max(700, int(settings.maximum_aps) * 2))
@@ -13220,7 +13614,7 @@ class MainWindow(QMainWindow):
                 ) for req in requirements]
                 return AccessPoint(
                     name="candidate", x=x, y=y, floor=self.floor.name, radios=radios,
-                    ap_type="Directional AP" if directional else "Ceiling AP", radio_profile="Predictive planner",
+                    ap_type=selected_ap_type, radio_profile=f"Predictive planner: {selected_ap_type}",
                     path_loss_exponent=float(self.ple.value()), azimuth_deg=azimuth,
                     mount_height_m=float(self.mount_height.value()), rx_height_m=float(self.rx_height.value()),
                     max_clients=settings.clients_per_ap, planned=True,
@@ -13528,7 +13922,7 @@ class MainWindow(QMainWindow):
             "Handover overlap requirement: disabled.\n"
         )
         summary_text = (
-            f"Added {len(new_aps)} RSSI-predicted AP(s) on {self.floor.name}.\n"
+            f"Added {len(new_aps)} RSSI-predicted {selected_ap_type} unit(s) on {self.floor.name}.\n"
             f"Planning area: {getattr(self, '_planner_area_source_label', 'selected floor geometry')}.\n"
             f"Overall coverage ({'every selected radio' if settings.coverage_mode == 'all' else 'any selected radio'}): {overall_pct:.1f}%\n"
             + handover_summary
@@ -13541,6 +13935,7 @@ class MainWindow(QMainWindow):
             )
         return {
             "floor": str(self.floor.name),
+            "ap_type": selected_ap_type,
             "added_aps": int(len(new_aps)),
             "overall_pct": float(overall_pct),
             "handover_pct": float(handover_pct),
@@ -15139,58 +15534,62 @@ class MainWindow(QMainWindow):
         requested_processes = int(getattr(self.heatmap_settings, "max_ifc_loader_processes", 0) or 0)
         available_process_count = self._resolve_ifc_loader_process_count(requested_processes)
 
-        # Do not cap the process pool by the number of IFC files when at least
-        # one large file will be split into geometry chunks. The earlier version
-        # used ``min(cpu_count, len(unique_paths))`` which meant a single 500 MB
-        # IFC could only ever use one process, even though it was later split
-        # into many chunk jobs.
-        chunk_threshold_mb = float(getattr(self.heatmap_settings, "chunk_ifc_files_over_mb", 100.0) or 0.0)
-        enable_chunking = bool(getattr(self.heatmap_settings, "enable_chunked_ifc_geometry_extraction", True))
-        huge_threshold_mb = float(getattr(self.heatmap_settings, "huge_ifc_single_process_threshold_mb", 512.0) or 0.0)
-        max_parallel_huge = max(1, int(getattr(self.heatmap_settings, "max_parallel_huge_ifc_processes", 1) or 1))
-        has_large_chunked_ifc = False
-        if use_processes and enable_chunking and chunk_threshold_mb > 0.0:
-            for path in unique_paths:
-                try:
-                    if path.exists() and (path.stat().st_size / (1024.0 * 1024.0)) >= chunk_threshold_mb:
-                        has_large_chunked_ifc = True
-                        break
-                except Exception:
-                    pass
-
+        # Parse each IFC exactly once. IfcOpenShell's native geometry iterator
+        # performs the intra-file parallelism; spawning GUID chunks caused every
+        # worker to reopen and rescan the full model, which dominated large-file
+        # load time and multiplied memory use.
+        huge_threshold_mb = float(getattr(
+            self.heatmap_settings, "huge_ifc_single_process_threshold_mb", 512.0
+        ) or 0.0)
+        max_parallel_huge = max(1, int(getattr(
+            self.heatmap_settings, "max_parallel_huge_ifc_processes", 1
+        ) or 1))
+        logical_cores = max(1, os.cpu_count() or 1)
         if use_processes:
-            # Always create a pool capable of using all configured/logical cores.
-            # The previous logic capped the pool to the number of IFC files when
-            # a file was not detected as "large" before chunking. That meant
-            # loading one or two large/complex models often showed only one or two
-            # busy cores in Task Manager. The job submission path below decides
-            # how many chunks to submit; the pool should not be artificially capped.
-            process_count = max(1, available_process_count)
+            process_count = max(1, min(available_process_count, len(unique_paths)))
         else:
             process_count = 1
 
-        if use_processes and huge_threshold_mb > 0.0:
-            huge_flags = []
-            for p in unique_paths:
-                try:
-                    huge_flags.append(p.exists() and (p.stat().st_size / (1024.0 * 1024.0)) >= huge_threshold_mb)
-                except Exception:
-                    huge_flags.append(False)
-            if huge_flags and all(huge_flags):
-                process_count = min(process_count, max_parallel_huge)
-        self._load_worker_label = f"{process_count} process(es)" if use_processes else "single process"
+        huge_flags = []
+        for candidate in unique_paths:
+            try:
+                huge_flags.append(
+                    candidate.exists()
+                    and huge_threshold_mb > 0.0
+                    and (candidate.stat().st_size / (1024.0 * 1024.0)) >= huge_threshold_mb
+                )
+            except Exception:
+                huge_flags.append(False)
+        if use_processes and huge_flags and all(huge_flags):
+            process_count = min(process_count, max_parallel_huge)
+
+        requested_geometry_threads = int(getattr(
+            self.heatmap_settings, "max_ifc_loader_threads", 0
+        ) or 0)
+        geometry_threads = (
+            requested_geometry_threads
+            if requested_geometry_threads > 0
+            else max(1, logical_cores // max(1, process_count))
+        )
+        geometry_threads = max(1, min(32, geometry_threads))
+        self._load_worker_label = (
+            f"{process_count} file process(es) × {geometry_threads} native geometry thread(s)"
+            if use_processes else f"single process × {geometry_threads} native geometry thread(s)"
+        )
         self._set_loading_ui(True)
         self._show_ifc_load_progress(self._load_total)
         self._update_ifc_load_progress()
         self._schedule_ifc_load_timeout_watchdog()
         self.statusBar().showMessage(
-            f"Loading {self._load_pending} IFC file(s) using {self._load_worker_label} on {os.cpu_count() or 1} logical CPU core(s)..."
+            f"Loading {self._load_pending} IFC file(s) using {self._load_worker_label} "
+            f"on {logical_cores} logical CPU core(s); each model is parsed once..."
         )
 
         base_jobs = [(
             str(path), 0.0, 0.0, 0.0,
             self.heatmap_settings.project_external_walls_across_floors,
             self.heatmap_settings.external_wall_keywords,
+            geometry_threads,
         ) for path in unique_paths]
 
         if use_processes:
@@ -15200,76 +15599,19 @@ class MainWindow(QMainWindow):
                 self._ifc_chunk_total = {}
                 self._ifc_chunk_sources = {}
                 self._ifc_chunk_had_error = {}
-                self._ifc_process_executor = concurrent.futures.ProcessPoolExecutor(max_workers=process_count)
+                self._ifc_process_executor = concurrent.futures.ProcessPoolExecutor(
+                    max_workers=process_count
+                )
                 self._ifc_process_futures = {}
-                chunk_size = max(25, int(getattr(self.heatmap_settings, "ifc_geometry_chunk_size", 250) or 250))
                 for job in base_jobs:
                     path = Path(job[0])
-                    size_mb = (path.stat().st_size / (1024.0 * 1024.0)) if path.exists() else 0.0
-                    # Chunk geometry whenever enabled and the file meets the configured
-                    # threshold. A threshold of 0 forces chunking for all IFCs.
-                    # This makes a single IFC capable of occupying multiple worker
-                    # processes instead of only one whole-file worker.
-                    is_huge_ifc = bool(huge_threshold_mb > 0.0 and size_mb >= huge_threshold_mb)
-                    should_chunk_this_file = (
-                        enable_chunking
-                        and process_count > 1
-                        and path.exists()
-                        and size_mb >= max(0.0, chunk_threshold_mb)
-                        and not is_huge_ifc
-                    )
-                    if is_huge_ifc:
-                        # Memory-safe huge-model path. Do not split into many
-                        # workers because every chunk worker reopens the full IFC.
-                        self.statusBar().showMessage(
-                            f"{path.name} is {size_mb:.0f} MB; using one isolated IFC process to avoid duplicate model loads..."
-                        )
-                        fut = self._ifc_process_executor.submit(_load_ifc_file_in_process, job)
-                        self._ifc_process_futures[fut] = (path, "file")
-                    elif should_chunk_this_file:
-                        try:
-                            self.statusBar().showMessage(
-                                f"Indexing {path.name} before chunked multiprocessing..."
-                            )
-                            QApplication.processEvents()
-                            path_str, storeys, wall_guids, space_guids, element_guids, source_name, origin_info = _index_ifc_file_for_chunking(job)
-                            self.ifc_origin_info[self._ifc_path_key(path)] = origin_info
-                            records = [("wall", g) for g in wall_guids] + [("space", g) for g in space_guids] + [("element", g) for g in element_guids]
-                            if not records:
-                                fut = self._ifc_process_executor.submit(_load_ifc_file_in_process, job)
-                                self._ifc_process_futures[fut] = (path, "file")
-                                continue
-                            chunks = [records[i:i + chunk_size] for i in range(0, len(records), chunk_size)]
-                            key = self._ifc_path_key(path)
-                            self._ifc_chunk_remaining[key] = len(chunks)
-                            self._ifc_chunk_total[key] = len(chunks)
-                            self._ifc_chunk_sources[key] = source_name
-                            self._ifc_chunk_had_error[key] = False
-                            for idx, chunk in enumerate(chunks, start=1):
-                                chunk_wall_guids = [g for kind, g in chunk if kind == "wall"]
-                                chunk_space_guids = [g for kind, g in chunk if kind == "space"]
-                                chunk_element_guids = [g for kind, g in chunk if kind == "element"]
-                                chunk_job = (
-                                    path_str, job[1], job[2], job[3], job[4], job[5],
-                                    storeys, chunk_wall_guids, chunk_space_guids, chunk_element_guids, idx, len(chunks),
-                                )
-                                fut = self._ifc_process_executor.submit(_load_ifc_geometry_chunk_in_process, chunk_job)
-                                self._ifc_process_futures[fut] = (path, "chunk")
-                            active_jobs = min(process_count, len(chunks))
-                            self.statusBar().showMessage(
-                                f"Chunked {path.name}: {len(records)} elements across {len(chunks)} geometry jobs "
-                                f"using up to {active_jobs}/{process_count} process(es)..."
-                            )
-                        except Exception as exc:
-                            self._load_errors.append(f"{path.name}: chunk index failed ({exc}); falling back to whole-file process loading")
-                            fut = self._ifc_process_executor.submit(_load_ifc_file_in_process, job)
-                            self._ifc_process_futures[fut] = (path, "file")
-                    else:
-                        fut = self._ifc_process_executor.submit(_load_ifc_file_in_process, job)
-                        self._ifc_process_futures[fut] = (path, "file")
+                    fut = self._ifc_process_executor.submit(_load_ifc_file_in_process, job)
+                    self._ifc_process_futures[fut] = (path, "file")
                 self._ifc_process_poll_timer.start()
             except Exception as exc:
-                self._load_errors.append(f"Process loader failed to start: {exc}. No in-GUI-process IFC fallback was used.")
+                self._load_errors.append(
+                    f"Process loader failed to start: {exc}. No in-GUI-process IFC fallback was used."
+                )
                 for job in base_jobs:
                     self._ifc_worker_error(Path(job[0]), "process loader failed to start")
                 return
@@ -15354,7 +15696,15 @@ class MainWindow(QMainWindow):
         self.loaded_ifc_paths.append(path)
         total_loaded = len(self.loaded_ifc_paths)
         self._update_ifc_load_progress(path.name)
-        self.statusBar().showMessage(f"Loaded {path.name}. Waiting for {self._load_pending} IFC file(s)... Total loaded: {total_loaded}")
+        performance = origin_info.get("load_performance", {}) if isinstance(origin_info, dict) else {}
+        elapsed = float(performance.get("total_elapsed_seconds", 0.0) or 0.0)
+        thread_count = int(performance.get("geometry_threads", 0) or 0)
+        timing = f" in {elapsed:.1f}s" if elapsed > 0.0 else ""
+        threading_note = f" using {thread_count} geometry thread(s)" if thread_count > 0 else ""
+        self.statusBar().showMessage(
+            f"Loaded {path.name}{timing}{threading_note}. "
+            f"Waiting for {self._load_pending} IFC file(s)... Total loaded: {total_loaded}"
+        )
         self._finish_ifc_batch_if_ready()
 
     @Slot(object, str)
@@ -17389,6 +17739,225 @@ class MainWindow(QMainWindow):
         export_view.setScene(None)
         export_view.deleteLater()
 
+    def _pdf_floor_ap_type_rows(
+        self,
+        floor_name: str,
+        selected_frequencies: Sequence[float],
+    ) -> List[Dict[str, object]]:
+        """Return AP inventory rows ordered by the configured symbol catalogue."""
+        floor_aps = [ap for ap in self.aps if ap.floor == floor_name]
+        known_order = {name: index for index, name in enumerate(AP_TYPE_PRESETS)}
+        type_names = sorted(
+            {str(ap.ap_type or "Ceiling AP") for ap in floor_aps},
+            key=lambda name: (known_order.get(name, len(known_order)), name.lower()),
+        )
+        rows: List[Dict[str, object]] = []
+        for ap_type in type_names:
+            type_aps = [ap for ap in floor_aps if str(ap.ap_type or "Ceiling AP") == ap_type]
+            frequency_counts = []
+            for frequency in selected_frequencies:
+                frequency_counts.append(sum(
+                    1 for ap in type_aps
+                    if any(
+                        getattr(radio, "enabled", True)
+                        and abs(float(radio.frequency_mhz) - float(frequency)) < 1e-6
+                        for radio in ap.active_radios()
+                    )
+                ))
+            rows.append({
+                "ap_type": ap_type,
+                "physical_count": len(type_aps),
+                "planned_count": sum(1 for ap in type_aps if ap.planned),
+                "manual_count": sum(1 for ap in type_aps if not ap.planned),
+                "frequency_counts": frequency_counts,
+            })
+        return rows
+
+    def _draw_pdf_ap_breakdown_page(
+        self,
+        painter: QPainter,
+        page_rect: QRectF,
+        floor: FloorModel,
+        selected_frequencies: Sequence[float],
+    ):
+        """Draw a per-floor AP type by frequency inventory matrix."""
+        painter.save()
+        painter.resetTransform()
+        painter.setClipping(False)
+        painter.setOpacity(1.0)
+        painter.fillRect(page_rect, QColor("#FFFFFF"))
+
+        margin = max(28.0, page_rect.width() * 0.018)
+        content = page_rect.adjusted(margin, margin, -margin, -margin)
+        title_font = QFont(painter.font())
+        title_font.setBold(True)
+        title_font.setPointSize(19)
+        painter.setFont(title_font)
+        painter.setPen(QColor("#111827"))
+        painter.drawText(
+            QRectF(content.left(), content.top(), content.width(), 48.0),
+            Qt.AlignLeft | Qt.AlignVCenter,
+            f"Access point type and frequency breakdown - {floor.name}",
+        )
+
+        subtitle_font = QFont(painter.font())
+        subtitle_font.setBold(False)
+        subtitle_font.setPointSize(9)
+        painter.setFont(subtitle_font)
+        painter.setPen(QColor("#475569"))
+        frequency_text = ", ".join(self._pdf_frequency_label(value) for value in selected_frequencies)
+        painter.drawText(
+            QRectF(content.left(), content.top() + 50.0, content.width(), 34.0),
+            Qt.AlignLeft | Qt.AlignTop | Qt.TextWordWrap,
+            "Physical AP counts are grouped by drawing symbol/type. Frequency columns count physical APs "
+            f"with an enabled radio at that frequency. Selected frequencies: {frequency_text}.",
+        )
+
+        rows = self._pdf_floor_ap_type_rows(floor.name, selected_frequencies)
+        floor_aps = [ap for ap in self.aps if ap.floor == floor.name]
+        active_radio_count = sum(len(ap.active_radios()) for ap in floor_aps)
+        planned_count = sum(1 for ap in floor_aps if ap.planned)
+        metrics_top = content.top() + 92.0
+        metric_gap = 12.0
+        metric_width = (content.width() - (2.0 * metric_gap)) / 3.0
+        metrics = [
+            ("Physical APs", str(len(floor_aps))),
+            ("Active radio instances", str(active_radio_count)),
+            ("Predicted / manually placed", f"{planned_count} / {len(floor_aps) - planned_count}"),
+        ]
+        metric_title_font = QFont(painter.font())
+        metric_title_font.setPointSize(8)
+        metric_value_font = QFont(painter.font())
+        metric_value_font.setPointSize(15)
+        metric_value_font.setBold(True)
+        for index, (label, value) in enumerate(metrics):
+            box = QRectF(
+                content.left() + index * (metric_width + metric_gap),
+                metrics_top,
+                metric_width,
+                70.0,
+            )
+            painter.setPen(QPen(QColor("#CBD5E1"), 1.0))
+            painter.setBrush(QBrush(QColor("#F8FAFC")))
+            painter.drawRoundedRect(box, 6.0, 6.0)
+            painter.setFont(metric_title_font)
+            painter.setPen(QColor("#475569"))
+            painter.drawText(box.adjusted(12.0, 8.0, -12.0, -35.0), Qt.AlignLeft | Qt.AlignVCenter, label)
+            painter.setFont(metric_value_font)
+            painter.setPen(QColor("#0F172A"))
+            painter.drawText(box.adjusted(12.0, 28.0, -12.0, -6.0), Qt.AlignLeft | Qt.AlignVCenter, value)
+
+        table_top = metrics_top + 88.0
+        table_rect = QRectF(content.left(), table_top, content.width(), content.bottom() - table_top - 35.0)
+        header_height = 48.0
+        row_count = max(1, len(rows)) + 1  # include totals
+        row_height = min(58.0, max(36.0, (table_rect.height() - header_height) / row_count))
+        type_width = table_rect.width() * 0.34
+        fixed_width = table_rect.width() * 0.09
+        frequency_count = max(1, len(selected_frequencies))
+        frequency_width = max(
+            58.0,
+            (table_rect.width() - type_width - (3.0 * fixed_width)) / frequency_count,
+        )
+        total_width = type_width + (3.0 * fixed_width) + (frequency_width * frequency_count)
+        if total_width > table_rect.width():
+            frequency_width = (table_rect.width() - type_width - (3.0 * fixed_width)) / frequency_count
+
+        headers = ["AP type / symbol", "Physical", "Predicted", "Manual"] + [
+            self._pdf_frequency_label(value) for value in selected_frequencies
+        ]
+        widths = [type_width, fixed_width, fixed_width, fixed_width] + [frequency_width] * len(selected_frequencies)
+        x_positions = [table_rect.left()]
+        for width in widths:
+            x_positions.append(x_positions[-1] + width)
+
+        painter.setPen(QPen(QColor("#334155"), 1.0))
+        painter.setBrush(QBrush(QColor("#E2E8F0")))
+        painter.drawRect(QRectF(table_rect.left(), table_top, sum(widths), header_height))
+        header_font = QFont(painter.font())
+        header_font.setBold(True)
+        header_font.setPointSize(8)
+        painter.setFont(header_font)
+        painter.setPen(QColor("#0F172A"))
+        for index, header in enumerate(headers):
+            alignment = Qt.AlignLeft | Qt.AlignVCenter if index == 0 else Qt.AlignCenter
+            painter.drawText(
+                QRectF(x_positions[index] + 7.0, table_top, widths[index] - 14.0, header_height),
+                alignment | Qt.TextWordWrap,
+                header,
+            )
+
+        body_font = QFont(painter.font())
+        body_font.setPointSize(8)
+        painter.setFont(body_font)
+        y = table_top + header_height
+        for row_index, row in enumerate(rows):
+            row_rect = QRectF(table_rect.left(), y, sum(widths), row_height)
+            painter.fillRect(row_rect, QColor("#FFFFFF") if row_index % 2 == 0 else QColor("#F8FAFC"))
+            painter.setPen(QPen(QColor("#CBD5E1"), 0.8))
+            painter.drawRect(row_rect)
+            ap_type = str(row["ap_type"])
+            symbol_radius = min(15.0, row_height * 0.30)
+            symbol_centre = QPointF(x_positions[0] + 19.0, y + row_height / 2.0)
+            _draw_access_point_type_symbol(painter, ap_type, symbol_centre, symbol_radius)
+            painter.setPen(QColor("#111827"))
+            painter.drawText(
+                QRectF(x_positions[0] + 40.0, y, widths[0] - 47.0, row_height),
+                Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWordWrap,
+                ap_type,
+            )
+            values = [
+                int(row["physical_count"]),
+                int(row["planned_count"]),
+                int(row["manual_count"]),
+            ] + [int(value) for value in row["frequency_counts"]]
+            for column, value in enumerate(values, start=1):
+                painter.drawText(
+                    QRectF(x_positions[column], y, widths[column], row_height),
+                    Qt.AlignCenter,
+                    str(value),
+                )
+            y += row_height
+
+        total_frequency_counts = [0] * len(selected_frequencies)
+        for row in rows:
+            for index, value in enumerate(row["frequency_counts"]):
+                total_frequency_counts[index] += int(value)
+        total_values = [
+            len(floor_aps),
+            planned_count,
+            len(floor_aps) - planned_count,
+        ] + total_frequency_counts
+        total_rect = QRectF(table_rect.left(), y, sum(widths), row_height)
+        painter.fillRect(total_rect, QColor("#DBEAFE"))
+        painter.setPen(QPen(QColor("#64748B"), 1.0))
+        painter.drawRect(total_rect)
+        total_font = QFont(body_font)
+        total_font.setBold(True)
+        painter.setFont(total_font)
+        painter.setPen(QColor("#0F172A"))
+        painter.drawText(
+            QRectF(x_positions[0] + 12.0, y, widths[0] - 20.0, row_height),
+            Qt.AlignLeft | Qt.AlignVCenter,
+            "All access point types",
+        )
+        for column, value in enumerate(total_values, start=1):
+            painter.drawText(
+                QRectF(x_positions[column], y, widths[column], row_height),
+                Qt.AlignCenter,
+                str(value),
+            )
+
+        if not rows:
+            painter.setFont(body_font)
+            painter.setPen(QColor("#64748B"))
+            painter.drawText(
+                QRectF(table_rect.left(), table_top + header_height, sum(widths), row_height),
+                Qt.AlignCenter,
+                "No access points are placed on this floor.",
+            )
+        painter.restore()
+
     def _draw_pdf_rssi_legend(
         self,
         painter: QPainter,
@@ -17398,6 +17967,7 @@ class MainWindow(QMainWindow):
         result: Optional[SimulationResult],
         frequency_ap_count: int,
         floor_ap_count: int,
+        ap_type_counts: Optional[Dict[str, int]] = None,
     ):
         painter.save()
         # QGraphicsView.render() can leave a non-identity world transform on
@@ -17443,7 +18013,9 @@ class MainWindow(QMainWindow):
             reverse=True,
         )
         zone_count = max(1, len(zones))
-        metadata_reserve = max(190.0, min(285.0, rect.height() * 0.34))
+        type_row_count = len(ap_type_counts or {})
+        type_section_height = (30.0 + (type_row_count * 23.0)) if type_row_count else 0.0
+        metadata_reserve = max(190.0, min(420.0, rect.height() * 0.34 + type_section_height))
         available_zone_height = max(100.0, rect.height() - (2.0 * pad) - 46.0 - metadata_reserve)
         zone_row_height = max(22.0, min(42.0, available_zone_height / zone_count))
         swatch_width = max(42.0, width * 0.19)
@@ -17494,6 +18066,41 @@ class MainWindow(QMainWindow):
         painter.drawLine(QPointF(x, y), QPointF(x + width, y))
         y += 12.0
         painter.setPen(QColor("#1F2937"))
+
+        if ap_type_counts:
+            type_title_font = QFont(body_font)
+            type_title_font.setBold(True)
+            painter.setFont(type_title_font)
+            painter.drawText(
+                QRectF(x, y, width, 22.0),
+                Qt.AlignLeft | Qt.AlignVCenter,
+                "AP types on this floor / frequency",
+            )
+            y += 24.0
+            painter.setFont(body_font)
+            known_order = {name: index for index, name in enumerate(AP_TYPE_PRESETS)}
+            for ap_type, count in sorted(
+                ap_type_counts.items(),
+                key=lambda item: (known_order.get(item[0], len(known_order)), item[0].lower()),
+            ):
+                _draw_access_point_type_symbol(
+                    painter,
+                    ap_type,
+                    QPointF(x + 10.0, y + 10.0),
+                    7.5,
+                )
+                painter.setPen(QColor("#1F2937"))
+                painter.drawText(
+                    QRectF(x + 24.0, y, width - 24.0, 20.0),
+                    Qt.AlignLeft | Qt.AlignVCenter,
+                    f"{ap_type}: {int(count)}",
+                )
+                y += 23.0
+            y += 5.0
+            painter.setPen(QPen(QColor("#CBD5E1"), 0.8))
+            painter.drawLine(QPointF(x, y), QPointF(x + width, y))
+            y += 12.0
+            painter.setPen(QColor("#1F2937"))
 
         reflection_text = (
             f"order {self.heatmap_settings.max_reflection_order} reflections"
@@ -17583,6 +18190,11 @@ class MainWindow(QMainWindow):
             for floor_name, floor in floor_items
             for frequency in selected_frequencies
         ]
+        report_pages = []
+        for floor_name, floor in floor_items:
+            report_pages.append(("breakdown", floor_name, floor, None))
+            for frequency in selected_frequencies:
+                report_pages.append(("heatmap", floor_name, floor, float(frequency)))
         if not pages:
             QMessageBox.information(self, "Nothing selected", "Select at least one floor and frequency.")
             return
@@ -17606,7 +18218,7 @@ class MainWindow(QMainWindow):
         temporary_path = target_path.with_name(f".{target_path.stem}.{uuid.uuid4().hex}.tmp.pdf")
 
         calculation_units = max(1, len(floor_items) * 100)
-        render_units = max(1, len(pages) * 10)
+        render_units = max(1, len(report_pages) * 10)
         progress = QProgressDialog(
             "Calculating selected RSSI floor results...",
             "Cancel",
@@ -17659,7 +18271,7 @@ class MainWindow(QMainWindow):
                     results_by_floor_frequency[(floor_name, float(frequency))] = floor_results.get(float(frequency))
                 progress.setValue((floor_index + 1) * 100)
 
-            progress.setLabelText("Rendering selected floor/frequency pages to PDF...")
+            progress.setLabelText("Rendering AP type breakdown and floor/frequency pages to PDF...")
             QApplication.processEvents()
             if progress.wasCanceled():
                 raise RuntimeError("RSSI floor PDF export cancelled")
@@ -17700,11 +18312,39 @@ class MainWindow(QMainWindow):
             self._pdf_export_rendering = True
             self.heatmap_settings.show_ap_cutoff_zones = False
             try:
-                for page_index, (floor_name, floor, frequency_mhz) in enumerate(pages):
+                for page_index, (page_kind, floor_name, floor, frequency_mhz) in enumerate(report_pages):
                     if page_index > 0 and not writer.newPage():
                         raise RuntimeError(f"Could not create PDF page {page_index + 1}.")
                     if progress.wasCanceled():
                         raise RuntimeError("RSSI floor PDF export cancelled")
+
+                    page_rect = QRectF(writer.pageLayout().paintRectPixels(writer.resolution()))
+                    if page_kind == "breakdown":
+                        self._draw_pdf_ap_breakdown_page(
+                            painter,
+                            page_rect,
+                            floor,
+                            selected_frequencies,
+                        )
+                        footer_height = max(34.0, page_rect.height() * 0.025)
+                        footer_margin = max(20.0, page_rect.width() * 0.012)
+                        footer_font = QFont(painter.font())
+                        footer_font.setPointSize(8)
+                        painter.setFont(footer_font)
+                        painter.setPen(QColor("#64748B"))
+                        painter.drawText(
+                            QRectF(
+                                page_rect.left() + footer_margin,
+                                page_rect.bottom() - footer_height,
+                                page_rect.width() - (2.0 * footer_margin),
+                                footer_height,
+                            ),
+                            Qt.AlignRight | Qt.AlignVCenter,
+                            f"Page {page_index + 1} of {len(report_pages)}",
+                        )
+                        progress.setValue(calculation_units + ((page_index + 1) * 10))
+                        QApplication.processEvents()
+                        continue
 
                     result = results_by_floor_frequency.get((floor_name, float(frequency_mhz)))
                     self.floor = floor
@@ -17820,7 +18460,12 @@ class MainWindow(QMainWindow):
                             for radio in ap.active_radios()
                         )
                     ]
-                    floor_ap_count = sum(1 for ap in frequency_aps if ap.floor == floor_name)
+                    floor_frequency_aps = [ap for ap in frequency_aps if ap.floor == floor_name]
+                    floor_ap_count = len(floor_frequency_aps)
+                    ap_type_counts: Dict[str, int] = {}
+                    for ap in floor_frequency_aps:
+                        ap_type = str(ap.ap_type or "Ceiling AP")
+                        ap_type_counts[ap_type] = ap_type_counts.get(ap_type, 0) + 1
                     # Draw the legend last and outside the plan clip.  This
                     # guarantees the key remains above every scene element.
                     painter.setClipping(False)
@@ -17833,6 +18478,7 @@ class MainWindow(QMainWindow):
                         result,
                         len(frequency_aps),
                         floor_ap_count,
+                        ap_type_counts,
                     )
 
                     footer_font = QFont(painter.font())
@@ -17847,7 +18493,7 @@ class MainWindow(QMainWindow):
                             footer_height,
                         ),
                         Qt.AlignRight | Qt.AlignVCenter,
-                        f"Page {page_index + 1} of {len(pages)}",
+                        f"Page {page_index + 1} of {len(report_pages)}",
                     )
                     progress.setValue(calculation_units + ((page_index + 1) * 10))
                     QApplication.processEvents()
@@ -17873,14 +18519,15 @@ class MainWindow(QMainWindow):
             os.replace(str(temporary_path), str(target_path))
             progress.setValue(progress.maximum())
             self.statusBar().showMessage(
-                f"Exported {len(pages)} RSSI page(s) for {len(floor_items)} floor(s) and "
-                f"{len(selected_frequencies)} frequency selection(s) to {target_path}"
+                f"Exported {len(report_pages)} PDF page(s), including {len(floor_items)} AP type breakdown page(s) "
+                f"and {len(pages)} RSSI heatmap page(s), to {target_path}"
             )
             QMessageBox.information(
                 self,
                 "RSSI floor PDF exported",
-                f"Exported {len(pages)} page(s) covering {len(floor_items)} floor(s) and "
-                f"{len(selected_frequencies)} frequenc{'ies' if len(selected_frequencies) != 1 else 'y'} to:\n"
+                f"Exported {len(report_pages)} page(s): {len(floor_items)} AP type/frequency breakdown page(s) "
+                f"and {len(pages)} RSSI heatmap page(s) covering {len(selected_frequencies)} "
+                f"frequenc{'ies' if len(selected_frequencies) != 1 else 'y'} to:\n"
                 f"{target_path}",
             )
         except Exception as exc:

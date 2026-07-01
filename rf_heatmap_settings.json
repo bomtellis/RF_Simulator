@@ -279,7 +279,7 @@
     "exterior",
     "outer",
     "facade",
-    "façade",
+    "fa\u00e7ade",
     "curtain",
     "envelope",
     "perimeter"
@@ -399,14 +399,14 @@
   "dxf_unit_name": "auto_from_INSUNITS_to_IFC_metres",
   "dxf_alignment_mode": "ifc_two_points_then_separate_dxf_dialog",
   "dxf_alignment_notes": "Select two snapped IFC reference points first. The DXF then opens in a separate pre-alignment dialog. Select two matching snapped DXF endpoints/corners; the corrected DXF is inserted into the IFC scene.",
-  "enable_chunked_ifc_geometry_extraction": true,
+  "enable_chunked_ifc_geometry_extraction": false,
   "chunk_ifc_files_over_mb": 100.0,
   "ifc_geometry_chunk_size": 250,
-  "ifc_process_pool_strategy": "all_cores_chunked_geometry",
+  "ifc_process_pool_strategy": "one_parse_per_file_native_geometry_threads",
   "huge_ifc_single_process_threshold_mb": 512.0,
   "max_parallel_huge_ifc_processes": 1,
   "allow_blocking_ifc_fallback": false,
-  "large_ifc_notes": "IFCs over huge_ifc_single_process_threshold_mb are parsed in one isolated child process. Do not chunk 800MB IFCs across multiple workers because each worker reopens the full model and can crash ifcopenshell/OCC from memory pressure.",
+  "large_ifc_notes": "Each IFC is opened once in an isolated child process. Walls, spaces and other elements are extracted in one batched IfcOpenShell geometry iterator using native threads; GUID chunk workers are disabled because they repeatedly reopened the full model.",
   "auto_planner_settings": {
     "target_coverage_percent": 95,
     "coverage_mode": "all",
@@ -532,6 +532,8 @@
     "cuda_block_segment_threshold": 48,
     "cuda_queue_depth": 3,
     "cuda_blocks_per_sm": 24,
-    "cuda_max_barrier_checks_per_launch": 200000000
+    "cuda_max_barrier_checks_per_launch": 1000000000,
+    "max_ifc_loader_threads": 0,
+    "cuda_angular_bins": 128
   }
 }

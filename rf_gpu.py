@@ -493,6 +493,98 @@ if cuda is not None:
             out_rssi[gid] = best
             out_counts[gid] = path_count
 
+    @cuda.jit(cache=True, fastmath=True)
+    def _cuda_direct_rssi_fused(xs, ys, valid, ap_data, segments, angular_segment_indices,
+                                angular_segment_offsets, angular_bin_count, disconnected,
+                                combine_mode, strongest_skip_margin, start_gid, work_count,
+                                out_rssi, out_counts, cols, rows):
+        """Calculate and combine every AP path in one angularly-pruned kernel."""
+        total = cols * rows
+        local_start = cuda.grid(1)
+        stride = cuda.gridsize(1)
+        two_pi = 6.283185307179586
+        pi = 3.141592653589793
+        for local_gid in range(local_start, work_count, stride):
+            gid = start_gid + local_gid
+            if gid >= total or valid[gid] == 0:
+                out_rssi[gid] = math.nan
+                out_counts[gid] = 0
+                continue
+            ix = gid % cols
+            iy = gid // cols
+            x = xs[ix]
+            y = ys[iy]
+            best = disconnected
+            power_sum_mw = 0.0
+            path_count = 0
+            ap_count = ap_data.shape[0]
+            for ai in range(ap_count):
+                ax = ap_data[ai, 0]
+                ay = ap_data[ai, 1]
+                az = ap_data[ai, 2]
+                z_delta = ap_data[ai, 3]
+                base_dbm = ap_data[ai, 4]
+                path_loss_factor = ap_data[ai, 5]
+                cutoff2 = ap_data[ai, 6]
+                dz2 = ap_data[ai, 7]
+                dx = x - ax
+                dy = y - ay
+                d2xy = dx * dx + dy * dy
+                if cutoff2 > 0.0 and d2xy > cutoff2:
+                    continue
+                d3 = math.sqrt(d2xy + dz2)
+                if d3 < 1.0:
+                    d3 = 1.0
+                unobstructed = base_dbm - path_loss_factor * math.log10(d3)
+                if combine_mode != 1 and path_count > 0 and unobstructed + strongest_skip_margin <= best:
+                    continue
+                ray_min_x = ax if ax < x else x
+                ray_max_x = x if x > ax else ax
+                ray_min_y = ay if ay < y else y
+                ray_max_y = y if y > ay else ay
+                angle = math.atan2(dy, dx)
+                angular_bin = int((angle + pi) * angular_bin_count / two_pi)
+                if angular_bin < 0:
+                    angular_bin = 0
+                elif angular_bin >= angular_bin_count:
+                    angular_bin = angular_bin_count - 1
+                offset_index = ai * angular_bin_count + angular_bin
+                first_segment = angular_segment_offsets[offset_index]
+                last_segment = angular_segment_offsets[offset_index + 1]
+                wall_loss = 0.0
+                for packed_index in range(first_segment, last_segment):
+                    si = angular_segment_indices[packed_index]
+                    if (segments[si, 8] < ray_min_x - 1.0e-5 or segments[si, 7] > ray_max_x + 1.0e-5 or
+                            segments[si, 10] < ray_min_y - 1.0e-5 or segments[si, 9] > ray_max_y + 1.0e-5):
+                        continue
+                    x1 = segments[si, 0]
+                    y1 = segments[si, 1]
+                    sdx = segments[si, 2]
+                    sdy = segments[si, 3]
+                    den = dx * sdy - dy * sdx
+                    if den > -1.0e-7 and den < 1.0e-7:
+                        continue
+                    t = ((x1 - ax) * sdy - (y1 - ay) * sdx) / den
+                    u = ((x1 - ax) * dy - (y1 - ay) * dx) / den
+                    if t >= 0.0 and t <= 1.0 and u >= 0.0 and u <= 1.0:
+                        zhit = az + z_delta * t
+                        if zhit >= segments[si, 4] and zhit <= segments[si, 5]:
+                            wall_loss += segments[si, 6]
+                rssi = base_dbm - path_loss_factor * math.log10(d3) - wall_loss
+                if rssi < disconnected:
+                    rssi = disconnected
+                path_count += 1
+                if combine_mode == 1:
+                    power_sum_mw += math.pow(10.0, rssi / 10.0)
+                elif rssi > best:
+                    best = rssi
+            if combine_mode == 1 and power_sum_mw > 0.0:
+                best = 10.0 * math.log10(power_sum_mw)
+            if path_count == 0:
+                best = disconnected
+            out_rssi[gid] = best
+            out_counts[gid] = path_count
+
 else:  # pragma: no cover
     _cuda_influence_mask = None
     _cuda_strongest_index = None
@@ -501,6 +593,7 @@ else:  # pragma: no cover
     _cuda_direct_rssi_paths = None
     _cuda_direct_rssi_paths_block = None
     _cuda_reduce_rssi_paths = None
+    _cuda_direct_rssi_fused = None
 
 
 class NumbaCUDARFAccelerator:
@@ -566,8 +659,19 @@ class NumbaCUDARFAccelerator:
             self._direct_path_capacity = path_items
         return self._direct_rssi_buffer, self._direct_count_buffer, self._direct_path_buffer
 
-    def _model_buffers(self, compact_aps, prepared_segments, segment_indices, segment_offsets, stream):
-        key = (id(compact_aps), id(prepared_segments), id(segment_indices), id(segment_offsets))
+    def _ensure_direct_output_buffers(self, total_points: int, stream):
+        if self._direct_output_capacity < total_points or self._direct_rssi_buffer is None:
+            self._direct_rssi_buffer = cuda.device_array(total_points, dtype=np.float32, stream=stream)
+            self._direct_count_buffer = cuda.device_array(total_points, dtype=np.int16, stream=stream)
+            self._direct_output_capacity = total_points
+        return self._direct_rssi_buffer, self._direct_count_buffer
+
+    def _model_buffers(self, compact_aps, prepared_segments, segment_indices, segment_offsets,
+                       angular_segment_indices, angular_segment_offsets, stream):
+        key = (
+            id(compact_aps), id(prepared_segments), id(segment_indices), id(segment_offsets),
+            id(angular_segment_indices), id(angular_segment_offsets),
+        )
         cached = self._direct_model_cache.get(key)
         if cached is not None:
             self._direct_model_cache.move_to_end(key)
@@ -577,9 +681,17 @@ class NumbaCUDARFAccelerator:
             cuda.to_device(prepared_segments, stream=stream),
             cuda.to_device(segment_indices, stream=stream),
             cuda.to_device(segment_offsets, stream=stream),
+            cuda.to_device(angular_segment_indices, stream=stream),
+            cuda.to_device(angular_segment_offsets, stream=stream),
         )
-        size_bytes = int(compact_aps.nbytes + prepared_segments.nbytes + segment_indices.nbytes + segment_offsets.nbytes)
-        host_refs = (compact_aps, prepared_segments, segment_indices, segment_offsets)
+        size_bytes = int(
+            compact_aps.nbytes + prepared_segments.nbytes + segment_indices.nbytes + segment_offsets.nbytes +
+            angular_segment_indices.nbytes + angular_segment_offsets.nbytes
+        )
+        host_refs = (
+            compact_aps, prepared_segments, segment_indices, segment_offsets,
+            angular_segment_indices, angular_segment_offsets,
+        )
         self._direct_model_cache[key] = (buffers, size_bytes, host_refs)
         self._direct_model_cache_bytes += size_bytes
         while len(self._direct_model_cache) > 4 or self._direct_model_cache_bytes > self._direct_model_cache_limit:
@@ -712,10 +824,14 @@ class NumbaCUDARFAccelerator:
 
     def direct_rssi_grid(self, xs: np.ndarray, ys: np.ndarray, ap_data: np.ndarray,
                          segments: np.ndarray, valid_mask: Optional[np.ndarray],
-                         disconnected: float, combine_mode: int, settings: Any = None
-                         ) -> Tuple[np.ndarray, np.ndarray]:
+                         disconnected: float, combine_mode: int, settings: Any = None,
+                         progress_callback=None) -> Tuple[np.ndarray, np.ndarray]:
         compact_aps, prepared_segments, segment_indices, segment_offsets = _prepare_direct_inputs(
             ap_data, segments, np.float32
+        )
+        angular_bin_count = max(32, min(512, int(_setting(settings, "cuda_angular_bins", 128) or 128)))
+        angular_indices, angular_offsets, angular_bin_count, average_bin_candidates = _prepare_angular_segment_bins(
+            compact_aps, prepared_segments, segment_indices, segment_offsets, angular_bin_count
         )
         rows, cols = len(ys), len(xs)
         total = rows * cols
@@ -723,103 +839,64 @@ class NumbaCUDARFAccelerator:
             return np.empty((rows, cols), dtype=np.float32), np.zeros((rows, cols), dtype=np.int16)
         ap_count = int(compact_aps.shape[0])
         configured_chunk = max(65_536, int(_setting(settings, "cuda_chunk_points", 1_048_576) or 1_048_576))
-        memory_fraction = max(0.10, min(0.75, float(_setting(settings, "cuda_memory_fraction", 0.45) or 0.45)))
-        block_threshold = max(1, int(_setting(settings, "cuda_block_segment_threshold", 48) or 48))
         queue_depth = max(1, min(8, int(_setting(settings, "cuda_queue_depth", 3) or 3)))
         max_barrier_checks = max(10_000_000, int(_setting(
-            settings, "cuda_max_barrier_checks_per_launch", 200_000_000
-        ) or 200_000_000))
+            settings, "cuda_max_barrier_checks_per_launch", 1_000_000_000
+        ) or 1_000_000_000))
         blocks_per_sm = max(4, min(64, int(_setting(settings, "cuda_blocks_per_sm", 24) or 24)))
-        packed_segment_count = int(segment_offsets[-1]) if len(segment_offsets) else 0
-        average_segments = (packed_segment_count / ap_count) if ap_count else 0.0
-        use_block_kernel = bool(average_segments >= block_threshold)
-        cooperative_threads = 32 if average_segments < 64 else (64 if average_segments < 128 else 128)
+        estimated_checks_per_point = max(1.0, float(ap_count) * max(1.0, average_bin_candidates))
+        max_points_by_latency = max(16_384, int(max_barrier_checks / estimated_checks_per_point))
+        # The fused kernel has no AP×point temporary field, so device memory no
+        # longer limits chunk size. Keep a few large launches for cancellation
+        # and progress while avoiding per-percent synchronisation.
+        auto_target = max(configured_chunk, min(total, 4_194_304))
+        chunk_points = max(1, min(total, auto_target, max_points_by_latency))
 
         with self._lock, cuda.gpus[self.device_index]:
             self._blocks_per_sm = blocks_per_sm
             self._maximum_blocks = max(self._minimum_blocks, self._sm_count * self._blocks_per_sm)
             stream = cuda.stream()
             d_xs, d_ys, d_valid = self._grid_buffers(xs, ys, valid_mask, stream)
-            d_aps, d_segments, d_segment_indices, d_offsets = self._model_buffers(
-                compact_aps, prepared_segments, segment_indices, segment_offsets, stream
+            (
+                d_aps, d_segments, _d_segment_indices, _d_offsets,
+                d_angular_indices, d_angular_offsets,
+            ) = self._model_buffers(
+                compact_aps, prepared_segments, segment_indices, segment_offsets,
+                angular_indices, angular_offsets, stream,
             )
-
-            # Scale the point/AP temporary field to the currently free device
-            # memory rather than an arbitrary 256 MB ceiling.  This cuts launch
-            # and synchronisation overhead on high-memory NVIDIA cards while
-            # reserving enough memory for the display driver and other stages.
-            try:
-                free_bytes, _total_bytes = cuda.current_context().get_memory_info()
-                free_bytes = int(free_bytes)
-            except Exception:
-                free_bytes = int(self.info.global_memory_mb or 2048) * 1024 * 1024
-            static_bytes = (
-                int(compact_aps.nbytes) + int(prepared_segments.nbytes) +
-                int(segment_indices.nbytes) + int(segment_offsets.nbytes) +
-                int(total * (np.dtype(np.float32).itemsize + np.dtype(np.int16).itemsize))
-            )
-            reserve_bytes = max(256 * 1024 * 1024, static_bytes * 2)
-            usable_bytes = max(32 * 1024 * 1024, free_bytes - reserve_bytes)
-            temp_budget_bytes = max(32 * 1024 * 1024, int(usable_bytes * memory_fraction))
-            temp_budget_bytes = min(temp_budget_bytes, 2 * 1024 * 1024 * 1024)
-            max_points_by_temp = max(4096, temp_budget_bytes // max(4, ap_count * 4))
-            # The saved chunk value is a cancellation/latency baseline.  Auto
-            # scaling may enlarge it when memory permits so the GPU receives a
-            # deep work queue and spends less time at Python synchronisation
-            # boundaries.
-            auto_target = max(configured_chunk, min(total, 2_097_152))
-            max_points_by_cancel = total
-            effective_queue_depth = queue_depth
-            if use_block_kernel and average_segments > 0.0:
-                # Bound one cooperative barrier kernel to a predictable amount
-                # of work so Cancel remains responsive even on very large IFCs.
-                # The chunk still contains tens of thousands of CUDA blocks on
-                # normal plans, which is ample to saturate the GPU.
-                max_points_by_cancel = max(1024, int(
-                    max_barrier_checks / max(1.0, ap_count * average_segments)
-                ))
-                effective_queue_depth = 1
-            chunk_points = max(1, min(total, auto_target, max_points_by_temp, max_points_by_cancel))
-            max_path_items = chunk_points * ap_count
-            d_rssi, d_counts, d_path_rssi = self._ensure_direct_buffers(total, max_path_items, stream)
-            stream.synchronize()
+            d_rssi, d_counts = self._ensure_direct_output_buffers(total, stream)
 
             queued_chunks = 0
+            queued_completed_points = 0
             chunk_count = 0
+            completed_points = 0
             for start_gid in range(0, total, chunk_points):
                 if self._cancelled(settings):
                     raise RuntimeError("RSSI calculation cancelled")
                 work_count = min(chunk_points, total - start_gid)
-                path_items = work_count * ap_count
-                if use_block_kernel:
-                    path_blocks, threads = self._block_launch_shape(path_items, cooperative_threads)
-                    _cuda_direct_rssi_paths_block[path_blocks, threads, stream](
-                        d_xs, d_ys, d_valid, d_aps, d_segments, d_segment_indices, d_offsets,
-                        np.float32(disconnected), np.int64(start_gid), np.int64(work_count),
-                        d_path_rssi, np.int32(cols), np.int32(rows),
-                    )
-                else:
-                    path_blocks, threads = self._launch_shape(path_items)
-                    _cuda_direct_rssi_paths[path_blocks, threads, stream](
-                        d_xs, d_ys, d_valid, d_aps, d_segments, d_segment_indices, d_offsets,
-                        np.float32(disconnected), np.int64(start_gid), np.int64(work_count),
-                        d_path_rssi, np.int32(cols), np.int32(rows),
-                    )
-                reduce_blocks, reduce_threads = self._launch_shape(work_count)
-                _cuda_reduce_rssi_paths[reduce_blocks, reduce_threads, stream](
-                    d_valid, d_path_rssi, np.int32(ap_count), np.float32(disconnected),
-                    np.int32(combine_mode), np.int64(start_gid), np.int64(work_count),
-                    d_rssi, d_counts,
+                blocks, threads = self._launch_shape(work_count)
+                _cuda_direct_rssi_fused[blocks, threads, stream](
+                    d_xs, d_ys, d_valid, d_aps, d_segments,
+                    d_angular_indices, d_angular_offsets, np.int32(angular_bin_count),
+                    np.float32(disconnected), np.int32(combine_mode),
+                    np.float32(
+                        max(0.0, float(_setting(settings, "strongest_ap_early_exit_margin_db", 12.0) or 0.0))
+                        if bool(_setting(settings, "enable_strongest_ap_early_exit", True)) else 1.0e9
+                    ),
+                    np.int64(start_gid), np.int64(work_count), d_rssi, d_counts,
+                    np.int32(cols), np.int32(rows),
                 )
                 queued_chunks += 1
+                queued_completed_points += work_count
                 chunk_count += 1
                 is_last = (start_gid + work_count) >= total
-                # Queue several dependent path/reduction pairs before waiting.
-                # They use one stream, so the temporary buffer is reused safely
-                # while the GPU remains continuously fed.
-                if queued_chunks >= effective_queue_depth or is_last:
+                if queued_chunks >= queue_depth or is_last:
                     stream.synchronize()
+                    completed_points += queued_completed_points
                     queued_chunks = 0
+                    queued_completed_points = 0
+                    if progress_callback is not None:
+                        progress_callback(completed_points, total)
                     if self._cancelled(settings):
                         raise RuntimeError("RSSI calculation cancelled")
 
@@ -836,16 +913,22 @@ class NumbaCUDARFAccelerator:
                 raise RuntimeError("RSSI calculation cancelled")
             rssi = np.asarray(host_rssi).copy()
             counts = np.asarray(host_counts).copy()
+            packed_segment_count = int(segment_offsets[-1]) if len(segment_offsets) else 0
+            average_segments = (packed_segment_count / ap_count) if ap_count else 0.0
+            reduction_ratio = average_bin_candidates / max(1.0, average_segments)
             self.last_direct_stats = {
-                "kernel": "block-per-path" if use_block_kernel else "thread-per-path",
+                "kernel": "fused-angular-point",
                 "average_segments_per_ap": float(average_segments),
-                "cooperative_threads": int(cooperative_threads if use_block_kernel else 1),
+                "average_candidates_per_angular_bin": float(average_bin_candidates),
+                "angular_bins": int(angular_bin_count),
+                "candidate_ratio": float(reduction_ratio),
+                "cooperative_threads": 1,
                 "chunk_points": int(chunk_points),
                 "chunks": int(chunk_count),
-                "queue_depth": int(effective_queue_depth),
+                "queue_depth": int(queue_depth),
                 "max_barrier_checks_per_launch": int(max_barrier_checks),
                 "path_items": int(total * ap_count),
-                "temporary_mb": float(max_path_items * 4 / (1024 * 1024)),
+                "temporary_mb": 0.0,
             }
         return rssi.reshape((rows, cols)), counts.reshape((rows, cols))
 
@@ -899,8 +982,8 @@ __kernel void colourise(__global const float *values,const int points,__global c
 __kernel void direct_rssi_paths(__global const float *xs,__global const float *ys,
  __global const uchar *valid,__global const float *aps,__global const float *segments,
  __global const int *segment_indices,__global const int *offsets,const int ap_count,
- const float disconnected,const int start_gid,const int work_count,__global float *path_rssi,
- const int cols,const int rows){
+ const float disconnected,const int combine_mode,const float strongest_skip_margin,
+ const int start_gid,const int work_count,__global float *path_rssi,const int cols,const int rows){
  const int total=cols*rows;const int path_total=work_count*ap_count;
  for(int path_index=get_global_id(0);path_index<path_total;path_index+=get_global_size(0)){
   const int ai=path_index/work_count;const int local_gid=path_index-ai*work_count;
@@ -911,6 +994,8 @@ __kernel void direct_rssi_paths(__global const float *xs,__global const float *y
   const float dx=x-ax,dy=y-ay;const float d2xy=dx*dx+dy*dy;
   if(cutoff2>0.0f&&d2xy>cutoff2){path_rssi[path_index]=NAN;continue;}
   float d3=sqrt(d2xy+dz2);d3=fmax(d3,1.0f);float wall_loss=0.0f;
+  const float unobstructed=base_dbm-path_loss_factor*log10(d3);
+  if(combine_mode!=1&&unobstructed+strongest_skip_margin<=disconnected){path_rssi[path_index]=NAN;continue;}
   const float ray_min_x=fmin(ax,x),ray_max_x=fmax(ax,x),ray_min_y=fmin(ay,y),ray_max_y=fmax(ay,y);
   for(int pi=offsets[ai];pi<offsets[ai+1];++pi){const int si=segment_indices[pi];const int sb=si*11;
    if(segments[sb+8]<ray_min_x-1.0e-5f||segments[sb+7]>ray_max_x+1.0e-5f||segments[sb+10]<ray_min_y-1.0e-5f||segments[sb+9]>ray_max_y+1.0e-5f)continue;
@@ -1042,7 +1127,8 @@ class OpenCLRFAccelerator:
             cl.enqueue_nd_range_kernel(self.queue,self._colour_kernel,global_size,local_size);cl.enqueue_copy(self.queue,output,out).wait();return output.reshape((*source.shape,4))
         finally:self._lock.release()
 
-    def direct_rssi_grid(self, xs, ys, ap_data, segments, valid_mask, disconnected, combine_mode, settings=None):
+    def direct_rssi_grid(self, xs, ys, ap_data, segments, valid_mask, disconnected, combine_mode,
+                         settings=None, progress_callback=None):
         compact_aps, prepared_segments, segment_indices, offsets = _prepare_direct_inputs(
             ap_data, segments, np.float32
         )
@@ -1058,8 +1144,8 @@ class OpenCLRFAccelerator:
         memory_fraction = max(0.10, min(0.75, float(_setting(settings, "cuda_memory_fraction", 0.45) or 0.45)))
         queue_depth = max(1, min(8, int(_setting(settings, "cuda_queue_depth", 3) or 3)))
         max_barrier_checks = max(10_000_000, int(_setting(
-            settings, "cuda_max_barrier_checks_per_launch", 200_000_000
-        ) or 200_000_000))
+            settings, "cuda_max_barrier_checks_per_launch", 1_000_000_000
+        ) or 1_000_000_000))
         ap_count = int(compact_aps.shape[0])
         packed_segment_count = int(offsets[-1]) if len(offsets) else 0
         average_segments = (packed_segment_count / ap_count) if ap_count else 0.0
@@ -1089,6 +1175,8 @@ class OpenCLRFAccelerator:
             cb = cl.Buffer(self.context, mf.WRITE_ONLY, counts.nbytes)
             pathb = cl.Buffer(self.context, mf.READ_WRITE, chunk_points * ap_count * np.dtype(np.float32).itemsize)
             queued = 0
+            queued_points = 0
+            completed_points = 0
             for start_gid in range(0, total, chunk_points):
                 if self._cancelled(settings):
                     raise RuntimeError("RSSI calculation cancelled")
@@ -1096,6 +1184,11 @@ class OpenCLRFAccelerator:
                 path_items = work * ap_count
                 self._direct_path_kernel.set_args(
                     xb, yb, vb, ab, sb, sib, ob, np.int32(ap_count), np.float32(disconnected),
+                    np.int32(combine_mode),
+                    np.float32(
+                        max(0.0, float(_setting(settings, "strongest_ap_early_exit_margin_db", 12.0) or 0.0))
+                        if bool(_setting(settings, "enable_strongest_ap_early_exit", True)) else 1.0e9
+                    ),
                     np.int32(start_gid), np.int32(work), pathb, np.int32(cols), np.int32(rows),
                 )
                 global_size, local_size = self._launch_shape(path_items)
@@ -1107,10 +1200,15 @@ class OpenCLRFAccelerator:
                 global_size, local_size = self._launch_shape(work)
                 event = cl.enqueue_nd_range_kernel(self.queue, self._direct_reduce_kernel, global_size, local_size)
                 queued += 1
+                queued_points += work
                 is_last = (start_gid + work) >= total
                 if queued >= effective_queue_depth or is_last:
                     event.wait()
+                    completed_points += queued_points
                     queued = 0
+                    queued_points = 0
+                    if progress_callback is not None:
+                        progress_callback(completed_points, total)
                     if self._cancelled(settings):
                         raise RuntimeError("RSSI calculation cancelled")
             cl.enqueue_copy(self.queue, rssi, rb)
@@ -1123,6 +1221,9 @@ class OpenCLRFAccelerator:
 _PREPARED_INPUT_CACHE_LOCK = threading.RLock()
 _PREPARED_INPUT_CACHE = OrderedDict()
 _PREPARED_INPUT_CACHE_MAX = 8
+_ANGULAR_BIN_CACHE_LOCK = threading.RLock()
+_ANGULAR_BIN_CACHE = OrderedDict()
+_ANGULAR_BIN_CACHE_MAX = 8
 
 
 def _prepared_array_signature(array: np.ndarray) -> Tuple[Any, ...]:
@@ -1150,6 +1251,11 @@ def _prepare_direct_inputs(ap_data: np.ndarray, segments: np.ndarray, dtype=np.f
     aps = np.ascontiguousarray(np.asarray(ap_data, dtype=np.float64).reshape(-1, column_count))
     if aps.shape[1] < 10:
         raise ValueError("Direct RSSI AP data must contain at least 10 columns")
+    if aps.shape[0] > 1:
+        # Stronger static link budgets first let strongest-mode kernels avoid
+        # expensive barrier checks once later APs cannot overtake the current best.
+        link_budget_order = np.argsort(-(aps[:, 4] + aps[:, 5] - aps[:, 9]))
+        aps = np.ascontiguousarray(aps[link_budget_order])
     raw_segments = np.ascontiguousarray(np.asarray(segments, dtype=np.float64).reshape(-1, 7))
     dtype = np.dtype(dtype)
     cache_key = (dtype.str, _prepared_array_signature(aps), _prepared_array_signature(raw_segments))
@@ -1226,11 +1332,120 @@ def _prepare_direct_inputs(ap_data: np.ndarray, segments: np.ndarray, dtype=np.f
     return result
 
 
+def _prepare_angular_segment_bins(
+    compact_aps: np.ndarray,
+    prepared_segments: np.ndarray,
+    segment_indices: np.ndarray,
+    segment_offsets: np.ndarray,
+    bin_count: int = 128,
+) -> Tuple[np.ndarray, np.ndarray, int, float]:
+    """Build a conservative AP-relative angular index for RF barriers.
+
+    A segment is placed in every direction bin that its endpoint angular span
+    overlaps, with one extra bin of padding on either side. Therefore a ray can
+    only discard segments that are geometrically incapable of intersecting it.
+    The result is cached independently of attenuation values where possible.
+    """
+    bin_count = max(32, min(512, int(bin_count)))
+    aps = np.ascontiguousarray(compact_aps, dtype=np.float32)
+    segs = np.ascontiguousarray(prepared_segments, dtype=np.float32)
+    indices = np.ascontiguousarray(segment_indices, dtype=np.int32)
+    offsets = np.ascontiguousarray(segment_offsets, dtype=np.int32)
+    geometry_columns = np.ascontiguousarray(segs[:, [0, 1, 2, 3, 7, 8, 9, 10]], dtype=np.float32)
+    ap_columns = np.ascontiguousarray(aps[:, [0, 1, 6]], dtype=np.float32)
+    cache_key = (
+        bin_count,
+        _prepared_array_signature(ap_columns),
+        _prepared_array_signature(geometry_columns),
+        _prepared_array_signature(indices),
+        _prepared_array_signature(offsets),
+    )
+    with _ANGULAR_BIN_CACHE_LOCK:
+        cached = _ANGULAR_BIN_CACHE.get(cache_key)
+        if cached is not None:
+            _ANGULAR_BIN_CACHE.move_to_end(cache_key)
+            return cached
+
+    two_pi = 2.0 * math.pi
+    bins: List[List[int]] = [[] for _ in range(max(1, aps.shape[0] * bin_count))]
+
+    def add_interval(ap_bin_base: int, start_angle: float, end_angle: float, segment_id: int) -> None:
+        start = start_angle % two_pi
+        end = end_angle % two_pi
+        if end < start:
+            end += two_pi
+        first = int(math.floor(start * bin_count / two_pi)) - 1
+        last = int(math.floor(end * bin_count / two_pi)) + 1
+        for raw_bin in range(first, last + 1):
+            bins[ap_bin_base + (raw_bin % bin_count)].append(segment_id)
+
+    for ai in range(aps.shape[0]):
+        ax = float(aps[ai, 0])
+        ay = float(aps[ai, 1])
+        first_segment = int(offsets[ai])
+        last_segment = int(offsets[ai + 1])
+        base = ai * bin_count
+        for packed_index in range(first_segment, last_segment):
+            current_segment = int(indices[packed_index])
+            x1 = float(segs[current_segment, 0])
+            y1 = float(segs[current_segment, 1])
+            x2 = x1 + float(segs[current_segment, 2])
+            y2 = y1 + float(segs[current_segment, 3])
+            vx = x2 - x1
+            vy = y2 - y1
+            length2 = vx * vx + vy * vy
+            if length2 <= 1.0e-16:
+                continue
+            projection = ((ax - x1) * vx + (ay - y1) * vy) / length2
+            projection = max(0.0, min(1.0, projection))
+            nearest_x = x1 + projection * vx
+            nearest_y = y1 + projection * vy
+            distance2 = (nearest_x - ax) ** 2 + (nearest_y - ay) ** 2
+            # Match the device mapping exactly: atan2 [-pi, pi] shifted so
+            # bin zero starts at -pi rather than at the positive X axis.
+            angle1 = (math.atan2(y1 - ay, x1 - ax) + math.pi) % two_pi
+            angle2 = (math.atan2(y2 - ay, x2 - ax) + math.pi) % two_pi
+            delta = (angle2 - angle1) % two_pi
+            # Segments passing almost through the AP are rare but their angular
+            # interval is numerically ambiguous. Retaining them in all bins is
+            # conservative and avoids missing a real attenuation crossing.
+            if distance2 <= 1.0e-8 or abs(delta - math.pi) <= (two_pi / bin_count):
+                for angular_bin in range(bin_count):
+                    bins[base + angular_bin].append(current_segment)
+                continue
+            if delta <= math.pi:
+                add_interval(base, angle1, angle1 + delta, current_segment)
+            else:
+                add_interval(base, angle2, angle2 + (two_pi - delta), current_segment)
+
+    flattened: List[int] = []
+    angular_offsets = np.zeros(len(bins) + 1, dtype=np.int32)
+    for index, values in enumerate(bins):
+        if values:
+            # Padding can place a segment into the same wrapped bin twice.
+            # Preserve order while removing duplicates.
+            flattened.extend(dict.fromkeys(values))
+        angular_offsets[index + 1] = len(flattened)
+    angular_indices = (
+        np.ascontiguousarray(np.asarray(flattened, dtype=np.int32))
+        if flattened else np.zeros(1, dtype=np.int32)
+    )
+    average_candidates = float(len(flattened)) / max(1, len(bins))
+    result = (angular_indices, np.ascontiguousarray(angular_offsets), bin_count, average_candidates)
+    with _ANGULAR_BIN_CACHE_LOCK:
+        _ANGULAR_BIN_CACHE[cache_key] = result
+        _ANGULAR_BIN_CACHE.move_to_end(cache_key)
+        while len(_ANGULAR_BIN_CACHE) > _ANGULAR_BIN_CACHE_MAX:
+            _ANGULAR_BIN_CACHE.popitem(last=False)
+    return result
+
+
 
 if njit is not None:
     @njit(parallel=True, fastmath=True, cache=True, nogil=True)
     def _numba_direct_rssi_grid(xs, ys, valid, ap_data, segments, segment_indices, segment_offsets,
-                                disconnected, combine_mode, start_gid, work_count, out, counts):
+                                disconnected, combine_mode, strongest_skip_margin, start_gid,
+                                work_count, out, counts):
         cols = xs.shape[0]
         total = ys.shape[0] * cols
         # Flattening the grid gives prange enough independent iterations even
@@ -1260,6 +1475,9 @@ if njit is not None:
                 d3 = math.sqrt(d2xy + dz2)
                 if d3 < 1.0:
                     d3 = 1.0
+                unobstructed = base_dbm - path_loss_factor * math.log10(d3)
+                if combine_mode != 1 and pc > 0 and unobstructed + strongest_skip_margin <= best:
+                    continue
                 ray_min_x = ax if ax < x else x
                 ray_max_x = x if x > ax else ax
                 ray_min_y = ay if ay < y else y
@@ -1301,7 +1519,7 @@ else:
 
 def gpu_direct_rssi_grid(xs: np.ndarray, ys: np.ndarray, ap_data: np.ndarray, segments: np.ndarray,
                          valid_mask: Optional[np.ndarray], disconnected: float, combine_mode: int,
-                         settings: Any) -> Optional[Tuple[np.ndarray, np.ndarray, str]]:
+                         settings: Any, progress_callback=None) -> Optional[Tuple[np.ndarray, np.ndarray, str]]:
     if not _enabled(settings):
         return None
     ap_array = np.asarray(ap_data)
@@ -1314,7 +1532,8 @@ def gpu_direct_rssi_grid(xs: np.ndarray, ys: np.ndarray, ap_data: np.ndarray, se
         if not hasattr(backend, "direct_rssi_grid"):
             return None
         grids = backend.direct_rssi_grid(
-            xs, ys, ap_data, segments, valid_mask, disconnected, combine_mode, settings
+            xs, ys, ap_data, segments, valid_mask, disconnected, combine_mode, settings,
+            progress_callback=progress_callback,
         )
         return grids, backend.info.label, backend.backend_name, dict(getattr(backend, "last_direct_stats", {}) or {})
 
@@ -1331,6 +1550,14 @@ def gpu_direct_rssi_grid(xs: np.ndarray, ys: np.ndarray, ap_data: np.ndarray, se
         detail = f"; {kernel}, {chunks} launch chunk(s), {chunk_points:,} points/chunk"
         if cooperative_threads > 1:
             detail += f", {cooperative_threads} threads/path"
+        angular_bins = int(stats.get("angular_bins", 0) or 0)
+        average_candidates = float(stats.get("average_candidates_per_angular_bin", 0.0) or 0.0)
+        candidate_ratio = float(stats.get("candidate_ratio", 1.0) or 1.0)
+        if angular_bins:
+            detail += (
+                f", {angular_bins} angular bins, {average_candidates:.1f} candidate barriers/bin"
+                f" ({candidate_ratio * 100.0:.1f}% of AP barrier list)"
+            )
     return rssi, counts, f"{backend_name}: {label}{detail}"
 
 
@@ -1347,6 +1574,10 @@ def numba_direct_rssi_grid(xs: np.ndarray, ys: np.ndarray, ap_data: np.ndarray, 
     out = np.empty(total, dtype=np.float64)
     counts = np.zeros(total, dtype=np.int16)
     cancel_event = getattr(settings, "_cancel_event", None) if settings is not None else None
+    strongest_skip_margin = (
+        max(0.0, float(_setting(settings, "strongest_ap_early_exit_margin_db", 12.0) or 0.0))
+        if bool(_setting(settings, "enable_strongest_ap_early_exit", True)) else 1.0e9
+    )
     # A single call is fastest when cancellation is not being monitored. When
     # it is, use large compiled chunks so Cancel is checked without reverting
     # to Python per-point work.
@@ -1357,7 +1588,7 @@ def numba_direct_rssi_grid(xs: np.ndarray, ys: np.ndarray, ap_data: np.ndarray, 
         work_count = min(chunk_points, total - start_gid)
         _numba_direct_rssi_grid(
             xs64, ys64, valid, compact, prepared_segments, segment_indices, offsets, float(disconnected),
-            int(combine_mode), int(start_gid), int(work_count), out, counts,
+            int(combine_mode), float(strongest_skip_margin), int(start_gid), int(work_count), out, counts,
         )
     if cancel_event is not None and cancel_event.is_set():
         raise RuntimeError("RSSI calculation cancelled")
