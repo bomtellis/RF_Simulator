@@ -563,6 +563,7 @@ class AutoPlannerSettings:
     clients_per_ap: int = 50
     keep_existing_aps: bool = True
     remove_previous_planned_aps: bool = True
+    ap_radio_profile: str = "Predictive planner"
     radio_requirements: List[PlannerRadioRequirement] = field(default_factory=lambda: [
         PlannerRadioRequirement(
             name="2.4 GHz", frequency_mhz=2400.0, tx_power_dbm=18.0,
@@ -600,6 +601,7 @@ class AutoPlannerSettings:
             "clients_per_ap": self.clients_per_ap,
             "keep_existing_aps": self.keep_existing_aps,
             "remove_previous_planned_aps": self.remove_previous_planned_aps,
+            "ap_radio_profile": self.ap_radio_profile,
             "radio_requirements": [r.to_dict() for r in self.radio_requirements],
         }
 
@@ -643,6 +645,7 @@ class AutoPlannerSettings:
         base.clients_per_ap = max(1, int(data.get("clients_per_ap", base.clients_per_ap)))
         base.keep_existing_aps = bool(data.get("keep_existing_aps", base.keep_existing_aps))
         base.remove_previous_planned_aps = bool(data.get("remove_previous_planned_aps", base.remove_previous_planned_aps))
+        base.ap_radio_profile = str(data.get("ap_radio_profile", base.ap_radio_profile) or base.ap_radio_profile)
         return base
 
 
@@ -726,7 +729,7 @@ class FloorModel:
     walls: List[Wall2D] = field(default_factory=list)
     spaces: List[Space2D] = field(default_factory=list)
     elements: List[IFCElement2D] = field(default_factory=list)
-    slab_attenuation_by_band_db: Dict[float, float] = field(default_factory=lambda: {2400.0: 12.0, 5000.0: 18.0, 6000.0: 22.0})
+    slab_attenuation_by_band_db: Dict[float, float] = field(default_factory=lambda: {2400.0: 35.0, 5000.0: 55.1581, 6000.0: 60.0})
 
     def slab_attenuation_db_for_frequency(self, frequency_mhz: float) -> float:
         """Return floor/slab penetration attenuation for the selected band."""
@@ -748,12 +751,13 @@ class FloorModel:
 
 @dataclass
 class PlannerBoundary2D:
-    """User-defined AP planning extent shared by every imported IFC floor."""
+    """User-defined AP planning/RF extent for one imported IFC floor."""
 
     guid: str
     name: str
     polygon: Polygon
     shape_type: str = "polygon"  # rectangle or polygon
+    floor: str = ""  # Empty means legacy/shared boundary from older projects.
 
 
 @dataclass
@@ -831,18 +835,25 @@ class HeatmapSettings:
     default_floor_attenuation_by_frequency_db: Dict[float, float] = field(default_factory=lambda: {
         433.0: 8.0,
         868.0: 10.0,
-        2400.0: 12.0,
-        5000.0: 18.0,
-        6000.0: 22.0,
+        2400.0: 35.0,
+        5000.0: 55.1581,
+        6000.0: 60.0,
     })
     default_wall_attenuation_by_material_db: Dict[str, Dict[float, float]] = field(default_factory=lambda: {
         "default": {433.0: 2.0, 868.0: 3.0, 2400.0: 5.0, 5000.0: 7.0, 6000.0: 8.0},
-        "concrete": {433.0: 5.0, 868.0: 7.0, 2400.0: 12.0, 5000.0: 16.0, 6000.0: 20.0},
-        "brick": {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 11.0, 6000.0: 14.0},
-        "masonry": {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 11.0, 6000.0: 14.0},
-        "glass": {433.0: 1.0, 868.0: 2.0, 2400.0: 3.0, 5000.0: 5.0, 6000.0: 7.0},
-        "plasterboard": {433.0: 1.0, 868.0: 1.5, 2400.0: 3.0, 5000.0: 4.0, 6000.0: 5.0},
-        "partition": {433.0: 1.0, 868.0: 1.5, 2400.0: 3.0, 5000.0: 4.0, 6000.0: 5.0},
+        "concrete": {433.0: 5.0, 868.0: 7.0, 2400.0: 12.0, 5000.0: 55.1581, 6000.0: 60.0},
+        "reinforced concrete": {433.0: 5.0, 868.0: 7.0, 2400.0: 12.0, 5000.0: 53.7989, 6000.0: 58.0},
+        "brick-faced concrete": {433.0: 5.0, 868.0: 7.0, 2400.0: 12.0, 5000.0: 39.8953, 6000.0: 44.0},
+        "brick-faced masonry block": {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 32.6320, 6000.0: 36.0},
+        "brick": {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 15.2806, 6000.0: 18.0},
+        "masonry": {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 14.9250, 6000.0: 18.0},
+        "masonry block": {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 14.9250, 6000.0: 18.0},
+        "timber": {433.0: 1.0, 868.0: 1.5, 2400.0: 3.0, 5000.0: 3.2778, 6000.0: 4.0},
+        "glass": {433.0: 1.0, 868.0: 2.0, 2400.0: 3.0, 5000.0: 0.0688, 6000.0: 1.0},
+        "drywall": {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0},
+        "plywood": {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0},
+        "plasterboard": {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0},
+        "partition": {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0},
         "metal": {433.0: 12.0, 868.0: 16.0, 2400.0: 20.0, 5000.0: 28.0, 6000.0: 35.0},
         "steel": {433.0: 12.0, 868.0: 16.0, 2400.0: 20.0, 5000.0: 28.0, 6000.0: 35.0}
     })
@@ -872,7 +883,7 @@ class HeatmapSettings:
     # activate or override any category/type across the complete project.
     default_ifc_element_attenuation_by_type_db: Dict[str, Dict[float, float]] = field(default_factory=lambda: {
         "default": {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0},
-        "slab": {433.0: 8.0, 868.0: 10.0, 2400.0: 12.0, 5000.0: 18.0, 6000.0: 22.0},
+        "slab": {433.0: 8.0, 868.0: 10.0, 2400.0: 35.0, 5000.0: 55.1581, 6000.0: 60.0},
         "roof": {433.0: 5.0, 868.0: 7.0, 2400.0: 9.0, 5000.0: 13.0, 6000.0: 16.0},
         "column": {433.0: 3.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 12.0, 6000.0: 15.0},
         "beam": {433.0: 2.0, 868.0: 4.0, 2400.0: 6.0, 5000.0: 9.0, 6000.0: 12.0},
@@ -880,9 +891,17 @@ class HeatmapSettings:
         "covering": {433.0: 0.5, 868.0: 0.8, 2400.0: 1.0, 5000.0: 1.5, 6000.0: 2.0},
         "plate": {433.0: 2.0, 868.0: 3.0, 2400.0: 5.0, 5000.0: 8.0, 6000.0: 10.0},
         "member": {433.0: 1.0, 868.0: 2.0, 2400.0: 3.0, 5000.0: 5.0, 6000.0: 7.0},
-        "concrete": {433.0: 5.0, 868.0: 7.0, 2400.0: 12.0, 5000.0: 16.0, 6000.0: 20.0},
-        "brick": {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 11.0, 6000.0: 14.0},
-        "glass": {433.0: 1.0, 868.0: 2.0, 2400.0: 3.0, 5000.0: 5.0, 6000.0: 7.0},
+        "concrete": {433.0: 5.0, 868.0: 7.0, 2400.0: 12.0, 5000.0: 55.1581, 6000.0: 60.0},
+        "reinforced concrete": {433.0: 5.0, 868.0: 7.0, 2400.0: 12.0, 5000.0: 53.7989, 6000.0: 58.0},
+        "brick-faced concrete": {433.0: 5.0, 868.0: 7.0, 2400.0: 12.0, 5000.0: 39.8953, 6000.0: 44.0},
+        "brick-faced masonry block": {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 32.6320, 6000.0: 36.0},
+        "brick": {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 15.2806, 6000.0: 18.0},
+        "masonry": {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 14.9250, 6000.0: 18.0},
+        "masonry block": {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 14.9250, 6000.0: 18.0},
+        "timber": {433.0: 1.0, 868.0: 1.5, 2400.0: 3.0, 5000.0: 3.2778, 6000.0: 4.0},
+        "glass": {433.0: 1.0, 868.0: 2.0, 2400.0: 3.0, 5000.0: 0.0688, 6000.0: 1.0},
+        "drywall": {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0},
+        "plywood": {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0},
         "metal": {433.0: 12.0, 868.0: 16.0, 2400.0: 20.0, 5000.0: 28.0, 6000.0: 35.0},
         "steel": {433.0: 12.0, 868.0: 16.0, 2400.0: 20.0, 5000.0: 28.0, 6000.0: 35.0},
         "furniture": {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0},
@@ -898,6 +917,7 @@ class HeatmapSettings:
         {"name": "5 GHz", "frequency_mhz": 5000.0, "tx_power_dbm": 20.0, "antenna_pattern": "Omni ceiling AP", "enabled": True, "cutoff_radius_m": 35.0, "antenna_gain_dbi": 0.0, "channel": "36", "channel_width_mhz": 40.0, "spectrum_occupancy_percent": 20.0},
         {"name": "6 GHz", "frequency_mhz": 6000.0, "tx_power_dbm": 20.0, "antenna_pattern": "Omni ceiling AP", "enabled": False, "cutoff_radius_m": 30.0, "antenna_gain_dbi": 0.0, "channel": "5", "channel_width_mhz": 80.0, "spectrum_occupancy_percent": 10.0}
     ])
+    custom_radio_profiles: Dict[str, List[Dict[str, object]]] = field(default_factory=dict)
     auto_planner_settings: Dict[str, object] = field(default_factory=lambda: AutoPlannerSettings().to_dict())
     user_wall_default_type: str = "partition"
     user_wall_default_thickness_m: float = 0.15
@@ -1207,6 +1227,13 @@ class HeatmapSettings:
         raw_radios = data.get("default_ap_radios", settings.default_ap_radios)
         if isinstance(raw_radios, list):
             settings.default_ap_radios = [dict(r) for r in raw_radios if isinstance(r, dict)]
+        raw_custom_profiles = data.get("custom_radio_profiles", data.get("radio_profile_presets", {}))
+        if isinstance(raw_custom_profiles, dict):
+            settings.custom_radio_profiles = {
+                str(name): [dict(radio) for radio in radios if isinstance(radio, dict)]
+                for name, radios in raw_custom_profiles.items()
+                if str(name).strip() and isinstance(radios, list)
+            }
         raw_planner = data.get("auto_planner_settings", data.get("predictive_ap_planner", {}))
         if isinstance(raw_planner, dict):
             settings.auto_planner_settings = AutoPlannerSettings.from_dict(raw_planner).to_dict()
@@ -5902,7 +5929,10 @@ class BulkAccessPointDialog(QDialog):
 
         ap_type = QComboBox(); ap_type.addItems(list(AP_TYPE_PRESETS.keys()))
         add_field("ap_type", "AP type / symbol", ap_type)
-        radio_profile = QComboBox(); radio_profile.addItem("Project default radios"); radio_profile.addItems(list(RADIO_PROFILE_PRESETS.keys()))
+        radio_profile = QComboBox()
+        radio_profile.addItem("Project default radios")
+        profile_names = parent._radio_profile_names() if hasattr(parent, "_radio_profile_names") else sorted(RADIO_PROFILE_PRESETS)
+        radio_profile.addItems(profile_names)
         add_field("radio_profile", "Replace radio profile", radio_profile)
         mount = QDoubleSpinBox(); mount.setRange(0.1, 50.0); mount.setValue(2.7); mount.setSuffix(" m")
         add_field("mount_height_m", "Mount height", mount)
@@ -5973,6 +6003,7 @@ class AutoPlannerSettingsDialog(QDialog):
     def __init__(self, parent, settings: AutoPlannerSettings, pattern_names: List[str]):
         super().__init__(parent)
         self.pattern_names = list(pattern_names)
+        self._initial_radio_requirements = [copy.deepcopy(radio) for radio in settings.radio_requirements]
         self.setWindowTitle("Predictive AP planner settings")
         self.resize(1120, 650)
         layout = QVBoxLayout(self)
@@ -6012,6 +6043,16 @@ class AutoPlannerSettingsDialog(QDialog):
         )
         self.expected_clients = QSpinBox(); self.expected_clients.setRange(0, 1000000); self.expected_clients.setValue(settings.expected_clients)
         self.clients_per_ap = QSpinBox(); self.clients_per_ap.setRange(1, 10000); self.clients_per_ap.setValue(settings.clients_per_ap)
+        self.ap_radio_profile = QComboBox()
+        parent_profiles = parent._radio_profile_names() if hasattr(parent, "_radio_profile_names") else sorted(RADIO_PROFILE_PRESETS)
+        self.ap_radio_profile.addItem("Predictive planner")
+        self.ap_radio_profile.addItem("Project default radios")
+        self.ap_radio_profile.addItems(parent_profiles)
+        self.ap_radio_profile.setEditable(True)
+        selected_profile = str(settings.ap_radio_profile or "Predictive planner")
+        if self.ap_radio_profile.findText(selected_profile) < 0:
+            self.ap_radio_profile.addItem(selected_profile)
+        self.ap_radio_profile.setCurrentText(selected_profile)
         self.keep_existing = QCheckBox("Count and retain manually placed APs on this floor"); self.keep_existing.setChecked(settings.keep_existing_aps)
         self.remove_planned = QCheckBox("Replace APs created by the previous planner run"); self.remove_planned.setChecked(settings.remove_previous_planned_aps)
         form.addRow("Target floor coverage", self.target)
@@ -6029,6 +6070,7 @@ class AutoPlannerSettingsDialog(QDialog):
         form.addRow("Inferred wall-footprint margin", self.wall_margin)
         form.addRow("Expected connected clients", self.expected_clients)
         form.addRow("Maximum clients per AP", self.clients_per_ap)
+        form.addRow("Predicted AP radio profile", self.ap_radio_profile)
         form.addRow(self.keep_existing)
         form.addRow(self.remove_planned)
         layout.addLayout(form)
@@ -6050,11 +6092,72 @@ class AutoPlannerSettingsDialog(QDialog):
 
         for radio in settings.radio_requirements:
             self._add_radio(radio)
+        self.ap_radio_profile.currentTextChanged.connect(self._ap_radio_profile_changed)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept); buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
         self.table.resizeColumnsToContents()
+
+    def _profile_radio_definitions(self, profile_name: str) -> List[Dict[str, object]]:
+        profile_name = str(profile_name or "Predictive planner")
+        if profile_name == "Predictive planner":
+            return []
+        if profile_name == "Project default radios":
+            parent = self.parent()
+            settings = getattr(parent, "heatmap_settings", None)
+            return [dict(item) for item in getattr(settings, "default_ap_radios", []) if isinstance(item, dict)]
+        parent = self.parent()
+        if hasattr(parent, "_radio_profile_definitions"):
+            return [dict(item) for item in parent._radio_profile_definitions().get(profile_name, []) if isinstance(item, dict)]
+        return [dict(item) for item in RADIO_PROFILE_PRESETS.get(profile_name, []) if isinstance(item, dict)]
+
+    def _planner_radio_from_profile_def(self, radio_def: Dict[str, object], index: int) -> PlannerRadioRequirement:
+        name = str(radio_def.get("name", f"Radio-{index + 1}"))
+        frequency = float(radio_def.get("frequency_mhz", 5000.0))
+        channels = radio_def.get("channel", "")
+        if isinstance(channels, str):
+            channel_values = [value.strip() for value in channels.replace(";", ",").split(",") if value.strip()]
+        elif isinstance(channels, (list, tuple)):
+            channel_values = [str(value).strip() for value in channels if str(value).strip()]
+        else:
+            channel_values = []
+        return PlannerRadioRequirement(
+            name=name,
+            enabled=bool(radio_def.get("enabled", True)),
+            frequency_mhz=frequency,
+            tx_power_dbm=float(radio_def.get("tx_power_dbm", 20.0)),
+            antenna_pattern=str(radio_def.get("antenna_pattern", "Omni ceiling AP")),
+            antenna_gain_dbi=float(radio_def.get("antenna_gain_dbi", 0.0)),
+            channel_width_mhz=float(radio_def.get("channel_width_mhz", 20.0)),
+            channels=channel_values or ["1"],
+            spectrum_occupancy_percent=float(radio_def.get("spectrum_occupancy_percent", 0.0)),
+            minimum_rssi_dbm=-67.0,
+            cutoff_radius_m=float(radio_def.get("cutoff_radius_m", 0.0)),
+        )
+
+    def _replace_radio_requirements(self, radios: Sequence[PlannerRadioRequirement]):
+        self.table.blockSignals(True)
+        try:
+            self.table.setRowCount(0)
+            for radio in radios:
+                self._add_radio(radio)
+        finally:
+            self.table.blockSignals(False)
+        self.table.resizeColumnsToContents()
+
+    def _ap_radio_profile_changed(self, profile_name: str):
+        profile_name = str(profile_name or "Predictive planner")
+        if profile_name == "Predictive planner":
+            self._replace_radio_requirements([copy.deepcopy(radio) for radio in self._initial_radio_requirements])
+            return
+        definitions = self._profile_radio_definitions(profile_name)
+        if not definitions:
+            return
+        self._replace_radio_requirements([
+            self._planner_radio_from_profile_def(radio_def, index)
+            for index, radio_def in enumerate(definitions)
+        ])
 
     def _add_radio(self, radio: PlannerRadioRequirement):
         row = self.table.rowCount(); self.table.insertRow(row)
@@ -6117,6 +6220,7 @@ class AutoPlannerSettingsDialog(QDialog):
             use_inferred_spaces=self.use_inferred_spaces.isChecked(),
             expected_clients=int(self.expected_clients.value()), clients_per_ap=int(self.clients_per_ap.value()),
             keep_existing_aps=self.keep_existing.isChecked(), remove_previous_planned_aps=self.remove_planned.isChecked(),
+            ap_radio_profile=str(self.ap_radio_profile.currentText() or "Predictive planner").strip() or "Predictive planner",
             radio_requirements=radios,
         )
 
@@ -6930,11 +7034,20 @@ class PlannerRunSelectionDialog(QDialog):
         floor_items: Sequence[Tuple[str, FloorModel]],
         radio_items: Sequence[Tuple[int, PlannerRadioRequirement]],
         current_floor_name: str = "",
+        current_radio_profile: str = "Predictive planner",
+        radio_profile_names: Optional[Sequence[str]] = None,
+        radio_profile_definitions: Optional[Dict[str, List[Dict[str, object]]]] = None,
+        default_ap_radios: Optional[Sequence[Dict[str, object]]] = None,
     ):
         super().__init__(parent)
         self.setWindowTitle("Predict AP locations - floors and radios")
         self.resize(820, 600)
         self._current_floor_name = str(current_floor_name or "")
+        self._radio_profile_definitions = {
+            str(name): [dict(radio) for radio in radios if isinstance(radio, dict)]
+            for name, radios in (radio_profile_definitions or RADIO_PROFILE_PRESETS).items()
+        }
+        self._default_ap_radios = [dict(radio) for radio in (default_ap_radios or []) if isinstance(radio, dict)]
 
         layout = QVBoxLayout(self)
         intro = QLabel(
@@ -6985,6 +7098,7 @@ class PlannerRunSelectionDialog(QDialog):
                 f"{requirement.antenna_pattern} — channels {channel_text}"
             )
             item.setData(Qt.UserRole, int(source_index))
+            item.setData(Qt.UserRole + 1, float(requirement.frequency_mhz))
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Checked)
             self.radio_list.addItem(item)
@@ -7000,17 +7114,31 @@ class PlannerRunSelectionDialog(QDialog):
         radio_column.addLayout(radio_buttons)
         columns.addLayout(radio_column, 1)
 
+        profile_row = QFormLayout()
+        self.radio_profile = QComboBox()
+        self.radio_profile.addItem("Predictive planner")
+        self.radio_profile.addItem("Project default radios")
+        self.radio_profile.addItems(list(radio_profile_names or sorted(RADIO_PROFILE_PRESETS)))
+        self.radio_profile.setEditable(True)
+        selected_profile = str(current_radio_profile or "Predictive planner")
+        if self.radio_profile.findText(selected_profile) < 0:
+            self.radio_profile.addItem(selected_profile)
+        self.radio_profile.setCurrentText(selected_profile)
+        profile_row.addRow("AP radio profile", self.radio_profile)
+        layout.addLayout(profile_row)
+
         self.summary = QLabel()
         self.summary.setWordWrap(True)
         layout.addWidget(self.summary)
         self.floor_list.itemChanged.connect(self._update_summary)
         self.radio_list.itemChanged.connect(self._update_summary)
+        self.radio_profile.currentTextChanged.connect(self._radio_profile_changed)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
-        self._update_summary()
+        self._radio_profile_changed(self.radio_profile.currentText())
 
     def _set_all_checked(self, list_widget: QListWidget, checked: bool):
         state = Qt.Checked if checked else Qt.Unchecked
@@ -7050,12 +7178,50 @@ class PlannerRunSelectionDialog(QDialog):
             if self.radio_list.item(index).checkState() == Qt.Checked
         ]
 
+    def selected_radio_profile(self) -> str:
+        return str(self.radio_profile.currentText() or "Predictive planner").strip() or "Predictive planner"
+
+    def _profile_frequencies(self, profile_name: str) -> List[float]:
+        profile_name = str(profile_name or "Predictive planner")
+        if profile_name == "Predictive planner":
+            return []
+        radios = self._default_ap_radios if profile_name == "Project default radios" else self._radio_profile_definitions.get(profile_name, [])
+        frequencies = []
+        for radio in radios:
+            if not bool(radio.get("enabled", True)):
+                continue
+            try:
+                frequencies.append(float(radio.get("frequency_mhz", 0.0)))
+            except Exception:
+                continue
+        return frequencies
+
+    def _radio_profile_changed(self, profile_name: str):
+        frequencies = self._profile_frequencies(profile_name)
+        if frequencies:
+            self.radio_list.blockSignals(True)
+            try:
+                for index in range(self.radio_list.count()):
+                    item = self.radio_list.item(index)
+                    try:
+                        frequency = float(item.data(Qt.UserRole + 1))
+                    except Exception:
+                        frequency = 0.0
+                    item.setCheckState(
+                        Qt.Checked if any(abs(frequency - candidate) < 1e-6 for candidate in frequencies) else Qt.Unchecked
+                    )
+            finally:
+                self.radio_list.blockSignals(False)
+        self._update_summary()
+
     def _update_summary(self, *_):
         floor_count = len(self.selected_floor_names())
         radio_count = len(self.selected_radio_indices())
+        profile_name = self.selected_radio_profile()
         self.summary.setText(
             f"Selected: {floor_count} floor{'s' if floor_count != 1 else ''}; "
-            f"each predicted AP will contain {radio_count} radio{'s' if radio_count != 1 else ''}."
+            f"each predicted AP will contain {radio_count} radio{'s' if radio_count != 1 else ''}; "
+            f"AP radio profile: {profile_name}."
         )
 
     def accept(self):
@@ -7064,6 +7230,209 @@ class PlannerRunSelectionDialog(QDialog):
             return
         if not self.selected_radio_indices():
             QMessageBox.warning(self, "No radios selected", "Select at least one planner radio.")
+            return
+        super().accept()
+
+
+class RadioProfileManagerDialog(QDialog):
+    HEADERS = ["Enabled", "Name", "Frequency MHz", "Pattern", "TX dBm", "Gain dBi", "Width MHz", "Channel", "Occupancy %", "Cut-off m"]
+
+    def __init__(self, parent, profiles: Dict[str, List[Dict[str, object]]], pattern_names: List[str]):
+        super().__init__(parent)
+        self.setWindowTitle("Manage AP radio profiles")
+        self.resize(980, 620)
+        self.pattern_names = list(pattern_names)
+        self._profile_radios: List[List[Dict[str, object]]] = []
+        self._current_index = -1
+
+        layout = QVBoxLayout(self)
+        columns = QHBoxLayout()
+        layout.addLayout(columns, 1)
+
+        left = QVBoxLayout()
+        left.addWidget(QLabel("Radio profiles"))
+        self.profile_list = QListWidget()
+        self.profile_list.setAlternatingRowColors(True)
+        left.addWidget(self.profile_list, 1)
+        profile_buttons = QHBoxLayout()
+        add_profile = QPushButton("Add")
+        duplicate_profile = QPushButton("Duplicate")
+        delete_profile = QPushButton("Delete")
+        profile_buttons.addWidget(add_profile)
+        profile_buttons.addWidget(duplicate_profile)
+        profile_buttons.addWidget(delete_profile)
+        left.addLayout(profile_buttons)
+        columns.addLayout(left, 1)
+
+        right = QVBoxLayout()
+        right.addWidget(QLabel("Radios in selected profile"))
+        self.radio_table = QTableWidget(0, len(self.HEADERS))
+        self.radio_table.setHorizontalHeaderLabels(self.HEADERS)
+        right.addWidget(self.radio_table, 1)
+        radio_buttons = QHBoxLayout()
+        add_radio = QPushButton("Add radio")
+        remove_radio = QPushButton("Remove radio")
+        radio_buttons.addWidget(add_radio)
+        radio_buttons.addWidget(remove_radio)
+        radio_buttons.addStretch(1)
+        right.addLayout(radio_buttons)
+        columns.addLayout(right, 3)
+
+        for name in sorted(profiles):
+            self._add_profile_item(str(name), [dict(radio) for radio in profiles.get(name, [])])
+        if self.profile_list.count() == 0:
+            self._add_profile_item("New radio profile", self._default_radios())
+
+        add_profile.clicked.connect(self._add_profile)
+        duplicate_profile.clicked.connect(self._duplicate_profile)
+        delete_profile.clicked.connect(self._delete_profile)
+        add_radio.clicked.connect(lambda: self._add_radio_row({}))
+        remove_radio.clicked.connect(self._remove_radio)
+        self.profile_list.currentRowChanged.connect(self._profile_selection_changed)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.profile_list.setCurrentRow(0)
+
+    def _default_radios(self) -> List[Dict[str, object]]:
+        return [
+            {"name": "2.4 GHz", "frequency_mhz": 2400.0, "tx_power_dbm": 20.0, "antenna_pattern": "Omni ceiling AP", "enabled": True, "channel": "1", "channel_width_mhz": 20.0, "spectrum_occupancy_percent": 35.0, "cutoff_radius_m": 45.0},
+            {"name": "5 GHz", "frequency_mhz": 5000.0, "tx_power_dbm": 20.0, "antenna_pattern": "Omni ceiling AP", "enabled": True, "channel": "36", "channel_width_mhz": 40.0, "spectrum_occupancy_percent": 20.0, "cutoff_radius_m": 35.0},
+        ]
+
+    def _add_profile_item(self, name: str, radios: List[Dict[str, object]]):
+        item = QListWidgetItem(name)
+        item.setFlags(item.flags() | Qt.ItemIsEditable)
+        self.profile_list.addItem(item)
+        self._profile_radios.append([dict(radio) for radio in radios])
+
+    def _unique_profile_name(self, base: str) -> str:
+        names = {
+            self.profile_list.item(index).text().strip()
+            for index in range(self.profile_list.count())
+        }
+        if base not in names:
+            return base
+        suffix = 2
+        while f"{base} {suffix}" in names:
+            suffix += 1
+        return f"{base} {suffix}"
+
+    def _add_profile(self):
+        self._save_current_radios()
+        self._add_profile_item(self._unique_profile_name("New radio profile"), self._default_radios())
+        self.profile_list.setCurrentRow(self.profile_list.count() - 1)
+
+    def _duplicate_profile(self):
+        row = self.profile_list.currentRow()
+        if row < 0:
+            return
+        self._save_current_radios()
+        source_name = self.profile_list.item(row).text().strip() or "Radio profile"
+        self._add_profile_item(self._unique_profile_name(f"{source_name} copy"), copy.deepcopy(self._profile_radios[row]))
+        self.profile_list.setCurrentRow(self.profile_list.count() - 1)
+
+    def _delete_profile(self):
+        row = self.profile_list.currentRow()
+        if row < 0:
+            return
+        self.profile_list.takeItem(row)
+        del self._profile_radios[row]
+        self._current_index = -1
+        if self.profile_list.count():
+            self.profile_list.setCurrentRow(min(row, self.profile_list.count() - 1))
+        else:
+            self.radio_table.setRowCount(0)
+
+    def _profile_selection_changed(self, row: int):
+        if self._current_index >= 0 and self._current_index != row:
+            self._profile_radios[self._current_index] = self._radio_rows()
+        self._current_index = int(row)
+        self.radio_table.setRowCount(0)
+        if row < 0 or row >= len(self._profile_radios):
+            return
+        for radio in self._profile_radios[row]:
+            self._add_radio_row(radio)
+
+    def _add_radio_row(self, radio: Dict[str, object]):
+        row = self.radio_table.rowCount()
+        self.radio_table.insertRow(row)
+        values = [
+            "Yes" if bool(radio.get("enabled", True)) else "No",
+            str(radio.get("name", f"Radio-{row + 1}")),
+            f"{float(radio.get('frequency_mhz', 5000.0)):g}",
+            str(radio.get("antenna_pattern", "Omni ceiling AP")),
+            f"{float(radio.get('tx_power_dbm', 20.0)):g}",
+            f"{float(radio.get('antenna_gain_dbi', 0.0)):g}",
+            f"{float(radio.get('channel_width_mhz', 20.0)):g}",
+            str(radio.get("channel", "")),
+            f"{float(radio.get('spectrum_occupancy_percent', 0.0)):g}",
+            f"{float(radio.get('cutoff_radius_m', 0.0)):g}",
+        ]
+        for col, value in enumerate(values):
+            self.radio_table.setItem(row, col, QTableWidgetItem(value))
+        self.radio_table.takeItem(row, 3)
+        pattern = QComboBox()
+        pattern.addItems(self.pattern_names)
+        pattern.setEditable(True)
+        pattern.setCurrentText(values[3])
+        self.radio_table.setCellWidget(row, 3, pattern)
+        self.radio_table.resizeColumnsToContents()
+
+    def _remove_radio(self):
+        row = self.radio_table.currentRow()
+        if row >= 0:
+            self.radio_table.removeRow(row)
+
+    def _radio_rows(self) -> List[Dict[str, object]]:
+        radios: List[Dict[str, object]] = []
+        for row in range(self.radio_table.rowCount()):
+            def text(col: int, default: str = "") -> str:
+                item = self.radio_table.item(row, col)
+                return item.text().strip() if item is not None else default
+            pattern_widget = self.radio_table.cellWidget(row, 3)
+            pattern = pattern_widget.currentText().strip() if isinstance(pattern_widget, QComboBox) else text(3, "Omni ceiling AP")
+            radios.append({
+                "enabled": text(0, "Yes").lower() in {"yes", "y", "true", "1", "on", "enabled"},
+                "name": text(1, f"Radio-{row + 1}") or f"Radio-{row + 1}",
+                "frequency_mhz": float(text(2, "5000")),
+                "antenna_pattern": pattern or "Omni ceiling AP",
+                "tx_power_dbm": float(text(4, "20")),
+                "antenna_gain_dbi": float(text(5, "0")),
+                "channel_width_mhz": max(0.01, float(text(6, "20"))),
+                "channel": text(7, ""),
+                "spectrum_occupancy_percent": max(0.0, min(100.0, float(text(8, "0")))),
+                "cutoff_radius_m": max(0.0, float(text(9, "0"))),
+            })
+        return radios
+
+    def _save_current_radios(self):
+        row = self.profile_list.currentRow()
+        if 0 <= row < len(self._profile_radios):
+            self._profile_radios[row] = self._radio_rows()
+
+    def profiles(self) -> Dict[str, List[Dict[str, object]]]:
+        self._save_current_radios()
+        result: Dict[str, List[Dict[str, object]]] = {}
+        for index in range(self.profile_list.count()):
+            name = self.profile_list.item(index).text().strip()
+            if not name:
+                continue
+            base = name
+            suffix = 2
+            while name in result:
+                name = f"{base} {suffix}"
+                suffix += 1
+            result[name] = copy.deepcopy(self._profile_radios[index])
+        return result
+
+    def accept(self):
+        try:
+            self._validated_profiles = self.profiles()
+        except Exception as exc:
+            QMessageBox.warning(self, "Invalid radio profile", str(exc))
             return
         super().accept()
 
@@ -7921,6 +8290,209 @@ class APSpacePlacementDialog(QDialog):
         }
 
 
+class PolarPattern3DWidget(QWidget):
+    """Interactive isometric renderer for an antenna polar pattern."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.pattern: Optional[AntennaPattern] = None
+        self.radio_gain_dbi = 0.0
+        self.ap_azimuth_deg = 0.0
+        self.ap_downtilt_deg = 0.0
+        self.yaw_deg = -35.0
+        self.pitch_deg = 28.0
+        self._last_mouse_pos = None
+        self.setMinimumSize(520, 420)
+        self.setMouseTracking(True)
+
+    def set_pattern(self, pattern: Optional[AntennaPattern], radio_gain_dbi: float = 0.0, ap_azimuth_deg: float = 0.0, ap_downtilt_deg: float = 0.0):
+        self.pattern = pattern
+        self.radio_gain_dbi = float(radio_gain_dbi or 0.0)
+        self.ap_azimuth_deg = float(ap_azimuth_deg or 0.0)
+        self.ap_downtilt_deg = float(ap_downtilt_deg or 0.0)
+        self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._last_mouse_pos = event.position()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._last_mouse_pos is not None and event.buttons() & Qt.LeftButton:
+            pos = event.position()
+            delta = pos - self._last_mouse_pos
+            self.yaw_deg += float(delta.x()) * 0.45
+            self.pitch_deg = max(-85.0, min(85.0, self.pitch_deg + float(delta.y()) * 0.35))
+            self._last_mouse_pos = pos
+            self.update()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._last_mouse_pos = None
+        super().mouseReleaseEvent(event)
+
+    @staticmethod
+    def _rotate_vector(x: float, y: float, z: float, yaw_deg: float, pitch_deg: float) -> Tuple[float, float, float]:
+        yaw = math.radians(yaw_deg)
+        pitch = math.radians(pitch_deg)
+        cy = math.cos(yaw)
+        sy = math.sin(yaw)
+        cp = math.cos(pitch)
+        sp = math.sin(pitch)
+        x1 = x * cy - y * sy
+        y1 = x * sy + y * cy
+        z1 = z
+        y2 = y1 * cp - z1 * sp
+        z2 = y1 * sp + z1 * cp
+        return x1, y2, z2
+
+    def _surface_points(self):
+        pattern = self.pattern
+        if pattern is None:
+            return [], 0.0, 0.0
+        azimuths = list(range(-180, 181, 10))
+        elevations = list(range(-90, 91, 10))
+        gains = []
+        for el in elevations:
+            row = []
+            for az in azimuths:
+                gain = float(pattern.gain_dbi(float(az), float(el))) + self.radio_gain_dbi
+                row.append(gain)
+                gains.append(gain)
+        gain_min = min(gains) if gains else 0.0
+        gain_max = max(gains) if gains else 1.0
+        floor_gain = gain_max - 30.0
+        points = []
+        for el_index, el in enumerate(elevations):
+            row = []
+            el_rad = math.radians(float(el) - self.ap_downtilt_deg)
+            for az_index, az in enumerate(azimuths):
+                gain = gains[el_index * len(azimuths) + az_index]
+                linear = math.pow(10.0, (max(gain, floor_gain) - gain_max) / 20.0)
+                radius = 0.22 + 0.78 * linear
+                az_rad = math.radians(float(az) + self.ap_azimuth_deg)
+                x = radius * math.cos(el_rad) * math.cos(az_rad)
+                y = radius * math.cos(el_rad) * math.sin(az_rad)
+                z = radius * math.sin(el_rad)
+                row.append((x, y, z, gain))
+            points.append(row)
+        return points, gain_min, gain_max
+
+    def _project(self, point: Tuple[float, float, float, float], scale: float, cx: float, cy: float) -> Tuple[QPointF, float, float]:
+        x, y, z, gain = point
+        xr, yr, zr = self._rotate_vector(x, y, z, self.yaw_deg, self.pitch_deg)
+        return QPointF(cx + xr * scale, cy - yr * scale), zr, gain
+
+    @staticmethod
+    def _gain_colour(gain: float, gain_min: float, gain_max: float) -> QColor:
+        span = max(1e-6, gain_max - gain_min)
+        t = max(0.0, min(1.0, (gain - gain_min) / span))
+        if t < 0.5:
+            local = t / 0.5
+            return QColor(int(40 + 40 * local), int(110 + 130 * local), int(220 - 120 * local), 190)
+        local = (t - 0.5) / 0.5
+        return QColor(int(80 + 175 * local), int(240 - 90 * local), int(100 - 40 * local), 205)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = self.rect()
+        painter.fillRect(rect, QColor("#F7F8FA"))
+        painter.setPen(QPen(QColor("#596579"), 1))
+        painter.drawText(rect.adjusted(12, 10, -12, -12), Qt.AlignLeft | Qt.AlignTop, "Drag to spin the 3D polar pattern")
+        if self.pattern is None:
+            painter.drawText(rect, Qt.AlignCenter, "No antenna pattern selected")
+            return
+
+        points, gain_min, gain_max = self._surface_points()
+        if not points:
+            return
+        cx = rect.width() * 0.52
+        cy = rect.height() * 0.53
+        scale = min(rect.width(), rect.height()) * 0.34
+
+        axes = [
+            ((0.0, 0.0, 0.0, 0.0), (1.25, 0.0, 0.0, 0.0), "+X"),
+            ((0.0, 0.0, 0.0, 0.0), (0.0, 1.25, 0.0, 0.0), "+Y"),
+            ((0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 1.25, 0.0), "+Z"),
+        ]
+        painter.setPen(QPen(QColor("#718096"), 1, Qt.DashLine))
+        for start, end, label in axes:
+            p0, _, _ = self._project(start, scale, cx, cy)
+            p1, _, _ = self._project(end, scale, cx, cy)
+            painter.drawLine(p0, p1)
+            painter.drawText(p1 + QPointF(4, -4), label)
+
+        cells = []
+        for row in range(len(points) - 1):
+            for col in range(len(points[row]) - 1):
+                corners = [points[row][col], points[row][col + 1], points[row + 1][col + 1], points[row + 1][col]]
+                projected = [self._project(point, scale, cx, cy) for point in corners]
+                depth = sum(value[1] for value in projected) / len(projected)
+                gain = sum(value[2] for value in projected) / len(projected)
+                polygon = QPolygonF([value[0] for value in projected])
+                cells.append((depth, gain, polygon))
+        cells.sort(key=lambda item: item[0])
+        painter.setPen(QPen(QColor(255, 255, 255, 120), 0.5))
+        for _depth, gain, polygon in cells:
+            painter.setBrush(QBrush(self._gain_colour(gain, gain_min, gain_max)))
+            painter.drawPolygon(polygon)
+
+        painter.setPen(QPen(QColor("#1A202C"), 1.2))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawEllipse(QPointF(cx, cy), scale * 0.035, scale * 0.035)
+        painter.drawText(
+            rect.adjusted(12, 34, -12, -12),
+            Qt.AlignLeft | Qt.AlignTop,
+            f"{self.pattern.name} | gain range {gain_min:g} to {gain_max:g} dBi"
+        )
+
+
+class PolarPatternDialog(QDialog):
+    def __init__(self, parent, ap: AccessPoint, patterns: Dict[str, AntennaPattern]):
+        super().__init__(parent)
+        self.ap = ap
+        self.patterns = patterns
+        self.setWindowTitle(f"Polar pattern - {ap.name}")
+        self.resize(760, 640)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.radio_combo = QComboBox()
+        radios = ap.active_radios()
+        if not radios:
+            radios = [APRadio(name="Radio-1", frequency_mhz=ap.frequency_mhz, antenna_pattern=ap.antenna_pattern)]
+        self._radios = radios
+        for index, radio in enumerate(radios):
+            self.radio_combo.addItem(
+                f"{radio.name} - {float(radio.frequency_mhz):g} MHz - {radio.antenna_pattern}",
+                int(index),
+            )
+        form.addRow("Radio", self.radio_combo)
+        layout.addLayout(form)
+        self.view = PolarPattern3DWidget(self)
+        layout.addWidget(self.view, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.radio_combo.currentIndexChanged.connect(self._radio_changed)
+        self._radio_changed()
+
+    def _radio_changed(self, *_):
+        index = int(self.radio_combo.currentData() or 0)
+        radio = self._radios[max(0, min(index, len(self._radios) - 1))]
+        pattern = self.patterns.get(str(radio.antenna_pattern))
+        self.view.set_pattern(
+            pattern,
+            float(getattr(radio, "antenna_gain_dbi", 0.0) or 0.0),
+            float(getattr(self.ap, "azimuth_deg", 0.0) or 0.0),
+            float(getattr(self.ap, "downtilt_deg", 0.0) or 0.0),
+        )
+
+
 def _access_point_symbol_path(ap_type: str, radius: float) -> QPainterPath:
     definition = AP_TYPE_PRESETS.get(ap_type, AP_TYPE_PRESETS["Ceiling AP"])
     symbol = definition.get("symbol", "circle_cross")
@@ -8125,12 +8697,13 @@ class AccessPointGraphicsItem(QGraphicsPathItem):
         menu = QMenu()
         focus_action = menu.addAction("Edit in access point table")
         duplicate_action = menu.addAction("Duplicate access point")
+        polar_action = menu.addAction("Visualise polar pattern")
         copy_action = menu.addAction("Copy selected access point(s)    Ctrl+C")
         paste_action = menu.addAction("Paste access point(s)    Ctrl+V")
         type_menu = menu.addMenu("Change access point type")
         type_actions = {type_menu.addAction(name): name for name in AP_TYPE_PRESETS}
         profile_menu = menu.addMenu("Apply radio profile")
-        profile_names = ["Project default radios"] + list(RADIO_PROFILE_PRESETS.keys())
+        profile_names = ["Project default radios"] + self.main._radio_profile_names()
         profile_actions = {profile_menu.addAction(name): name for name in profile_names}
         menu.addSeparator()
         delete_action = menu.addAction("Delete access point")
@@ -8139,6 +8712,8 @@ class AccessPointGraphicsItem(QGraphicsPathItem):
             self.main.focus_ap_in_table(self.ap)
         elif chosen == duplicate_action:
             self.main.duplicate_access_point(self.ap)
+        elif chosen == polar_action:
+            self.main.show_access_point_polar_pattern(self.ap)
         elif chosen == copy_action:
             self.main.copy_selected_access_points()
         elif chosen == paste_action:
@@ -8578,8 +9153,8 @@ class MainWindow(QMainWindow):
             self.ap_type_combo.setItemData(self.ap_type_combo.count() - 1, definition.get("description", ""), Qt.ToolTipRole)
         self.ap_type_combo.currentTextChanged.connect(self._new_ap_type_changed)
         self.radio_profile_combo = QComboBox()
-        self.radio_profile_combo.addItem("Project default radios")
-        self.radio_profile_combo.addItems(list(RADIO_PROFILE_PRESETS.keys()))
+        self._populate_radio_profile_combo(self.radio_profile_combo, include_predictive=False)
+        self.radio_profile_combo.currentTextChanged.connect(self._new_ap_radio_profile_changed)
         self.azimuth = QDoubleSpinBox()
         self.azimuth.setRange(-180.0, 180.0)
         self.azimuth.setValue(0.0)
@@ -8608,15 +9183,15 @@ class MainWindow(QMainWindow):
         self.include_inter_floor.setChecked(True)
         self.slab_att_24 = QDoubleSpinBox()
         self.slab_att_24.setRange(0.0, 80.0)
-        self.slab_att_24.setValue(12.0)
+        self.slab_att_24.setValue(float(self.heatmap_settings.default_floor_attenuation_by_frequency_db.get(2400.0, 35.0)))
         self.slab_att_24.setSuffix(" dB")
         self.slab_att_5 = QDoubleSpinBox()
         self.slab_att_5.setRange(0.0, 80.0)
-        self.slab_att_5.setValue(18.0)
+        self.slab_att_5.setValue(float(self.heatmap_settings.default_floor_attenuation_by_frequency_db.get(5000.0, 55.0)))
         self.slab_att_5.setSuffix(" dB")
         self.slab_att_6 = QDoubleSpinBox()
         self.slab_att_6.setRange(0.0, 80.0)
-        self.slab_att_6.setValue(22.0)
+        self.slab_att_6.setValue(float(self.heatmap_settings.default_floor_attenuation_by_frequency_db.get(6000.0, 60.0)))
         self.slab_att_6.setSuffix(" dB")
 
         controls = QWidget()
@@ -8727,6 +9302,8 @@ class MainWindow(QMainWindow):
         self.sim_action.triggered.connect(self.simulate)
         self.export_action = QAction("Export CSV", self)
         self.export_action.triggered.connect(self.export_csv)
+        self.export_ap_positions_action = QAction("Export AP positions", self)
+        self.export_ap_positions_action.triggered.connect(self.export_ap_positions_csv)
         self.export_pdf_action = QAction("Export floor PDF", self)
         self.export_pdf_action.triggered.connect(self.export_floor_pdf)
         self.clear_ap_action = QAction("Clear APs", self)
@@ -8757,6 +9334,8 @@ class MainWindow(QMainWindow):
         self.paste_ap_action.triggered.connect(self.paste_access_points)
         self.load_pattern_action = QAction("Load pattern CSV", self)
         self.load_pattern_action.triggered.connect(self.load_pattern_csv)
+        self.manage_radio_profiles_action = QAction("Manage radio profiles", self)
+        self.manage_radio_profiles_action.triggered.connect(self.show_radio_profile_manager)
         self.load_heatmap_settings_action = QAction("Load heatmap settings", self)
         self.load_heatmap_settings_action.triggered.connect(self.load_heatmap_settings)
         self.propagation_settings_action = QAction("Propagation model", self)
@@ -9077,6 +9656,10 @@ class MainWindow(QMainWindow):
                 "Export CSV", "Export the calculated RF sample results to CSV.",
                 "SP_DialogSaveButton", "Ctrl+E"
             ),
+            "export_ap_positions_action": (
+                "Export AP positions", "Export access point radio profiles, floors and insertion-point-relative positions to CSV.",
+                "SP_DialogSaveButton", "Ctrl+Shift+A"
+            ),
             "export_pdf_action": (
                 "Export floor PDF", "Choose floors and active frequencies, then calculate and export one scaled RSSI heatmap page for each selected floor/frequency combination using the same simulation pipeline as Simulate RSSI.",
                 "SP_FileDialogContentsView", "Ctrl+Shift+E"
@@ -9128,6 +9711,10 @@ class MainWindow(QMainWindow):
             "load_pattern_action": (
                 "Load antenna pattern", "Import a directional antenna pattern from a CSV file.",
                 "SP_FileIcon", ""
+            ),
+            "manage_radio_profiles_action": (
+                "Manage radio profiles", "Add, duplicate, delete and edit AP radio profiles used by manual and predictive AP placement.",
+                "SP_FileDialogDetailedView", ""
             ),
             "load_heatmap_settings_action": (
                 "Load display settings", "Load RF heatmap, colour, IFC and rendering settings from JSON.",
@@ -9299,10 +9886,10 @@ class MainWindow(QMainWindow):
         ribbon.addTab(self._make_ribbon_page([
             ("Project", ["open_action", "add_action", "load_plan_action", "save_plan_action"]),
             ("Planning workflow", ["planner_settings_action", "predict_aps_action", "sim_action"]),
-            ("Results and cleanup", ["export_action", "export_pdf_action", "clear_ap_action"]),
+            ("Results and cleanup", ["export_action", "export_ap_positions_action", "export_pdf_action", "clear_ap_action"]),
         ]), "Home")
         ribbon.addTab(self._make_ribbon_page([
-            ("Interaction", ["ap_interaction_action", "ap_ruler_action", "copy_ap_action", "paste_ap_action", "bulk_ap_action", "cancel_ap_tool_action"]),
+            ("Interaction", ["ap_interaction_action", "ap_ruler_action", "copy_ap_action", "paste_ap_action", "bulk_ap_action", "export_ap_positions_action", "cancel_ap_tool_action"]),
             ("Manual placement", ["place_ap_action", "array_ap_action"]),
             ("Space-assisted placement", ["space_ap_action", "select_ap_spaces_action"]),
         ]), "Access points")
@@ -9318,9 +9905,9 @@ class MainWindow(QMainWindow):
             ("Permitted planning area", ["draw_boundary_action", "draw_polygon_boundary_action", "suggest_external_boundary_action", "clear_boundaries_action"]),
         ]), "Walls and boundaries")
         ribbon.addTab(self._make_ribbon_page([
-            ("Antenna data", ["load_pattern_action"]),
+            ("Antenna data", ["load_pattern_action", "manage_radio_profiles_action"]),
             ("Propagation and display", ["propagation_settings_action", "performance_settings_action", "boundary_result_filter_action", "load_heatmap_settings_action"]),
-            ("Analysis", ["sim_action", "export_action", "export_pdf_action"]),
+            ("Analysis", ["sim_action", "export_action", "export_ap_positions_action", "export_pdf_action"]),
         ]), "Radio and analysis")
         return ribbon
 
@@ -9527,6 +10114,79 @@ class MainWindow(QMainWindow):
         pattern = str(definition.get("pattern", ""))
         if pattern and pattern in self.antenna_patterns:
             self.pattern_combo.setCurrentText(pattern)
+        self._new_ap_radio_profile_changed(self.radio_profile_combo.currentText())
+
+    def _radio_profile_definitions(self) -> Dict[str, List[Dict[str, object]]]:
+        profiles = {
+            str(name): [dict(radio) for radio in radios if isinstance(radio, dict)]
+            for name, radios in RADIO_PROFILE_PRESETS.items()
+        }
+        custom = getattr(self.heatmap_settings, "custom_radio_profiles", {}) or {}
+        for name, radios in custom.items():
+            if str(name).strip() and isinstance(radios, list):
+                profiles[str(name)] = [dict(radio) for radio in radios if isinstance(radio, dict)]
+        return profiles
+
+    def _radio_profile_names(self) -> List[str]:
+        return sorted(self._radio_profile_definitions().keys())
+
+    def _populate_radio_profile_combo(self, combo: QComboBox, include_predictive: bool = False, current: Optional[str] = None):
+        selected = str(current if current is not None else combo.currentText() or "")
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            if include_predictive:
+                combo.addItem("Predictive planner")
+            combo.addItem("Project default radios")
+            combo.addItems(self._radio_profile_names())
+            if selected and combo.findText(selected) < 0:
+                combo.addItem(selected)
+            if selected:
+                combo.setCurrentText(selected)
+        finally:
+            combo.blockSignals(False)
+
+    def _refresh_radio_profile_controls(self):
+        if hasattr(self, "radio_profile_combo"):
+            self._populate_radio_profile_combo(self.radio_profile_combo, include_predictive=False)
+
+    def show_radio_profile_manager(self):
+        dialog = RadioProfileManagerDialog(
+            self,
+            self._radio_profile_definitions(),
+            list(self.antenna_patterns.keys()),
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        self.heatmap_settings.custom_radio_profiles = dialog._validated_profiles
+        self._refresh_radio_profile_controls()
+        self._apply_frequency_settings_to_model(replace_existing=False)
+        self._refresh_rssi_frequency_dropdown()
+        self.populate_wall_table()
+        self.statusBar().showMessage(f"Updated {len(self.heatmap_settings.custom_radio_profiles)} managed radio profile(s)")
+
+    def _new_ap_radio_profile_changed(self, profile_name: str):
+        if not hasattr(self, "radio_profile_combo") or not hasattr(self, "freq"):
+            return
+        radios = self._radios_for_profile(str(profile_name or "Project default radios"), self.ap_type_combo.currentText())
+        enabled_radios = [radio for radio in radios if getattr(radio, "enabled", True)]
+        selected_radios = enabled_radios or radios
+        selected_frequency = None
+        if selected_radios:
+            selected_frequency = float(selected_radios[0].frequency_mhz)
+            self.freq.blockSignals(True)
+            self.freq.setValue(selected_frequency)
+            self.freq.blockSignals(False)
+        self._apply_frequency_settings_to_model(replace_existing=False)
+        self._refresh_rssi_frequency_dropdown()
+        if selected_frequency is not None and hasattr(self, "rssi_view_frequency"):
+            for index in range(self.rssi_view_frequency.count()):
+                try:
+                    if abs(float(self.rssi_view_frequency.itemData(index)) - selected_frequency) < 1e-6:
+                        self.rssi_view_frequency.setCurrentIndex(index)
+                        break
+                except Exception:
+                    continue
 
     def _set_interaction_action_checked(self, action_name: str, checked: bool):
         action = getattr(self, action_name, None)
@@ -10279,6 +10939,10 @@ class MainWindow(QMainWindow):
         self.populate_ap_table()
         self.statusBar().showMessage(f"Applied {profile_name} to {ap.name}")
 
+    def show_access_point_polar_pattern(self, ap: AccessPoint):
+        dialog = PolarPatternDialog(self, ap, self.antenna_patterns)
+        dialog.exec()
+
     # ----------------------------- View/origin tools -----------------------------
 
     def rotate_view(self, delta_degrees: float):
@@ -10705,6 +11369,7 @@ class MainWindow(QMainWindow):
             name=f"Planner boundary {len(self.planner_boundaries) + 1}",
             polygon=box(minx, miny, maxx, maxy),
             shape_type="rectangle",
+            floor=str(self.floor.name),
         )
         self.planner_boundaries.append(boundary)
         self._boundary_draw_start = None
@@ -10712,7 +11377,7 @@ class MainWindow(QMainWindow):
         self._clear_rssi_results()
         self.draw_floor()
         self.statusBar().showMessage(
-            f"Created {boundary.name}; it now constrains AP planning on all IFC floors. "
+            f"Created {boundary.name} on '{self.floor.name}'; it constrains AP planning and RF results on this floor. "
             "Click two more corners to add another rectangle, or right-click to finish."
         )
 
@@ -10736,6 +11401,7 @@ class MainWindow(QMainWindow):
             name=f"Planner boundary {len(self.planner_boundaries) + 1}",
             polygon=polygon,
             shape_type="polygon",
+            floor=str(self.floor.name),
         )
         self.planner_boundaries.append(boundary)
         self._boundary_polygon_points = []
@@ -10743,7 +11409,7 @@ class MainWindow(QMainWindow):
         self._clear_rssi_results()
         self.draw_floor()
         self.statusBar().showMessage(
-            f"Created {boundary.name} with {len(coordinates)} vertices; it constrains AP planning on all IFC floors. "
+            f"Created {boundary.name} with {len(coordinates)} vertices on '{self.floor.name}'; it constrains AP planning and RF results on this floor. "
             "Left-click to start another polygon or toggle the tool off."
         )
 
@@ -12007,14 +12673,8 @@ class MainWindow(QMainWindow):
                 return info
         return None
 
-    def _ifc_insertion_point_for_wall(self, wall: Wall2D) -> Tuple[float, float, str]:
-        """Return the selected IFC insertion point in current scene coordinates.
-
-        Site placement is preferred, followed by building placement and the
-        geometric representation context world origin. Placement coordinates
-        are converted to metres before the current IFC alignment is applied.
-        """
-        info = self._origin_information_for_wall(wall)
+    def _ifc_insertion_point_from_origin_info(self, info: Optional[Dict[str, object]]) -> Tuple[float, float, str]:
+        """Return the selected IFC insertion point in current scene coordinates."""
         raw_x = raw_y = 0.0
         source = "IFC model origin"
         if info is not None:
@@ -12048,6 +12708,32 @@ class MainWindow(QMainWindow):
 
         scene_x, scene_y = self.ifc_alignment.map_xy(raw_x, raw_y)
         return float(scene_x), float(scene_y), source
+
+    def _ifc_insertion_point_for_project(self) -> Tuple[float, float, str]:
+        """Return the project insertion point used for project-wide exports."""
+        if self.loaded_ifc_paths:
+            for path in self.loaded_ifc_paths:
+                info = self.ifc_origin_info.get(self._ifc_path_key(path))
+                if isinstance(info, dict):
+                    x, y, source = self._ifc_insertion_point_from_origin_info(info)
+                    return x, y, f"{source} ({Path(path).name})"
+        for key in sorted(self.ifc_origin_info):
+            info = self.ifc_origin_info.get(key)
+            if isinstance(info, dict):
+                x, y, source = self._ifc_insertion_point_from_origin_info(info)
+                label = Path(str(key)).name or str(key)
+                return x, y, f"{source} ({label})"
+        x, y = self.ifc_alignment.map_xy(0.0, 0.0)
+        return float(x), float(y), "IFC model origin"
+
+    def _ifc_insertion_point_for_wall(self, wall: Wall2D) -> Tuple[float, float, str]:
+        """Return the selected IFC insertion point in current scene coordinates.
+
+        Site placement is preferred, followed by building placement and the
+        geometric representation context world origin. Placement coordinates
+        are converted to metres before the current IFC alignment is applied.
+        """
+        return self._ifc_insertion_point_from_origin_info(self._origin_information_for_wall(wall))
 
     @staticmethod
     def _rotation_about_point_matrix(angle_deg: float, pivot_x: float, pivot_y: float) -> Tuple[float, float, float, float, float, float]:
@@ -12525,6 +13211,7 @@ class MainWindow(QMainWindow):
             self.auto_planner_settings = dlg._validated_settings
             self.heatmap_settings.auto_planner_settings = self.auto_planner_settings.to_dict()
             self._apply_frequency_settings_to_model(replace_existing=False)
+            self._refresh_radio_profile_controls()
             self._refresh_rssi_frequency_dropdown()
             self.populate_wall_table()
             self.statusBar().showMessage("Predictive AP planner settings updated")
@@ -13007,12 +13694,22 @@ class MainWindow(QMainWindow):
             self.floors.items(), key=lambda item: (float(item[1].elevation), item[0])
         )
         selection = PlannerRunSelectionDialog(
-            self, floor_items, enabled_radio_items, self.floor.name
+            self,
+            floor_items,
+            enabled_radio_items,
+            self.floor.name,
+            settings.ap_radio_profile,
+            self._radio_profile_names(),
+            self._radio_profile_definitions(),
+            self.heatmap_settings.default_ap_radios,
         )
         if selection.exec() != QDialog.Accepted:
             return
         selected_floor_names = set(selection.selected_floor_names())
         selected_radio_indices = set(selection.selected_radio_indices())
+        selected_radio_profile = selection.selected_radio_profile()
+        settings.ap_radio_profile = selected_radio_profile
+        self.heatmap_settings.auto_planner_settings = settings.to_dict()
         selected_requirements = [
             copy.deepcopy(requirement)
             for index, requirement in enumerate(settings.radio_requirements)
@@ -13038,6 +13735,7 @@ class MainWindow(QMainWindow):
                 )
                 report = self._run_auto_planner_current_floor(
                     requirements_override=selected_requirements,
+                    radio_profile=selected_radio_profile,
                     refresh_ui=False,
                     show_summary=False,
                 )
@@ -13090,6 +13788,7 @@ class MainWindow(QMainWindow):
             self,
             "Predictive AP plan complete",
             f"Added {total_added} RSSI-predicted AP(s) across {len(reports)} floor(s).\n"
+            f"AP radio profile: {selected_radio_profile}.\n"
             f"Selected radios fitted to each new AP: {radio_text}.\n\n"
             + "\n".join(floor_lines)
             + failure_text
@@ -13099,6 +13798,7 @@ class MainWindow(QMainWindow):
     def _run_auto_planner_current_floor(
         self,
         requirements_override: Optional[Sequence[PlannerRadioRequirement]] = None,
+        radio_profile: Optional[str] = None,
         refresh_ui: bool = True,
         show_summary: bool = True,
     ) -> Optional[Dict[str, object]]:
@@ -13116,6 +13816,7 @@ class MainWindow(QMainWindow):
         if not requirements:
             QMessageBox.information(self, "No planner radios", "Enable at least one frequency in Planner settings.")
             return
+        selected_radio_profile = str(radio_profile or settings.ap_radio_profile or "Predictive planner")
 
         if settings.remove_previous_planned_aps:
             self.aps = [ap for ap in self.aps if not (ap.floor == self.floor.name and ap.planned)]
@@ -13220,7 +13921,7 @@ class MainWindow(QMainWindow):
                 ) for req in requirements]
                 return AccessPoint(
                     name="candidate", x=x, y=y, floor=self.floor.name, radios=radios,
-                    ap_type="Directional AP" if directional else "Ceiling AP", radio_profile="Predictive planner",
+                    ap_type="Directional AP" if directional else "Ceiling AP", radio_profile=selected_radio_profile,
                     path_loss_exponent=float(self.ple.value()), azimuth_deg=azimuth,
                     mount_height_m=float(self.mount_height.value()), rx_height_m=float(self.rx_height.value()),
                     max_clients=settings.clients_per_ap, planned=True,
@@ -13529,6 +14230,7 @@ class MainWindow(QMainWindow):
         )
         summary_text = (
             f"Added {len(new_aps)} RSSI-predicted AP(s) on {self.floor.name}.\n"
+            f"AP radio profile: {selected_radio_profile}.\n"
             f"Planning area: {getattr(self, '_planner_area_source_label', 'selected floor geometry')}.\n"
             f"Overall coverage ({'every selected radio' if settings.coverage_mode == 'all' else 'any selected radio'}): {overall_pct:.1f}%\n"
             + handover_summary
@@ -13545,6 +14247,7 @@ class MainWindow(QMainWindow):
             "overall_pct": float(overall_pct),
             "handover_pct": float(handover_pct),
             "available_capacity": int(available_capacity),
+            "ap_radio_profile": selected_radio_profile,
             "planning_area": str(getattr(
                 self, "_planner_area_source_label", "selected floor geometry"
             )),
@@ -13671,6 +14374,7 @@ class MainWindow(QMainWindow):
             "selected_floor": self.floor.name if self.floor else "", "view_rotation_deg": self.view_rotation_deg,
             "ifc_alignment": {"dx": self.ifc_alignment.dx, "dy": self.ifc_alignment.dy, "rotation_deg": self.ifc_alignment.rotation_deg, "scale": self.ifc_alignment.scale},
             "auto_planner_settings": self.auto_planner_settings.to_dict(),
+            "custom_radio_profiles": copy.deepcopy(getattr(self.heatmap_settings, "custom_radio_profiles", {})),
             "propagation_model": self.heatmap_settings.propagation_model_dict(),
             "rf_performance": self.heatmap_settings.performance_model_dict(),
             "planner_boundaries": planner_boundaries,
@@ -14212,6 +14916,14 @@ class MainWindow(QMainWindow):
                 radios=radios, max_clients=int(item.get("max_clients", 50)), planned=bool(item.get("planned", False)),
             ))
         self.auto_planner_settings = AutoPlannerSettings.from_dict(data.get("auto_planner_settings", {}))
+        custom_profiles = data.get("custom_radio_profiles", data.get("radio_profile_presets", {}))
+        if isinstance(custom_profiles, dict):
+            self.heatmap_settings.custom_radio_profiles = {
+                str(name): [dict(radio) for radio in radios if isinstance(radio, dict)]
+                for name, radios in custom_profiles.items()
+                if str(name).strip() and isinstance(radios, list)
+            }
+            self._refresh_radio_profile_controls()
         self.heatmap_settings.apply_propagation_model_dict(data.get("propagation_model", {}))
         self.heatmap_settings.apply_performance_model_dict(data.get("rf_performance", {}))
         self.boundary_result_filter_action.blockSignals(True)
@@ -15526,7 +16238,7 @@ class MainWindow(QMainWindow):
         if profile_name == "Project default radios":
             definitions = list(self.heatmap_settings.default_ap_radios or [])
         else:
-            definitions = list(RADIO_PROFILE_PRESETS.get(profile_name, []))
+            definitions = list(self._radio_profile_definitions().get(profile_name, []))
         type_pattern = str(AP_TYPE_PRESETS.get(ap_type, AP_TYPE_PRESETS["Ceiling AP"]).get("pattern", self.pattern_combo.currentText()))
         radios: List[APRadio] = []
         for index, radio_def in enumerate(definitions):
@@ -16280,6 +16992,19 @@ class MainWindow(QMainWindow):
         if planner is not None:
             values.update(float(r.frequency_mhz) for r in planner.radio_requirements)
         values.update(float(r.frequency_mhz) for ap in getattr(self, "aps", []) for r in ap.active_radios())
+        if hasattr(self, "radio_profile_combo") and hasattr(self, "ap_type_combo"):
+            try:
+                profile_radios = self._radios_for_profile(
+                    self.radio_profile_combo.currentText(),
+                    self.ap_type_combo.currentText(),
+                )
+                values.update(
+                    float(radio.frequency_mhz)
+                    for radio in profile_radios
+                    if getattr(radio, "enabled", True)
+                )
+            except Exception:
+                pass
         return sorted(values)
 
     def _frequency_label(self, mhz: float) -> str:
@@ -17915,6 +18640,39 @@ class MainWindow(QMainWindow):
                     delay = float(self.last_result.delay_spread_ns[iy, ix]) if self.last_result.delay_spread_ns is not None else 0.0
                     path_count = int(self.last_result.path_count[iy, ix]) if self.last_result.path_count is not None else 1
                     writer.writerow([self.floor.name if self.floor else "", x, y, self.heatmap_settings.combined_ap_mode, ";".join(str(int(r.frequency_mhz)) for r in active_radios), rssi, delay, path_count, zone.name, rssi >= self.heatmap_settings.minimum_client_rssi_dbm, self.heatmap_settings.minimum_client_rssi_dbm, len(self.aps), self.include_inter_floor.isChecked(), float(self.slab_att_24.value()), float(self.slab_att_5.value()), float(self.slab_att_6.value()), ";".join(sorted({r.antenna_pattern for r in active_radios}))])
+
+    def export_ap_positions_csv(self):
+        if not self.aps:
+            QMessageBox.information(self, "No access points", "Place or predict at least one access point before exporting AP positions.")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Export AP positions CSV", "ap_positions.csv", "CSV files (*.csv)")
+        if not path:
+            return
+        insertion_x, insertion_y, insertion_source = self._ifc_insertion_point_for_project()
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "access_point",
+                "ap_radio_profile",
+                "floor_level",
+                "x_delta_from_insertion_point_m",
+                "y_delta_from_insertion_point_m",
+                "insertion_point_x_m",
+                "insertion_point_y_m",
+                "insertion_point_source",
+            ])
+            for ap in sorted(self.aps, key=lambda item: (str(item.floor), str(item.name))):
+                writer.writerow([
+                    ap.name,
+                    ap.radio_profile,
+                    ap.floor,
+                    float(ap.x) - insertion_x,
+                    float(ap.y) - insertion_y,
+                    insertion_x,
+                    insertion_y,
+                    insertion_source,
+                ])
+        self.statusBar().showMessage(f"Exported {len(self.aps)} AP position(s) to {Path(path).name}")
 
 
 def main():
