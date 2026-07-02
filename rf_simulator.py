@@ -122,6 +122,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QLineEdit,
     QProgressDialog,
     QPushButton,
     QScrollArea,
@@ -548,11 +549,11 @@ class AutoPlannerSettings:
     minimum_ap_spacing_m: float = 8.0
     maximum_aps: int = 64
     # ``auto`` uses eligible IFC/manual/inferred space footprints when present,
-    # otherwise shared user rectangular/polygon boundaries, and finally an
+    # otherwise current-floor rectangular/polygon boundaries, and finally an
     # inferred wall footprint. ``spaces`` requires eligible space geometry;
-    # ``boundaries`` uses only the shared planner boundaries; ``walls`` always
-    # uses the inferred footprint. User
-    # boundaries are a hard clipping limit in every mode whenever one exists.
+    # ``boundaries`` uses only the current floor's planner boundaries; ``walls``
+    # always uses the inferred footprint. User boundaries are a hard clipping
+    # limit in every mode whenever one exists for the active floor.
     planning_area_mode: str = "auto"
     wall_footprint_margin_m: float = 0.0
     # Inferred simulator spaces can be used as predictive-planner coverage and
@@ -1010,8 +1011,8 @@ class HeatmapSettings:
     interactive_preview_enabled: bool = True
     interactive_preview_delay_ms: int = 350
     interactive_preview_resolution_m: float = 3.0
-    # When enabled and one or more shared planner boundaries exist, RSSI grid
-    # points outside their union are not calculated, displayed or exported.
+    # When enabled and planner boundaries exist for a floor, RSSI grid points
+    # outside that floor's boundary union are not calculated, displayed or exported.
     ignore_results_outside_planner_boundaries: bool = False
     # Optional absolute quick-calculation threshold. If the unobstructed best-case
     # signal cannot reach this value, the AP/point path is skipped before IFC
@@ -2182,14 +2183,22 @@ class IFCModelLoader:
             return {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0}
         if "metal" in text or "steel" in text:
             return {433.0: 12.0, 868.0: 16.0, 2400.0: 20.0, 5000.0: 28.0, 6000.0: 35.0}
-        if "concrete" in text or "block" in text:
-            return {433.0: 5.0, 868.0: 7.0, 2400.0: 12.0, 5000.0: 16.0, 6000.0: 20.0}
+        if "reinforced concrete" in text:
+            return {433.0: 5.0, 868.0: 7.0, 2400.0: 12.0, 5000.0: 53.7989, 6000.0: 58.0}
+        if "brick-faced concrete" in text:
+            return {433.0: 5.0, 868.0: 7.0, 2400.0: 12.0, 5000.0: 39.8953, 6000.0: 44.0}
+        if "brick-faced masonry block" in text:
+            return {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 32.6320, 6000.0: 36.0}
+        if "concrete" in text:
+            return {433.0: 5.0, 868.0: 7.0, 2400.0: 12.0, 5000.0: 55.1581, 6000.0: 60.0}
+        if "block" in text:
+            return {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 14.9250, 6000.0: 18.0}
         if "brick" in text or "masonry" in text:
-            return {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 11.0, 6000.0: 14.0}
+            return {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 15.2806 if "brick" in text else 14.9250, 6000.0: 18.0}
         if "glass" in text or category == "curtain_wall":
-            return {433.0: 1.0, 868.0: 2.0, 2400.0: 3.0, 5000.0: 5.0, 6000.0: 7.0}
+            return {433.0: 1.0, 868.0: 2.0, 2400.0: 3.0, 5000.0: 0.0688, 6000.0: 1.0}
         category_profiles = {
-            "slab": {433.0: 8.0, 868.0: 10.0, 2400.0: 12.0, 5000.0: 18.0, 6000.0: 22.0},
+            "slab": {433.0: 8.0, 868.0: 10.0, 2400.0: 35.0, 5000.0: 55.1581, 6000.0: 60.0},
             "roof": {433.0: 5.0, 868.0: 7.0, 2400.0: 9.0, 5000.0: 13.0, 6000.0: 16.0},
             "column": {433.0: 3.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 12.0, 6000.0: 15.0},
             "beam": {433.0: 2.0, 868.0: 4.0, 2400.0: 6.0, 5000.0: 9.0, 6000.0: 12.0},
@@ -4595,6 +4604,39 @@ class DxfPrimitive:
 
 
 @dataclass
+class DxfBasePointAlignment:
+    """Absolute transform that moves a DXF base point onto an IFC base point.
+
+    The DXF is scaled and rotated about its own base point, then translated so
+    that base point coincides with the IFC insertion/base point. IFC geometry is
+    never modified by this alignment workflow.
+    """
+    dxf_base_x: float = 0.0
+    dxf_base_y: float = 0.0
+    ifc_base_x: float = 0.0
+    ifc_base_y: float = 0.0
+    rotation_deg: float = 0.0
+    scale: float = 1.0
+
+    def matrix(self) -> Tuple[float, float, float, float, float, float]:
+        angle = math.radians(float(self.rotation_deg))
+        scale = float(self.scale)
+        cos_a = math.cos(angle)
+        sin_a = math.sin(angle)
+        a = scale * cos_a
+        b = -scale * sin_a
+        d = scale * sin_a
+        e = scale * cos_a
+        xoff = float(self.ifc_base_x) - a * float(self.dxf_base_x) - b * float(self.dxf_base_y)
+        yoff = float(self.ifc_base_y) - d * float(self.dxf_base_x) - e * float(self.dxf_base_y)
+        return a, b, d, e, xoff, yoff
+
+    def map_xy(self, x: float, y: float) -> Tuple[float, float]:
+        a, b, d, e, xoff, yoff = self.matrix()
+        return a * float(x) + b * float(y) + xoff, d * float(x) + e * float(y) + yoff
+
+
+@dataclass
 class DxfOverlay:
     path: str
     primitives: List[DxfPrimitive] = field(default_factory=list)
@@ -4604,6 +4646,15 @@ class DxfOverlay:
     metres_per_dxf_unit: float = 1.0
     manual_scale: float = 1.0
     effective_scale_to_metres: float = 1.0
+    file_base_point_x: float = 0.0
+    file_base_point_y: float = 0.0
+    source_base_point_x: float = 0.0
+    source_base_point_y: float = 0.0
+    base_point_source: str = "DXF $INSBASE"
+    base_point_alignment: Optional[DxfBasePointAlignment] = None
+    source_to_scene_matrix: Optional[Tuple[float, float, float, float, float, float]] = None
+    alignment_method: str = ""
+    alignment_applied: bool = False
 
 
 DXF_INSUNITS_TO_METRES: Dict[int, Tuple[str, float]] = {
@@ -4678,6 +4729,17 @@ class AlignmentTransform:
     def map_xy(self, x: float, y: float) -> Tuple[float, float]:
         a, b, d, e, xoff, yoff = self.matrix()
         return a * x + b * y + xoff, d * x + e * y + yoff
+
+    def unmap_delta(self, dx: float, dy: float) -> Tuple[float, float]:
+        """Convert a scene-space vector back to IFC/model-local metres.
+
+        Translation is deliberately ignored because ``dx`` and ``dy`` are
+        offsets. The inverse linear transform removes any IFC alignment
+        rotation and scale so exported coordinate deltas remain expressed
+        along the original IFC X and Y axes.
+        """
+        ia, ib, id_, ie, _ix, _iy = self._invert_matrix(self.matrix())
+        return ia * float(dx) + ib * float(dy), id_ * float(dx) + ie * float(dy)
 
     @staticmethod
     def _invert_matrix(m: Tuple[float, float, float, float, float, float]) -> Tuple[float, float, float, float, float, float]:
@@ -4760,6 +4822,16 @@ def load_dxf_overlay(path: Path, unit_scale: float = 1.0, auto_units: bool = Tru
     msp = doc.modelspace()
     prims: List[DxfPrimitive] = []
 
+    try:
+        insbase = doc.header.get("$INSBASE", (0.0, 0.0, 0.0))
+        file_base_x = float(insbase[0]) * effective_scale
+        file_base_y = float(insbase[1]) * effective_scale
+        base_point_source = "DXF $INSBASE"
+    except Exception:
+        file_base_x = 0.0
+        file_base_y = 0.0
+        base_point_source = "DXF origin (0, 0)"
+
     def sc(pt) -> Tuple[float, float]:
         return float(pt[0]) * effective_scale, float(pt[1]) * effective_scale
 
@@ -4821,81 +4893,254 @@ def load_dxf_overlay(path: Path, unit_scale: float = 1.0, auto_units: bool = Tru
         metres_per_dxf_unit=metres_per_unit,
         manual_scale=float(unit_scale or 1.0),
         effective_scale_to_metres=effective_scale,
+        file_base_point_x=file_base_x,
+        file_base_point_y=file_base_y,
+        source_base_point_x=file_base_x,
+        source_base_point_y=file_base_y,
+        base_point_source=base_point_source,
+        base_point_alignment=DxfBasePointAlignment(
+            dxf_base_x=file_base_x,
+            dxf_base_y=file_base_y,
+            ifc_base_x=file_base_x,
+            ifc_base_y=file_base_y,
+        ),
+        source_to_scene_matrix=(1.0, 0.0, 0.0, 1.0, 0.0, 0.0),
+        alignment_method="",
+        alignment_applied=False,
     )
 
 
 def load_dxf_overlay_with_similarity_transform(path: Path, transform: SimilarityTransform2D) -> DxfOverlay:
-    """Load a DXF using raw DXF coordinates, then map it into IFC coordinates.
+    """Load a two-point-aligned DXF while retaining its source coordinate reference.
 
-    The DxfPreAlignDialog calculates a transform from raw DXF coordinates to
-    IFC/model metres. That transform already includes the DXF $INSUNITS unit
-    conversion, so this function deliberately reads the DXF with auto unit
-    conversion disabled and then applies the two-point transform to every point.
+    The pre-alignment dialog returns a matrix from raw DXF units to IFC scene
+    metres. The overlay itself is loaded in metres, so the linear terms are
+    normalised by the DXF unit conversion before being applied. Keeping this
+    absolute source-metres-to-scene matrix allows later AP exports to recover
+    the original DXF coordinates exactly.
     """
-    overlay = load_dxf_overlay(path, unit_scale=1.0, auto_units=False)
-    transformed: List[DxfPrimitive] = []
+    overlay = load_dxf_overlay(path, unit_scale=1.0, auto_units=True)
+    unit_to_m = float(overlay.effective_scale_to_metres or 1.0)
+    if abs(unit_to_m) <= 1e-18:
+        raise ValueError("The DXF unit conversion is zero and cannot be used for alignment.")
+
     affine = getattr(transform, "affine_matrix", None)
-    for prim in overlay.primitives:
-        if affine:
-            a, b, d, e, tx, ty = affine
-            pts = [(a * float(x) + b * float(y) + tx, d * float(x) + e * float(y) + ty) for x, y in prim.points]
-        else:
-            pts = [transform.map_point(float(x), float(y)) for x, y in prim.points]
-        transformed.append(DxfPrimitive(prim.kind, prim.layer, pts))
+    if affine:
+        raw_a, raw_b, raw_d, raw_e, tx, ty = [float(value) for value in affine]
+    else:
+        angle = float(transform.rotation_rad)
+        raw_scale = float(transform.scale)
+        cos_a = math.cos(angle)
+        sin_a = math.sin(angle)
+        raw_a = raw_scale * cos_a
+        raw_b = -raw_scale * sin_a
+        raw_d = raw_scale * sin_a
+        raw_e = raw_scale * cos_a
+        tx = float(transform.tx)
+        ty = float(transform.ty)
+
+    source_to_scene = (
+        raw_a / unit_to_m,
+        raw_b / unit_to_m,
+        raw_d / unit_to_m,
+        raw_e / unit_to_m,
+        tx,
+        ty,
+    )
+    a, b, d, e, xoff, yoff = source_to_scene
+    transformed: List[DxfPrimitive] = []
+    for primitive in overlay.primitives:
+        points = [
+            (
+                a * float(x) + b * float(y) + xoff,
+                d * float(x) + e * float(y) + yoff,
+            )
+            for x, y in primitive.points
+        ]
+        transformed.append(DxfPrimitive(primitive.kind, primitive.layer, points))
     overlay.primitives = transformed
-    overlay.source_units_name = "pre-aligned DXF"
-    overlay.effective_scale_to_metres = float(transform.scale)
+
+    source_base_x = float(overlay.source_base_point_x)
+    source_base_y = float(overlay.source_base_point_y)
+    scene_base_x = a * source_base_x + b * source_base_y + xoff
+    scene_base_y = d * source_base_x + e * source_base_y + yoff
+    scene_scale = math.hypot(a, d)
+    scene_rotation = math.degrees(math.atan2(d, a)) if scene_scale > 1e-18 else 0.0
+
+    overlay.base_point_source = "pre-aligned DXF base point"
+    overlay.base_point_alignment = DxfBasePointAlignment(
+        dxf_base_x=source_base_x,
+        dxf_base_y=source_base_y,
+        ifc_base_x=float(scene_base_x),
+        ifc_base_y=float(scene_base_y),
+        rotation_deg=float(scene_rotation),
+        scale=float(scene_scale),
+    )
+    overlay.source_to_scene_matrix = source_to_scene
+    overlay.alignment_method = "two_point"
+    overlay.alignment_applied = True
     return overlay
 
 
 class DxfAlignmentDialog(QDialog):
-    def __init__(self, parent=None, transform: Optional[AlignmentTransform] = None, apply_callback=None):
+    COORDINATE_LIMIT = 1_000_000_000_000_000.0
+
+    def __init__(
+        self,
+        parent=None,
+        alignment: Optional[DxfBasePointAlignment] = None,
+        detected_dxf_base: Tuple[float, float] = (0.0, 0.0),
+        ifc_base_source: str = "IFC insertion point",
+        apply_callback=None,
+    ):
         super().__init__(parent)
-        self.setWindowTitle("Align IFC to DXF")
-        self.transform = transform or AlignmentTransform()
+        self.setWindowTitle("Align DXF base point to IFC")
+        self.alignment = alignment or DxfBasePointAlignment()
+        self.detected_dxf_base = (float(detected_dxf_base[0]), float(detected_dxf_base[1]))
+        self.ifc_base_source = str(ifc_base_source or "IFC insertion point")
         self.apply_callback = apply_callback
+        self.setMinimumWidth(590)
+
         layout = QVBoxLayout(self)
-        info = QLabel("Adjust the IFC model against the DXF overlay. Values are model metres/degrees. Click Apply to update geometry used by RF simulation.")
+        info = QLabel(
+            "Move the DXF overlay by placing its base point on the IFC base point. "
+            "The IFC geometry, access points and RF coordinates remain unchanged. "
+            "The DXF X and Y base-point coordinates can be typed or pasted manually. "
+            "Coordinates are model metres and accept large georeferenced values."
+        )
         info.setWordWrap(True)
         layout.addWidget(info)
+
         form = QFormLayout()
-        self.dx = QDoubleSpinBox(); self.dx.setRange(-1_000_000, 1_000_000); self.dx.setDecimals(4); self.dx.setSingleStep(0.1); self.dx.setValue(self.transform.dx)
-        self.dy = QDoubleSpinBox(); self.dy.setRange(-1_000_000, 1_000_000); self.dy.setDecimals(4); self.dy.setSingleStep(0.1); self.dy.setValue(self.transform.dy)
-        self.rot = QDoubleSpinBox(); self.rot.setRange(-360, 360); self.rot.setDecimals(4); self.rot.setSingleStep(0.25); self.rot.setValue(self.transform.rotation_deg); self.rot.setSuffix("°")
-        self.scale_spin = QDoubleSpinBox(); self.scale_spin.setRange(0.000001, 1000000); self.scale_spin.setDecimals(6); self.scale_spin.setSingleStep(0.01); self.scale_spin.setValue(self.transform.scale)
-        form.addRow("IFC offset X", self.dx)
-        form.addRow("IFC offset Y", self.dy)
-        form.addRow("IFC rotation", self.rot)
-        form.addRow("IFC scale", self.scale_spin)
+        self.ifc_x_label = QLabel(f"{float(self.alignment.ifc_base_x):.6f} m")
+        self.ifc_y_label = QLabel(f"{float(self.alignment.ifc_base_y):.6f} m")
+        self.ifc_x_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.ifc_y_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.ifc_x_label.setToolTip(self.ifc_base_source)
+        self.ifc_y_label.setToolTip(self.ifc_base_source)
+
+        self.dxf_x = self._coordinate_editor(float(self.alignment.dxf_base_x), "X")
+        self.dxf_y = self._coordinate_editor(float(self.alignment.dxf_base_y), "Y")
+        self.dxf_x.returnPressed.connect(self.apply)
+        self.dxf_y.returnPressed.connect(self.apply)
+        self.rot = QDoubleSpinBox()
+        self.rot.setRange(-360.0, 360.0)
+        self.rot.setDecimals(6)
+        self.rot.setSingleStep(0.25)
+        self.rot.setValue(float(self.alignment.rotation_deg))
+        self.rot.setSuffix("°")
+        self.rot.setKeyboardTracking(False)
+        self.rot.setMinimumWidth(220)
+
+        self.scale_spin = QDoubleSpinBox()
+        self.scale_spin.setRange(0.000000001, 1_000_000_000.0)
+        self.scale_spin.setDecimals(9)
+        self.scale_spin.setSingleStep(0.01)
+        self.scale_spin.setValue(float(self.alignment.scale))
+        self.scale_spin.setKeyboardTracking(False)
+        self.scale_spin.setMinimumWidth(220)
+
+        form.addRow("IFC base point X", self.ifc_x_label)
+        form.addRow("IFC base point Y", self.ifc_y_label)
+        form.addRow("DXF base point X (m)", self.dxf_x)
+        form.addRow("DXF base point Y (m)", self.dxf_y)
+        form.addRow("DXF rotation about base point", self.rot)
+        form.addRow("DXF scale about base point", self.scale_spin)
         layout.addLayout(form)
+
+        detected = QLabel(
+            f"Detected {self.detected_dxf_base[0]:.6f}, {self.detected_dxf_base[1]:.6f} m "
+            f"from {getattr(parent, 'dxf_overlay', None).base_point_source if getattr(parent, 'dxf_overlay', None) is not None else 'the DXF file'}."
+        )
+        detected.setWordWrap(True)
+        layout.addWidget(detected)
+
         btn_row = QHBoxLayout()
-        apply_btn = QPushButton("Apply")
-        reset_btn = QPushButton("Reset")
+        apply_btn = QPushButton("Move DXF base point to IFC base point")
+        reset_btn = QPushButton("Use detected DXF base point")
         apply_btn.clicked.connect(self.apply)
         reset_btn.clicked.connect(self.reset)
         btn_row.addWidget(apply_btn)
         btn_row.addWidget(reset_btn)
         layout.addLayout(btn_row)
+
         close = QDialogButtonBox(QDialogButtonBox.Close)
         close.rejected.connect(self.reject)
         layout.addWidget(close)
 
-    def current_transform(self) -> AlignmentTransform:
-        return AlignmentTransform(
-            dx=float(self.dx.value()),
-            dy=float(self.dy.value()),
+    @staticmethod
+    def _format_coordinate(value: float) -> str:
+        # Keep the shortest decimal representation that round-trips to the
+        # stored float without exposing binary floating-point noise.
+        text = np.format_float_positional(
+            float(value), unique=True, precision=15, trim="-"
+        )
+        return text if text not in {"", "-0"} else "0"
+
+    @classmethod
+    def _coordinate_editor(cls, value: float, axis_name: str) -> QLineEdit:
+        editor = QLineEdit(cls._format_coordinate(value))
+        editor.setMinimumWidth(300)
+        editor.setClearButtonEnabled(True)
+        editor.setPlaceholderText(f"Enter DXF base point {axis_name} coordinate")
+        editor.setToolTip(
+            "Type or paste the DXF base-point coordinate. Commas and an optional "
+            "trailing 'm' are accepted. Values may be up to ±1e15 metres."
+        )
+        return editor
+
+    @classmethod
+    def _parse_coordinate(cls, editor: QLineEdit, axis_name: str) -> float:
+        raw = editor.text().strip()
+        cleaned = raw.replace(",", "").strip()
+        if cleaned.lower().endswith("metres"):
+            cleaned = cleaned[:-6].strip()
+        elif cleaned.lower().endswith("meters"):
+            cleaned = cleaned[:-6].strip()
+        elif cleaned.lower().endswith("m"):
+            cleaned = cleaned[:-1].strip()
+        try:
+            value = float(cleaned)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"DXF base point {axis_name} must be a valid number, for example "
+                "368003438.500336."
+            ) from exc
+        if not math.isfinite(value):
+            raise ValueError(f"DXF base point {axis_name} must be a finite number.")
+        if abs(value) > cls.COORDINATE_LIMIT:
+            raise ValueError(
+                f"DXF base point {axis_name} must be between "
+                f"{-cls.COORDINATE_LIMIT:g} and {cls.COORDINATE_LIMIT:g} metres."
+            )
+        return value
+
+    def current_alignment(self) -> DxfBasePointAlignment:
+        return DxfBasePointAlignment(
+            dxf_base_x=self._parse_coordinate(self.dxf_x, "X"),
+            dxf_base_y=self._parse_coordinate(self.dxf_y, "Y"),
+            ifc_base_x=float(self.alignment.ifc_base_x),
+            ifc_base_y=float(self.alignment.ifc_base_y),
             rotation_deg=float(self.rot.value()),
             scale=float(self.scale_spin.value()),
         )
 
     def apply(self):
-        self.transform = self.current_transform()
+        try:
+            self.alignment = self.current_alignment()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid DXF base point", str(exc))
+            return
+        # Normalise the displayed values after successful manual entry so the
+        # exact coordinates being saved and exported remain visible.
+        self.dxf_x.setText(self._format_coordinate(self.alignment.dxf_base_x))
+        self.dxf_y.setText(self._format_coordinate(self.alignment.dxf_base_y))
         if self.apply_callback:
-            self.apply_callback(self.transform)
+            self.apply_callback(self.alignment)
 
     def reset(self):
-        self.dx.setValue(0.0)
-        self.dy.setValue(0.0)
+        self.dxf_x.setText(self._format_coordinate(self.detected_dxf_base[0]))
+        self.dxf_y.setText(self._format_coordinate(self.detected_dxf_base[1]))
         self.rot.setValue(0.0)
         self.scale_spin.setValue(1.0)
         self.apply()
@@ -6030,7 +6275,7 @@ class AutoPlannerSettingsDialog(QDialog):
         self.area_mode = QComboBox()
         self.area_mode.addItem("Automatic — eligible spaces, then shared boundaries, then walls", "auto")
         self.area_mode.addItem("Eligible IFC/manual/inferred spaces only", "spaces")
-        self.area_mode.addItem("Shared planner boundaries only", "boundaries")
+        self.area_mode.addItem("Current-floor planner boundaries only", "boundaries")
         self.area_mode.addItem("Infer floor footprint from IFC walls", "walls")
         area_index = self.area_mode.findData(settings.planning_area_mode)
         self.area_mode.setCurrentIndex(max(0, area_index))
@@ -6075,7 +6320,7 @@ class AutoPlannerSettingsDialog(QDialog):
         form.addRow(self.remove_planned)
         layout.addLayout(form)
 
-        note = QLabel("AP positions are selected from simulated RSSI values: the planner prioritises the samples with the largest dB shortfall instead of relying only on geometric spacing. When handover is enabled, a sample contributes to the handover target only when a second distinct AP reaches the configured secondary threshold. The second AP may use a different channel; channel allocation prefers non-overlapping channels in shared coverage areas. Spectrum occupancy reduces effective client capacity. Inferred spaces are optional predictive locations and can be excluded without deleting them. Shared rectangular and polygon planner boundaries apply to every IFC floor and remain a hard placement limit. The outer-boundary suggestion tool can trace and preview the outermost IFC wall chain before it is accepted.")
+        note = QLabel("AP positions are selected from simulated RSSI values: the planner prioritises the samples with the largest dB shortfall instead of relying only on geometric spacing. When handover is enabled, a sample contributes to the handover target only when a second distinct AP reaches the configured secondary threshold. The second AP may use a different channel; channel allocation prefers non-overlapping channels in shared coverage areas. Spectrum occupancy reduces effective client capacity. Inferred spaces are optional predictive locations and can be excluded without deleting them. Rectangular and polygon planner boundaries apply to the floor they were drawn on and remain a hard placement limit. The outer-boundary suggestion tool can trace and preview the outermost IFC wall chain before it is accepted.")
         note.setWordWrap(True)
         layout.addWidget(note)
 
@@ -7783,7 +8028,7 @@ class PropagationSettingsDialog(QDialog):
         self.ap_combination.setCurrentIndex(max(0, index))
         form.addRow("Multiple-AP combination", self.ap_combination)
 
-        self.boundary_filter = QCheckBox("Ignore RSSI results outside shared planner boundaries")
+        self.boundary_filter = QCheckBox("Ignore RSSI results outside planner boundaries for each floor")
         self.boundary_filter.setChecked(bool(settings.ignore_results_outside_planner_boundaries))
         self.boundary_filter.setToolTip(
             "When shared rectangular or polygon boundaries exist, points outside their union are skipped during calculation and omitted from heatmaps, hover results, statistics, CSV and PDF output."
@@ -8137,7 +8382,7 @@ class IFCElementGraphicsItem(QGraphicsPolygonItem):
 
 
 class PlannerBoundaryGraphicsItem(QGraphicsPolygonItem):
-    """Selectable outline for a planner boundary shared across all floors."""
+    """Selectable outline for a planner boundary on one floor."""
 
     def __init__(self, main, boundary: PlannerBoundary2D):
         coords = list(boundary.polygon.exterior.coords)
@@ -9061,6 +9306,7 @@ class MainWindow(QMainWindow):
         self._saved_simulation_entries: Dict[Tuple[str, float], Dict[str, object]] = {}
         self._saved_simulation_root: Optional[Path] = None
         self.dxf_overlay: Optional[DxfOverlay] = None
+        self.dxf_export_alignment: Optional[Dict[str, object]] = None
         self.ifc_alignment = AlignmentTransform()
         self.alignment_pick_mode: Optional[str] = None
         self.alignment_pick_points: Dict[str, Tuple[float, float]] = {}
@@ -9292,7 +9538,7 @@ class MainWindow(QMainWindow):
         self.add_action.triggered.connect(self.add_ifc)
         self.open_dxf_action = QAction("Open DXF overlay", self)
         self.open_dxf_action.triggered.connect(self.open_dxf_overlay)
-        self.align_ifc_action = QAction("Align IFC to DXF", self)
+        self.align_ifc_action = QAction("Align DXF base point to IFC", self)
         self.align_ifc_action.triggered.connect(self.show_dxf_alignment_dialog)
         self.two_point_align_action = QAction("2-point align IFC/DXF", self)
         self.two_point_align_action.triggered.connect(self.start_two_point_alignment)
@@ -9637,7 +9883,7 @@ class MainWindow(QMainWindow):
                 "SP_DirOpenIcon", ""
             ),
             "align_ifc_action": (
-                "Align IFC to DXF", "Open the interactive IFC-to-DXF alignment dialog.",
+                "Align DXF base point", "Move the DXF base point onto the IFC insertion/base point without modifying IFC geometry.",
                 "SP_BrowserReload", ""
             ),
             "two_point_align_action": (
@@ -9729,7 +9975,7 @@ class MainWindow(QMainWindow):
                 "SP_ComputerIcon", "Ctrl+Alt+Shift+P"
             ),
             "boundary_result_filter_action": (
-                "Limit RSSI to boundaries", "Skip and hide RSSI samples outside the union of accepted shared planner boundaries. The filter also applies to hover values, CSV statistics and floor PDF exports.",
+                "Limit RSSI to boundaries", "Skip and hide RSSI samples outside the accepted planner boundaries for each floor. The filter also applies to hover values, CSV statistics and floor PDF exports.",
                 "SP_DialogApplyButton", "Ctrl+Alt+L"
             ),
             "planner_settings_action": (
@@ -9757,7 +10003,7 @@ class MainWindow(QMainWindow):
                 "SP_DriveNetIcon", ""
             ),
             "suggest_external_boundary_action": (
-                "Suggest outer boundary", "Trace the outermost combined IFC and manually placed RF wall chain, preview it on the plan and accept it as a shared planner boundary.",
+                "Suggest outer boundary", "Trace the outermost combined IFC and manually placed RF wall chain, preview it on the plan and accept it as a planner boundary on the current floor.",
                 "SP_FileDialogListView", ""
             ),
             "create_spaces_action": (
@@ -11113,7 +11359,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(
                     self,
                     "No floor selected",
-                    "Load an IFC and select a floor before drawing a shared planner boundary.",
+                    "Load an IFC and select a floor before drawing a planner boundary.",
                 )
                 self.cancel_planner_boundary_drawing(show_status=False)
                 return
@@ -11690,6 +11936,7 @@ class MainWindow(QMainWindow):
                 name=f"Suggested external boundary{chain_suffix}",
                 polygon=polygon,
                 shape_type="polygon",
+                floor=str(self.floor.name) if self.floor else "",
             ))
 
         self._clear_rssi_results()
@@ -11697,7 +11944,7 @@ class MainWindow(QMainWindow):
         created = len(current_polygons)
         self.statusBar().showMessage(
             f"Accepted {created} suggested external planner boundar{'y' if created == 1 else 'ies'}; "
-            "the permitted area now applies to all IFC floors."
+            f"the permitted area now applies to '{self.floor.name}' only."
         )
 
     def _clear_suggested_space_preview(self):
@@ -11854,9 +12101,9 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(dialog)
 
         baseline_text = (
-            f"{len(accepted_baselines)} accepted shared planner boundary polygon(s) will be used as the external wall baseline."
+            f"{len(accepted_baselines)} accepted planner boundary polygon(s) on this floor will be used as the external wall baseline."
             if accepted_baselines else
-            "No shared planner boundary exists. The outermost-wall algorithm will suggest an external baseline and preview it in magenta."
+            "No planner boundary exists on this floor. The outermost-wall algorithm will suggest an external baseline and preview it in magenta."
         )
         explanation = QLabel(
             "The green polygons are proposed simulator spaces. Small wall gaps and ordinary door openings are bridged before the free floor area is split. "
@@ -11893,7 +12140,7 @@ class MainWindow(QMainWindow):
         replace_inferred = QCheckBox("Replace existing inferred spaces on this floor when accepted")
         replace_inferred.setChecked(True)
         layout.addWidget(replace_inferred)
-        create_baseline = QCheckBox("Create the suggested external baseline as shared planner boundaries")
+        create_baseline = QCheckBox("Create the suggested external baseline as planner boundaries on this floor")
         create_baseline.setChecked(not bool(accepted_baselines))
         create_baseline.setEnabled(not bool(accepted_baselines))
         create_baseline.setToolTip(
@@ -12028,6 +12275,7 @@ class MainWindow(QMainWindow):
                     name=f"Space inference external boundary{suffix}",
                     polygon=polygon,
                     shape_type="polygon",
+                    floor=str(self.floor.name) if self.floor else "",
                 ))
 
         active_baselines = accepted_baselines or inferred_baselines
@@ -12073,7 +12321,7 @@ class MainWindow(QMainWindow):
             + (
                 "an inferred outer-wall baseline."
                 if used_suggested else
-                "the accepted shared planner boundary as the external wall."
+                "the accepted planner boundary as the external wall."
             )
         )
         if barrier_counts.get("element_count", 0):
@@ -12168,16 +12416,16 @@ class MainWindow(QMainWindow):
         ]
         self._clear_rssi_results()
         self.draw_floor()
-        self.statusBar().showMessage("Deleted shared planner boundary")
+        self.statusBar().showMessage("Deleted planner boundary")
 
     def clear_planner_boundaries(self):
         if not self.planner_boundaries:
-            self.statusBar().showMessage("No shared planner boundaries to clear")
+            self.statusBar().showMessage("No planner boundaries to clear")
             return
         answer = QMessageBox.question(
             self,
             "Clear planner boundaries",
-            "Delete all rectangular and polygon planner boundaries shared by every IFC floor?",
+            "Delete all rectangular and polygon planner boundaries on every floor?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -12186,7 +12434,7 @@ class MainWindow(QMainWindow):
         self.planner_boundaries.clear()
         self._clear_rssi_results()
         self.draw_floor()
-        self.statusBar().showMessage("Cleared all shared planner boundaries")
+        self.statusBar().showMessage("Cleared all planner boundaries")
 
     def nearest_ifc_connection_point(
         self,
@@ -13073,10 +13321,17 @@ class MainWindow(QMainWindow):
 
     # ----------------------------- Predictive AP planning -----------------------------
 
-    def _rssi_calculation_boundary(self):
+    def _planner_boundaries_for_floor(self, floor: Optional[FloorModel] = None) -> List[PlannerBoundary2D]:
+        target_floor = str((floor or self.floor).name) if (floor or self.floor) is not None else ""
+        return [
+            boundary for boundary in self.planner_boundaries
+            if not str(getattr(boundary, "floor", "") or "") or str(boundary.floor) == target_floor
+        ]
+
+    def _rssi_calculation_boundary(self, floor: Optional[FloorModel] = None):
         if not bool(self.heatmap_settings.ignore_results_outside_planner_boundaries):
             return None
-        return self._planner_boundary_area()
+        return self._planner_boundary_area(floor)
 
     def _clear_rssi_results(self):
         self._invalidate_interactive_preview_requests()
@@ -13091,11 +13346,11 @@ class MainWindow(QMainWindow):
         self.draw_floor()
         if enabled and not self.planner_boundaries:
             self.statusBar().showMessage(
-                "Boundary RSSI filter enabled; create or accept a shared planner boundary for it to take effect."
+                "Boundary RSSI filter enabled; create or accept a planner boundary for it to take effect."
             )
         elif enabled:
             self.statusBar().showMessage(
-                "Boundary RSSI filter enabled: samples outside the shared planner-boundary union will be ignored."
+                "Boundary RSSI filter enabled: samples outside each floor's planner-boundary union will be ignored."
             )
         else:
             self.statusBar().showMessage("Boundary RSSI filter disabled")
@@ -13216,9 +13471,10 @@ class MainWindow(QMainWindow):
             self.populate_wall_table()
             self.statusBar().showMessage("Predictive AP planner settings updated")
 
-    def _planner_boundary_area(self):
+    def _planner_boundary_area(self, floor: Optional[FloorModel] = None):
+        floor_boundaries = self._planner_boundaries_for_floor(floor)
         polygons = [
-            boundary.polygon for boundary in self.planner_boundaries
+            boundary.polygon for boundary in floor_boundaries
             if boundary.polygon is not None and not boundary.polygon.is_empty
         ]
         if not polygons:
@@ -13234,19 +13490,20 @@ class MainWindow(QMainWindow):
     def _planner_floor_area(self):
         """Return the area sampled by the predictive planner.
 
-        Shared user boundaries apply to every IFC floor. Whenever at least
-        one exists, their union is a hard clipping mask: no candidate or sample
+        User boundaries apply to the floor they were drawn on. Whenever at least
+        one exists for this floor, their union is a hard clipping mask: no candidate or sample
         point can be generated outside it. In automatic mode, IFC spaces are
-        preferred; if spaces are absent, the shared boundaries become the
+        preferred; if spaces are absent, floor boundaries become the
         planning area; wall-derived geometry is used only as the final fallback.
         """
         if not self.floor:
             return None
         settings = self.auto_planner_settings
         mode = str(getattr(settings, "planning_area_mode", "auto") or "auto").lower()
-        boundary_area = self._planner_boundary_area()
-        boundary_count = len(self.planner_boundaries)
-        boundary_description = f"{boundary_count} shared planner {'boundary' if boundary_count == 1 else 'boundaries'}"
+        boundary_area = self._planner_boundary_area(self.floor)
+        floor_boundaries = self._planner_boundaries_for_floor(self.floor)
+        boundary_count = len(floor_boundaries)
+        boundary_description = f"{boundary_count} planner {'boundary' if boundary_count == 1 else 'boundaries'} on {self.floor.name}"
         use_inferred_spaces = bool(getattr(settings, "use_inferred_spaces", True))
         selected_space_objects = [
             space for space in self._selected_ap_planning_spaces()
@@ -13300,7 +13557,7 @@ class MainWindow(QMainWindow):
 
         if mode == "boundaries":
             if boundary_area is None:
-                self._planner_area_source_label = "shared planner boundaries only (none drawn)"
+                self._planner_area_source_label = f"planner boundaries on {self.floor.name} only (none drawn)"
                 return None
             self._planner_area_source_label = boundary_description
             return boundary_area
@@ -13339,7 +13596,7 @@ class MainWindow(QMainWindow):
             if wall.polygon is not None and not wall.polygon.is_empty
         ]
         if not wall_polygons:
-            self._planner_area_source_label = "no IFC spaces, shared planner boundaries, or wall geometry"
+            self._planner_area_source_label = "no IFC spaces, planner boundaries, or wall geometry"
             return None
         try:
             wall_union = unary_union(wall_polygons)
@@ -13831,17 +14088,17 @@ class MainWindow(QMainWindow):
                 )
                 message = (
                     "This floor contains no usable eligible space geometry. Change Planning area source to "
-                    "Automatic, draw shared planner boundaries, infer the footprint from walls, or create/select spaces."
+                    "Automatic, draw planner boundaries, infer the footprint from walls, or create/select spaces."
                     + inferred_hint
                 )
             elif settings.planning_area_mode == "boundaries":
                 message = (
-                    "No shared planner boundaries have been drawn. Use 'Draw rectangular boundary' or 'Draw polygon boundary' "
-                    "and define the permitted area; the boundaries will apply to every IFC floor."
+                    f"No planner boundaries have been drawn on {self.floor.name}. Use 'Draw rectangular boundary' or "
+                    "'Draw polygon boundary' and define the permitted area for this floor."
                 )
             else:
                 message = (
-                    "No usable planning area was found. Draw one or more shared rectangular or polygon planner boundaries "
+                    "No usable planning area was found. Draw one or more rectangular or polygon planner boundaries "
                     "or provide IFC space/wall geometry."
                 )
             QMessageBox.warning(self, "No plannable area", message)
@@ -13959,6 +14216,13 @@ class MainWindow(QMainWindow):
             capacity_ap_count = int(math.ceil(settings.expected_clients / effective_clients)) if settings.expected_clients > 0 else 0
             selected: List[Tuple[AccessPoint, List[np.ndarray]]] = []
             positions = [(ap.x, ap.y) for ap in existing]
+            other_floor_positions = [
+                (float(ap.x), float(ap.y))
+                for ap in self.aps
+                if str(ap.floor) != str(self.floor.name)
+            ]
+            vertical_avoidance_m = max(2.0, min(12.0, float(settings.minimum_ap_spacing_m) * 0.5))
+            vertical_hard_overlap_m = min(0.75, vertical_avoidance_m * 0.25)
             remaining = set(range(len(candidate_specs)))
             sample_points = np.asarray(samples, dtype=np.float32)
 
@@ -13968,14 +14232,27 @@ class MainWindow(QMainWindow):
             def handover_fraction_now() -> float:
                 return float(np.count_nonzero(handover_overall)) / max(1, len(handover_overall))
 
-            def candidate_spacing_ok(candidate_ap: AccessPoint) -> Tuple[bool, float]:
+            def nearest_xy_distance(points: Sequence[Tuple[float, float]], x: float, y: float) -> float:
+                if not points:
+                    return float("inf")
+                return min(math.hypot(float(x) - px, float(y) - py) for px, py in points)
+
+            def vertical_spacing_penalty(vertical_distance: float) -> float:
+                if not math.isfinite(vertical_distance) or vertical_distance >= vertical_avoidance_m:
+                    return 0.0
+                return (vertical_avoidance_m - max(0.0, vertical_distance)) * 80.0
+
+            def candidate_spacing_ok(candidate_ap: AccessPoint) -> Tuple[bool, float, float]:
+                vertical_distance = nearest_xy_distance(other_floor_positions, candidate_ap.x, candidate_ap.y)
+                if vertical_distance < vertical_hard_overlap_m:
+                    return False, 0.0, vertical_distance
                 if not positions:
-                    return True, float(settings.minimum_ap_spacing_m)
+                    return True, float(settings.minimum_ap_spacing_m), vertical_distance
                 min_distance = min(
                     math.hypot(candidate_ap.x - px, candidate_ap.y - py)
                     for px, py in positions
                 )
-                return min_distance + 1e-9 >= settings.minimum_ap_spacing_m, min_distance
+                return min_distance + 1e-9 >= settings.minimum_ap_spacing_m, min_distance, vertical_distance
 
             def nearest_position_distance(points: np.ndarray) -> np.ndarray:
                 if points.size == 0:
@@ -14053,7 +14330,10 @@ class MainWindow(QMainWindow):
                     proposed_coverage_deficit, proposed_handover_deficit,
                 )
 
-            def score_candidate(candidate_ap: AccessPoint, candidate_rssi: List[np.ndarray], min_distance: float, coverage_needed: bool, handover_needed: bool, capacity_needed: bool):
+            def score_candidate(
+                candidate_ap: AccessPoint, candidate_rssi: List[np.ndarray], min_distance: float,
+                vertical_distance: float, coverage_needed: bool, handover_needed: bool, capacity_needed: bool,
+            ):
                 state = insert_candidate_state(candidate_rssi)
                 (
                     proposed_strongest, _proposed_second,
@@ -14081,6 +14361,7 @@ class MainWindow(QMainWindow):
                     score += min_distance * 10.0 + mean_margin
                 else:
                     score += min_distance * 0.01
+                score -= vertical_spacing_penalty(vertical_distance)
                 return score, state
 
             def apply_selected(index: int, candidate_ap: AccessPoint, candidate_rssi: List[np.ndarray], state):
@@ -14117,7 +14398,14 @@ class MainWindow(QMainWindow):
                         sx = float(np.mean(sample_points[:, 0])); sy = float(np.mean(sample_points[:, 1]))
                     seed_index = min(
                         remaining,
-                        key=lambda index: math.hypot(float(candidate_specs[index][0]) - sx, float(candidate_specs[index][1]) - sy),
+                        key=lambda index: (
+                            math.hypot(float(candidate_specs[index][0]) - sx, float(candidate_specs[index][1]) - sy)
+                            + vertical_spacing_penalty(nearest_xy_distance(
+                                other_floor_positions,
+                                float(candidate_specs[index][0]),
+                                float(candidate_specs[index][1]),
+                            )) * 0.25
+                        ),
                     )
                     candidate_ap, candidate_rssi = candidate_record(seed_index)
                     state = insert_candidate_state(candidate_rssi)
@@ -14145,10 +14433,13 @@ class MainWindow(QMainWindow):
                         progress.setValue(len(selected))
                         QApplication.processEvents()
                     candidate_ap, candidate_rssi = candidate_record(record_index)
-                    spacing_ok, min_distance = candidate_spacing_ok(candidate_ap)
+                    spacing_ok, min_distance, vertical_distance = candidate_spacing_ok(candidate_ap)
                     if not spacing_ok:
                         continue
-                    score, state = score_candidate(candidate_ap, candidate_rssi, min_distance, coverage_needed, handover_needed, capacity_needed)
+                    score, state = score_candidate(
+                        candidate_ap, candidate_rssi, min_distance, vertical_distance,
+                        coverage_needed, handover_needed, capacity_needed,
+                    )
                     if score > best_score:
                         best_score = score
                         best_index = record_index
@@ -14278,6 +14569,94 @@ class MainWindow(QMainWindow):
             spectrum_occupancy_percent=float(data.get("spectrum_occupancy_percent", 0.0)),
         )
 
+    @staticmethod
+    def _validated_dxf_export_alignment(data: object) -> Optional[Dict[str, object]]:
+        """Return a normalised saved DXF export reference, or ``None``.
+
+        The stored affine matrix maps original DXF coordinates in metres into
+        the current RF scene. Its inverse is the exact offset/rotation/scale
+        required to export scene access points back into the DXF reference.
+        """
+        if not isinstance(data, dict) or not bool(data.get("aligned", False)):
+            return None
+        raw_matrix = data.get("source_to_scene_matrix", [])
+        if not isinstance(raw_matrix, (list, tuple)) or len(raw_matrix) != 6:
+            return None
+        try:
+            matrix = tuple(float(value) for value in raw_matrix)
+            inverse = AlignmentTransform._invert_matrix(matrix)
+            source_base_x = float(data.get("source_base_point_x_m", 0.0))
+            source_base_y = float(data.get("source_base_point_y_m", 0.0))
+        except Exception:
+            return None
+        a, b, d, e, xoff, yoff = matrix
+        scene_base_x = a * source_base_x + b * source_base_y + xoff
+        scene_base_y = d * source_base_x + e * source_base_y + yoff
+        scale = math.hypot(a, d)
+        rotation_deg = math.degrees(math.atan2(d, a)) if scale > 1e-18 else 0.0
+        try:
+            source_units_code = int(data.get("source_units_code", 0) or 0)
+        except Exception:
+            source_units_code = 0
+        try:
+            metres_per_dxf_unit = float(data.get("metres_per_dxf_unit", 1.0) or 1.0)
+        except Exception:
+            metres_per_dxf_unit = 1.0
+        return {
+            "aligned": True,
+            "method": str(data.get("method", "base_point") or "base_point"),
+            "dxf_path": str(data.get("dxf_path", "")),
+            "base_point_source": str(data.get("base_point_source", "DXF base point")),
+            "source_units_code": source_units_code,
+            "source_units_name": str(data.get("source_units_name", "metres")),
+            "metres_per_dxf_unit": metres_per_dxf_unit,
+            "source_base_point_x_m": source_base_x,
+            "source_base_point_y_m": source_base_y,
+            "scene_base_point_x_m": float(scene_base_x),
+            "scene_base_point_y_m": float(scene_base_y),
+            "source_to_scene_matrix": [float(value) for value in matrix],
+            "scene_to_source_matrix": [float(value) for value in inverse],
+            "export_offset_x_m": float(inverse[4]),
+            "export_offset_y_m": float(inverse[5]),
+            "rotation_deg": float(rotation_deg),
+            "scale": float(scale),
+        }
+
+    def _dxf_export_alignment_from_overlay(self, overlay: Optional[DxfOverlay] = None) -> Optional[Dict[str, object]]:
+        overlay = overlay or getattr(self, "dxf_overlay", None)
+        if overlay is None or not bool(getattr(overlay, "alignment_applied", False)):
+            return None
+        matrix = getattr(overlay, "source_to_scene_matrix", None)
+        if matrix is None:
+            alignment = getattr(overlay, "base_point_alignment", None)
+            matrix = alignment.matrix() if alignment is not None else None
+        if matrix is None:
+            return None
+        source_base_x = float(getattr(overlay, "source_base_point_x", overlay.file_base_point_x))
+        source_base_y = float(getattr(overlay, "source_base_point_y", overlay.file_base_point_y))
+        record = {
+            "aligned": True,
+            "method": str(getattr(overlay, "alignment_method", "base_point") or "base_point"),
+            "dxf_path": str(getattr(overlay, "path", "")),
+            "base_point_source": str(getattr(overlay, "base_point_source", "DXF base point")),
+            "source_units_code": int(getattr(overlay, "source_units_code", 0) or 0),
+            "source_units_name": str(getattr(overlay, "source_units_name", "metres")),
+            "metres_per_dxf_unit": float(getattr(overlay, "metres_per_dxf_unit", 1.0) or 1.0),
+            "source_base_point_x_m": source_base_x,
+            "source_base_point_y_m": source_base_y,
+            "source_to_scene_matrix": [float(value) for value in matrix],
+        }
+        return self._validated_dxf_export_alignment(record)
+
+    def _active_dxf_export_alignment(self) -> Optional[Dict[str, object]]:
+        current = self._dxf_export_alignment_from_overlay()
+        if current is not None:
+            self.dxf_export_alignment = current
+            return current
+        saved = self._validated_dxf_export_alignment(getattr(self, "dxf_export_alignment", None))
+        self.dxf_export_alignment = saved
+        return saved
+
     def _rf_plan_data(self) -> Dict[str, object]:
         aps = []
         for ap in self.aps:
@@ -14333,6 +14712,7 @@ class MainWindow(QMainWindow):
                 "guid": boundary.guid,
                 "name": boundary.name,
                 "shape_type": boundary.shape_type,
+                "floor": str(getattr(boundary, "floor", "") or ""),
                 "polygon": [
                     [float(x), float(y)] for x, y in boundary.polygon.exterior.coords
                 ],
@@ -14368,11 +14748,13 @@ class MainWindow(QMainWindow):
                     user_spaces.append(item)
                 else:
                     inferred_spaces.append(item)
+        dxf_export_alignment = self._active_dxf_export_alignment()
         return {
-            "format": "rf-attenuation-plan", "version": 8,
+            "format": "rf-attenuation-plan", "version": 9,
             "ifc_paths": [str(path) for path in self.loaded_ifc_paths],
             "selected_floor": self.floor.name if self.floor else "", "view_rotation_deg": self.view_rotation_deg,
             "ifc_alignment": {"dx": self.ifc_alignment.dx, "dy": self.ifc_alignment.dy, "rotation_deg": self.ifc_alignment.rotation_deg, "scale": self.ifc_alignment.scale},
+            "dxf_alignment": dxf_export_alignment,
             "auto_planner_settings": self.auto_planner_settings.to_dict(),
             "custom_radio_profiles": copy.deepcopy(getattr(self.heatmap_settings, "custom_radio_profiles", {})),
             "propagation_model": self.heatmap_settings.propagation_model_dict(),
@@ -14419,7 +14801,7 @@ class MainWindow(QMainWindow):
             "include_inter_floor": bool(self.include_inter_floor.isChecked()),
             "settings": RFEngine._settings_revision(self.heatmap_settings),
             "patterns": RFEngine._pattern_revision(self.antenna_patterns),
-            "boundary": RFEngine._boundary_revision(self._rssi_calculation_boundary()),
+            "boundary_filter": bool(self.heatmap_settings.ignore_results_outside_planner_boundaries),
         }
 
     def _simulation_signature(
@@ -14448,6 +14830,7 @@ class MainWindow(QMainWindow):
             "frequency_mhz": round(frequency, 6),
             "geometry": RFEngine._geometry_revision(geometry_models),
             "aps": tuple(sorted(relevant_aps)),
+            "boundary": RFEngine._boundary_revision(self._rssi_calculation_boundary(floor)),
         })
 
     def _simulation_result_filename(self, floor_name: str, frequency_mhz: float) -> str:
@@ -14541,7 +14924,7 @@ class MainWindow(QMainWindow):
                     delay_spread_ns=None if delay.size == 0 else delay,
                     path_count=None if counts.size == 0 else counts,
                     valid_mask=None if valid.size == 0 else valid,
-                    boundary_geometry=self._rssi_calculation_boundary(),
+                    boundary_geometry=self._rssi_calculation_boundary(floor),
                     ignored_point_count=int(metadata.get("ignored_point_count", 0)),
                     execution_mode="saved-result", worker_processes=int(metadata.get("worker_processes", 1)),
                     elapsed_seconds=float(metadata.get("elapsed_seconds", 0.0)),
@@ -14691,6 +15074,11 @@ class MainWindow(QMainWindow):
         self._apply_rf_plan_data(data)
 
     def _apply_rf_plan_data(self, data: Dict[str, object]):
+        # A plan must never inherit a DXF overlay or export reference from the
+        # previously open project. The saved reference remains usable even when
+        # the original DXF file is unavailable.
+        self.dxf_overlay = None
+        self.dxf_export_alignment = self._validated_dxf_export_alignment(data.get("dxf_alignment"))
         alignment_data = data.get("ifc_alignment", {}) or {}
         try:
             target_alignment = AlignmentTransform(
@@ -14897,6 +15285,7 @@ class MainWindow(QMainWindow):
                     name=str(item.get("name", f"Planner boundary {len(self.planner_boundaries) + 1}")),
                     polygon=polygon,
                     shape_type=shape_type,
+                    floor=str(item.get("floor", "")),
                 ))
             except Exception:
                 continue
@@ -15374,31 +15763,112 @@ class MainWindow(QMainWindow):
             unit_scale = float(getattr(self.heatmap_settings, "dxf_unit_scale", 1.0))
             auto_units = bool(getattr(self.heatmap_settings, "dxf_auto_unit_scale", True))
             self.dxf_overlay = load_dxf_overlay(Path(path), unit_scale=unit_scale, auto_units=auto_units)
+            self.dxf_export_alignment = None
         except Exception as exc:
             QMessageBox.critical(self, "DXF load failed", str(exc))
             return
         self.statusBar().showMessage(
             f"Loaded unaligned DXF overlay: {Path(path).name} ({len(self.dxf_overlay.primitives)} primitives), "
-            f"units={self.dxf_overlay.source_units_name}, scale={self.dxf_overlay.effective_scale_to_metres:g} m/unit"
+            f"units={self.dxf_overlay.source_units_name}, scale={self.dxf_overlay.effective_scale_to_metres:g} m/unit, "
+            f"base=({self.dxf_overlay.file_base_point_x:.6f}, {self.dxf_overlay.file_base_point_y:.6f}) m"
         )
         self.draw_floor()
 
     def clear_dxf_overlay(self):
         self.dxf_overlay = None
-        self.statusBar().showMessage("Cleared DXF overlay")
+        self.dxf_export_alignment = None
+        self.statusBar().showMessage("Cleared DXF overlay and its saved AP export offset")
         self.draw_floor()
 
     def show_dxf_alignment_dialog(self):
         if not self.floors:
-            QMessageBox.information(self, "No IFC loaded", "Load an IFC model before aligning to a DXF.")
+            QMessageBox.information(self, "No IFC loaded", "Load an IFC model before aligning a DXF base point.")
             return
         if self.dxf_overlay is None:
-            QMessageBox.information(self, "No DXF overlay", "Open a DXF overlay first, then align the IFC to it.")
+            QMessageBox.information(self, "No DXF overlay", "Open a DXF overlay before aligning its base point to the IFC.")
             return
-        dlg = DxfAlignmentDialog(self, transform=self.ifc_alignment, apply_callback=self.apply_ifc_alignment)
+
+        ifc_x, ifc_y, ifc_source = self._ifc_insertion_point_for_project()
+        current = self.dxf_overlay.base_point_alignment
+        if current is None:
+            current = DxfBasePointAlignment(
+                dxf_base_x=float(self.dxf_overlay.file_base_point_x),
+                dxf_base_y=float(self.dxf_overlay.file_base_point_y),
+                ifc_base_x=float(self.dxf_overlay.file_base_point_x),
+                ifc_base_y=float(self.dxf_overlay.file_base_point_y),
+            )
+        alignment = DxfBasePointAlignment(
+            dxf_base_x=float(current.dxf_base_x),
+            dxf_base_y=float(current.dxf_base_y),
+            ifc_base_x=float(ifc_x),
+            ifc_base_y=float(ifc_y),
+            rotation_deg=float(current.rotation_deg),
+            scale=float(current.scale),
+        )
+        dlg = DxfAlignmentDialog(
+            self,
+            alignment=alignment,
+            detected_dxf_base=(
+                float(self.dxf_overlay.file_base_point_x),
+                float(self.dxf_overlay.file_base_point_y),
+            ),
+            ifc_base_source=ifc_source,
+            apply_callback=self.apply_dxf_base_point_alignment,
+        )
+        self._dxf_alignment_dialog = dlg
+        dlg.finished.connect(lambda _result: setattr(self, "_dxf_alignment_dialog", None))
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
+
+    def apply_dxf_base_point_alignment(self, new_alignment: DxfBasePointAlignment):
+        """Move the DXF base point to the IFC base point without changing IFC geometry."""
+        overlay = getattr(self, "dxf_overlay", None)
+        if overlay is None:
+            QMessageBox.information(self, "No DXF overlay", "Open a DXF overlay before applying base-point alignment.")
+            return
+        try:
+            new_matrix = new_alignment.matrix()
+            old_alignment = overlay.base_point_alignment
+            if old_alignment is None:
+                old_alignment = DxfBasePointAlignment(
+                    dxf_base_x=float(overlay.file_base_point_x),
+                    dxf_base_y=float(overlay.file_base_point_y),
+                    ifc_base_x=float(overlay.file_base_point_x),
+                    ifc_base_y=float(overlay.file_base_point_y),
+                )
+            old_matrix = old_alignment.matrix()
+            delta = AlignmentTransform._compose(
+                new_matrix, AlignmentTransform._invert_matrix(old_matrix)
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Invalid DXF base-point alignment", str(exc))
+            return
+
+        a, b, d, e, xoff, yoff = delta
+        for primitive in overlay.primitives:
+            primitive.points = [
+                (
+                    a * float(x) + b * float(y) + xoff,
+                    d * float(x) + e * float(y) + yoff,
+                )
+                for x, y in primitive.points
+            ]
+        overlay.base_point_alignment = new_alignment
+        overlay.source_to_scene_matrix = tuple(float(value) for value in new_matrix)
+        overlay.alignment_method = "base_point"
+        overlay.alignment_applied = True
+        self.dxf_export_alignment = self._dxf_export_alignment_from_overlay(overlay)
+        self._preserve_view_on_redraw = True
+        try:
+            self.draw_floor()
+        finally:
+            self._preserve_view_on_redraw = False
+        self.statusBar().showMessage(
+            f"DXF base point ({new_alignment.dxf_base_x:.6f}, {new_alignment.dxf_base_y:.6f}) m "
+            f"moved to IFC base point ({new_alignment.ifc_base_x:.6f}, {new_alignment.ifc_base_y:.6f}) m; "
+            f"rotation {new_alignment.rotation_deg:.6f}°, scale {new_alignment.scale:.9f}. IFC geometry unchanged."
+        )
 
     def start_two_point_alignment(self):
         """Start the corrected two-stage DXF alignment workflow.
@@ -15536,6 +16006,7 @@ class MainWindow(QMainWindow):
             return
         try:
             self.dxf_overlay = load_dxf_overlay_with_similarity_transform(Path(path), transform)
+            self.dxf_export_alignment = self._dxf_export_alignment_from_overlay(self.dxf_overlay)
         except Exception as exc:
             QMessageBox.critical(self, "Corrected DXF insertion failed", str(exc))
             return
@@ -16423,13 +16894,14 @@ class MainWindow(QMainWindow):
             item = IFCElementGraphicsItem(self, element, poly, element_pen, QBrush(element_fill_colour))
             scene.addItem(item)
 
-        for boundary in self.planner_boundaries:
+        for boundary in self._planner_boundaries_for_floor(self.floor):
             item = PlannerBoundaryGraphicsItem(self, boundary)
             scene.addItem(item)
             minx, miny, maxx, maxy = boundary.polygon.bounds
+            floor_label = str(getattr(boundary, "floor", "") or "all floors")
             self._add_upright_text(
                 scene,
-                f"{boundary.name} (all floors)",
+                f"{boundary.name} ({floor_label})",
                 float(minx),
                 float(maxy),
                 QColor("#00A6D6"),
@@ -17290,9 +17762,15 @@ class MainWindow(QMainWindow):
         self.slab_att_24.blockSignals(True)
         self.slab_att_5.blockSignals(True)
         self.slab_att_6.blockSignals(True)
-        self.slab_att_24.setValue(float(self.floor.slab_attenuation_by_band_db.get(2400.0, 12.0)))
-        self.slab_att_5.setValue(float(self.floor.slab_attenuation_by_band_db.get(5000.0, 18.0)))
-        self.slab_att_6.setValue(float(self.floor.slab_attenuation_by_band_db.get(6000.0, 22.0)))
+        self.slab_att_24.setValue(float(self.floor.slab_attenuation_by_band_db.get(
+            2400.0, self.heatmap_settings.default_floor_attenuation_by_frequency_db.get(2400.0, 35.0)
+        )))
+        self.slab_att_5.setValue(float(self.floor.slab_attenuation_by_band_db.get(
+            5000.0, self.heatmap_settings.default_floor_attenuation_by_frequency_db.get(5000.0, 55.1581)
+        )))
+        self.slab_att_6.setValue(float(self.floor.slab_attenuation_by_band_db.get(
+            6000.0, self.heatmap_settings.default_floor_attenuation_by_frequency_db.get(6000.0, 60.0)
+        )))
         self.slab_att_24.blockSignals(False)
         self.slab_att_5.blockSignals(False)
         self.slab_att_6.blockSignals(False)
@@ -17321,10 +17799,13 @@ class MainWindow(QMainWindow):
             "include_inter_floor", self.include_inter_floor.isChecked()
         ))
         settings = context.get("heatmap_settings", self.heatmap_settings)
-        if "calculation_boundary" in context:
+        calculation_boundaries_by_floor = context.get("calculation_boundaries_by_floor")
+        if isinstance(calculation_boundaries_by_floor, dict):
+            calculation_boundary = calculation_boundaries_by_floor.get(str(floor.name))
+        elif "calculation_boundary" in context:
             calculation_boundary = context.get("calculation_boundary")
         else:
-            calculation_boundary = self._rssi_calculation_boundary()
+            calculation_boundary = self._rssi_calculation_boundary(floor)
         return RFEngine.simulate_frequencies(
             floor,
             floors,
@@ -17368,7 +17849,7 @@ class MainWindow(QMainWindow):
         return self._rssi_request_token_for(
             floor, frequencies_mhz, self.aps, float(self.resolution.value()),
             self.antenna_patterns, bool(self.include_inter_floor.isChecked()),
-            self.heatmap_settings, self._rssi_calculation_boundary(),
+            self.heatmap_settings, self._rssi_calculation_boundary(floor),
         )
 
     def _set_rssi_calculation_ui(self, running: bool):
@@ -17473,6 +17954,7 @@ class MainWindow(QMainWindow):
                 "frequency_mhz": round(frequency, 6),
                 "geometry": geometry_revision,
                 "aps": tuple(sorted(relevant_aps)),
+                "boundary": RFEngine._boundary_revision(result.boundary_geometry),
             })
             metadata = {
                 "format": "rf-simulation-result", "version": 1,
@@ -17813,7 +18295,10 @@ class MainWindow(QMainWindow):
         patterns_snapshot = copy.deepcopy(self.antenna_patterns)
         resolution_m = float(self.resolution.value())
         include_inter_floor = bool(self.include_inter_floor.isChecked())
-        calculation_boundary = self._rssi_calculation_boundary()
+        calculation_boundaries_by_floor = {
+            str(floor.name): self._rssi_calculation_boundary(floor)
+            for _, floor in floor_items
+        }
         simulation_context: Dict[str, object] = {
             "floors": self.floors,
             "aps": aps_snapshot,
@@ -17821,7 +18306,7 @@ class MainWindow(QMainWindow):
             "patterns": patterns_snapshot,
             "include_inter_floor": include_inter_floor,
             "heatmap_settings": settings_snapshot,
-            "calculation_boundary": calculation_boundary,
+            "calculation_boundaries_by_floor": calculation_boundaries_by_floor,
             "plan_path": (
                 Path(self.current_rf_plan_path)
                 if self.current_rf_plan_path is not None else None
@@ -17831,7 +18316,7 @@ class MainWindow(QMainWindow):
             str(floor.name): self._rssi_request_token_for(
                 floor, selected_frequencies, aps_snapshot, resolution_m,
                 patterns_snapshot, include_inter_floor, settings_snapshot,
-                calculation_boundary,
+                calculation_boundaries_by_floor.get(str(floor.name)),
             )
             for _, floor in floor_items
         }
@@ -17841,7 +18326,7 @@ class MainWindow(QMainWindow):
             "include_inter_floor": include_inter_floor,
             "settings": RFEngine._settings_revision(settings_snapshot),
             "patterns": RFEngine._pattern_revision(patterns_snapshot),
-            "boundary": RFEngine._boundary_revision(calculation_boundary),
+            "boundary_filter": bool(settings_snapshot.ignore_results_outside_planner_boundaries),
         }
 
         progress = QProgressDialog(
@@ -18648,7 +19133,35 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(self, "Export AP positions CSV", "ap_positions.csv", "CSV files (*.csv)")
         if not path:
             return
+
+        dxf_reference = self._active_dxf_export_alignment()
         insertion_x, insertion_y, insertion_source = self._ifc_insertion_point_for_project()
+        ifc_insertion = (insertion_x, insertion_y, insertion_source)
+        scene_to_dxf = None
+        dxf_base_x = dxf_base_y = 0.0
+        dxf_method = ""
+        dxf_path = ""
+        dxf_offset_x = dxf_offset_y = ""
+        dxf_rotation = dxf_scale = ""
+        if dxf_reference is not None:
+            try:
+                scene_to_dxf = tuple(float(value) for value in dxf_reference["scene_to_source_matrix"])
+                dxf_base_x = float(dxf_reference["source_base_point_x_m"])
+                dxf_base_y = float(dxf_reference["source_base_point_y_m"])
+                insertion_x = dxf_base_x
+                insertion_y = dxf_base_y
+                dxf_method = str(dxf_reference.get("method", "base_point"))
+                dxf_path = str(dxf_reference.get("dxf_path", ""))
+                dxf_offset_x = float(dxf_reference.get("export_offset_x_m", scene_to_dxf[4]))
+                dxf_offset_y = float(dxf_reference.get("export_offset_y_m", scene_to_dxf[5]))
+                dxf_rotation = float(dxf_reference.get("rotation_deg", 0.0))
+                dxf_scale = float(dxf_reference.get("scale", 1.0))
+                source_name = Path(dxf_path).name if dxf_path else "saved DXF"
+                insertion_source = f"Aligned DXF base point ({source_name})"
+            except Exception:
+                scene_to_dxf = None
+                insertion_x, insertion_y, insertion_source = ifc_insertion
+
         with open(path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow([
@@ -18660,19 +19173,63 @@ class MainWindow(QMainWindow):
                 "insertion_point_x_m",
                 "insertion_point_y_m",
                 "insertion_point_source",
+                "x_coordinate_m",
+                "y_coordinate_m",
+                "coordinate_reference",
+                "dxf_alignment_applied",
+                "dxf_alignment_method",
+                "dxf_export_offset_x_m",
+                "dxf_export_offset_y_m",
+                "dxf_alignment_rotation_deg",
+                "dxf_alignment_scale",
+                "dxf_source_path",
             ])
             for ap in sorted(self.aps, key=lambda item: (str(item.floor), str(item.name))):
+                absolute_x = absolute_y = ""
+                coordinate_reference = "IFC insertion point"
+                if scene_to_dxf is not None:
+                    ia, ib, id_, ie, ix, iy = scene_to_dxf
+                    absolute_x = ia * float(ap.x) + ib * float(ap.y) + ix
+                    absolute_y = id_ * float(ap.x) + ie * float(ap.y) + iy
+                    delta_x = float(absolute_x) - dxf_base_x
+                    delta_y = float(absolute_y) - dxf_base_y
+                    coordinate_reference = "aligned DXF coordinates"
+                else:
+                    scene_delta_x = float(ap.x) - insertion_x
+                    scene_delta_y = float(ap.y) - insertion_y
+                    delta_x, delta_y = self.ifc_alignment.unmap_delta(scene_delta_x, scene_delta_y)
+
+                # Avoid insignificant floating-point residue after inverse transforms.
+                delta_x = 0.0 if abs(delta_x) < 1e-12 else float(delta_x)
+                delta_y = 0.0 if abs(delta_y) < 1e-12 else float(delta_y)
+                if absolute_x != "" and abs(float(absolute_x)) < 1e-12:
+                    absolute_x = 0.0
+                if absolute_y != "" and abs(float(absolute_y)) < 1e-12:
+                    absolute_y = 0.0
                 writer.writerow([
                     ap.name,
                     ap.radio_profile,
                     ap.floor,
-                    float(ap.x) - insertion_x,
-                    float(ap.y) - insertion_y,
+                    delta_x,
+                    delta_y,
                     insertion_x,
                     insertion_y,
                     insertion_source,
+                    absolute_x,
+                    absolute_y,
+                    coordinate_reference,
+                    scene_to_dxf is not None,
+                    dxf_method,
+                    dxf_offset_x,
+                    dxf_offset_y,
+                    dxf_rotation,
+                    dxf_scale,
+                    dxf_path,
                 ])
-        self.statusBar().showMessage(f"Exported {len(self.aps)} AP position(s) to {Path(path).name}")
+        reference_note = " using the saved DXF alignment offset" if scene_to_dxf is not None else ""
+        self.statusBar().showMessage(
+            f"Exported {len(self.aps)} AP position(s){reference_note} to {Path(path).name}"
+        )
 
 
 def main():
