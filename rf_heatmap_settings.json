@@ -263,7 +263,7 @@
       "tx_power_dbm": 10,
       "antenna_pattern": "Omni ceiling AP",
       "enabled": false,
-      "cutoff_radius_m": 120,
+      "cutoff_radius_m": 0,
       "antenna_gain_dbi": 0,
       "channel": "",
       "channel_width_mhz": 20,
@@ -275,7 +275,7 @@
       "tx_power_dbm": 14,
       "antenna_pattern": "Omni ceiling AP",
       "enabled": false,
-      "cutoff_radius_m": 90,
+      "cutoff_radius_m": 0,
       "antenna_gain_dbi": 0,
       "channel": "",
       "channel_width_mhz": 20,
@@ -287,7 +287,7 @@
       "tx_power_dbm": 20,
       "antenna_pattern": "Omni ceiling AP",
       "enabled": true,
-      "cutoff_radius_m": 45,
+      "cutoff_radius_m": 0,
       "antenna_gain_dbi": 0,
       "channel": "1",
       "channel_width_mhz": 20,
@@ -299,7 +299,7 @@
       "tx_power_dbm": 20,
       "antenna_pattern": "Omni ceiling AP",
       "enabled": true,
-      "cutoff_radius_m": 35,
+      "cutoff_radius_m": 0,
       "antenna_gain_dbi": 0,
       "channel": "36",
       "channel_width_mhz": 40,
@@ -311,7 +311,7 @@
       "tx_power_dbm": 20,
       "antenna_pattern": "Omni ceiling AP",
       "enabled": false,
-      "cutoff_radius_m": 30,
+      "cutoff_radius_m": 0,
       "antenna_gain_dbi": 0,
       "channel": "5",
       "channel_width_mhz": 80,
@@ -335,13 +335,13 @@
   ],
   "enable_ap_cutoff_zones": true,
   "disconnected_rssi_dbm": -120,
-  "default_ap_cutoff_radius_m": 45,
+  "default_ap_cutoff_radius_m": 0,
   "ap_cutoff_radius_by_frequency_m": {
-    "433": 120,
-    "868": 90,
-    "2400": 45,
-    "5000": 35,
-    "6000": 30
+    "433": 0,
+    "868": 0,
+    "2400": 0,
+    "5000": 0,
+    "6000": 0
   },
   "show_ap_cutoff_zones": true,
   "ap_cutoff_zone_line_width": 0.12,
@@ -483,7 +483,7 @@
         ],
         "spectrum_occupancy_percent": 35,
         "minimum_rssi_dbm": -67,
-        "cutoff_radius_m": 45
+        "cutoff_radius_m": 0
       },
       {
         "name": "5 GHz",
@@ -505,7 +505,7 @@
         ],
         "spectrum_occupancy_percent": 20,
         "minimum_rssi_dbm": -67,
-        "cutoff_radius_m": 35
+        "cutoff_radius_m": 0
       },
       {
         "name": "6 GHz",
@@ -525,7 +525,7 @@
         ],
         "spectrum_occupancy_percent": 10,
         "minimum_rssi_dbm": -67,
-        "cutoff_radius_m": 30
+        "cutoff_radius_m": 0
       }
     ],
     "planning_area_mode": "auto",

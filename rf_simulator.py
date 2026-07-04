@@ -27,6 +27,8 @@ import tempfile
 import threading
 import uuid
 import time
+import urllib.error
+import urllib.request
 from rf_dxf_prealign import DxfPreAlignDialog, SimilarityTransform2D, two_point_transform
 from rf_boundary_tools import (
     estimate_outer_wall_gap_tolerance,
@@ -402,32 +404,32 @@ AP_TYPE_PRESETS: Dict[str, Dict[str, str]] = {
 
 RADIO_PROFILE_PRESETS: Dict[str, List[Dict[str, object]]] = {
     "Wi-Fi 5 dual-band": [
-        {"name": "2.4 GHz", "frequency_mhz": 2400.0, "tx_power_dbm": 20.0, "channel": "1", "channel_width_mhz": 20.0, "cutoff_radius_m": 45.0, "spectrum_occupancy_percent": 35.0},
-        {"name": "5 GHz", "frequency_mhz": 5000.0, "tx_power_dbm": 20.0, "channel": "36", "channel_width_mhz": 40.0, "cutoff_radius_m": 35.0, "spectrum_occupancy_percent": 20.0},
+        {"name": "2.4 GHz", "frequency_mhz": 2400.0, "tx_power_dbm": 20.0, "channel": "1", "channel_width_mhz": 20.0, "cutoff_radius_m": 0.0, "spectrum_occupancy_percent": 35.0},
+        {"name": "5 GHz", "frequency_mhz": 5000.0, "tx_power_dbm": 20.0, "channel": "36", "channel_width_mhz": 40.0, "cutoff_radius_m": 0.0, "spectrum_occupancy_percent": 20.0},
     ],
     "Wi-Fi 6 dual-band": [
-        {"name": "2.4 GHz", "frequency_mhz": 2400.0, "tx_power_dbm": 20.0, "channel": "1", "channel_width_mhz": 20.0, "cutoff_radius_m": 45.0, "spectrum_occupancy_percent": 30.0},
-        {"name": "5 GHz", "frequency_mhz": 5000.0, "tx_power_dbm": 20.0, "channel": "36", "channel_width_mhz": 80.0, "cutoff_radius_m": 35.0, "spectrum_occupancy_percent": 18.0},
+        {"name": "2.4 GHz", "frequency_mhz": 2400.0, "tx_power_dbm": 20.0, "channel": "1", "channel_width_mhz": 20.0, "cutoff_radius_m": 0.0, "spectrum_occupancy_percent": 30.0},
+        {"name": "5 GHz", "frequency_mhz": 5000.0, "tx_power_dbm": 20.0, "channel": "36", "channel_width_mhz": 80.0, "cutoff_radius_m": 0.0, "spectrum_occupancy_percent": 18.0},
     ],
     "Wi-Fi 6E tri-band": [
-        {"name": "2.4 GHz", "frequency_mhz": 2400.0, "tx_power_dbm": 20.0, "channel": "1", "channel_width_mhz": 20.0, "cutoff_radius_m": 45.0, "spectrum_occupancy_percent": 30.0},
-        {"name": "5 GHz", "frequency_mhz": 5000.0, "tx_power_dbm": 20.0, "channel": "36", "channel_width_mhz": 80.0, "cutoff_radius_m": 35.0, "spectrum_occupancy_percent": 18.0},
-        {"name": "6 GHz", "frequency_mhz": 6000.0, "tx_power_dbm": 20.0, "channel": "5", "channel_width_mhz": 80.0, "cutoff_radius_m": 30.0, "spectrum_occupancy_percent": 10.0},
+        {"name": "2.4 GHz", "frequency_mhz": 2400.0, "tx_power_dbm": 20.0, "channel": "1", "channel_width_mhz": 20.0, "cutoff_radius_m": 0.0, "spectrum_occupancy_percent": 30.0},
+        {"name": "5 GHz", "frequency_mhz": 5000.0, "tx_power_dbm": 20.0, "channel": "36", "channel_width_mhz": 80.0, "cutoff_radius_m": 0.0, "spectrum_occupancy_percent": 18.0},
+        {"name": "6 GHz", "frequency_mhz": 6000.0, "tx_power_dbm": 20.0, "channel": "5", "channel_width_mhz": 80.0, "cutoff_radius_m": 0.0, "spectrum_occupancy_percent": 10.0},
     ],
     "Wi-Fi 7 tri-band": [
-        {"name": "2.4 GHz", "frequency_mhz": 2400.0, "tx_power_dbm": 20.0, "channel": "1", "channel_width_mhz": 20.0, "cutoff_radius_m": 45.0, "spectrum_occupancy_percent": 25.0},
-        {"name": "5 GHz", "frequency_mhz": 5000.0, "tx_power_dbm": 20.0, "channel": "36", "channel_width_mhz": 160.0, "cutoff_radius_m": 35.0, "spectrum_occupancy_percent": 15.0},
-        {"name": "6 GHz", "frequency_mhz": 6000.0, "tx_power_dbm": 20.0, "channel": "5", "channel_width_mhz": 320.0, "cutoff_radius_m": 30.0, "spectrum_occupancy_percent": 8.0},
+        {"name": "2.4 GHz", "frequency_mhz": 2400.0, "tx_power_dbm": 20.0, "channel": "1", "channel_width_mhz": 20.0, "cutoff_radius_m": 0.0, "spectrum_occupancy_percent": 25.0},
+        {"name": "5 GHz", "frequency_mhz": 5000.0, "tx_power_dbm": 20.0, "channel": "36", "channel_width_mhz": 160.0, "cutoff_radius_m": 0.0, "spectrum_occupancy_percent": 15.0},
+        {"name": "6 GHz", "frequency_mhz": 6000.0, "tx_power_dbm": 20.0, "channel": "5", "channel_width_mhz": 320.0, "cutoff_radius_m": 0.0, "spectrum_occupancy_percent": 8.0},
     ],
     "2.4 GHz IoT / BLE": [
-        {"name": "2.4 GHz IoT", "frequency_mhz": 2400.0, "tx_power_dbm": 10.0, "channel": "", "channel_width_mhz": 2.0, "cutoff_radius_m": 55.0, "spectrum_occupancy_percent": 10.0},
+        {"name": "2.4 GHz IoT", "frequency_mhz": 2400.0, "tx_power_dbm": 10.0, "channel": "", "channel_width_mhz": 2.0, "cutoff_radius_m": 0.0, "spectrum_occupancy_percent": 10.0},
     ],
     "EU sub-GHz IoT": [
-        {"name": "433 MHz", "frequency_mhz": 433.0, "tx_power_dbm": 10.0, "channel": "", "channel_width_mhz": 0.2, "cutoff_radius_m": 120.0, "spectrum_occupancy_percent": 5.0},
-        {"name": "868 MHz", "frequency_mhz": 868.0, "tx_power_dbm": 14.0, "channel": "", "channel_width_mhz": 0.2, "cutoff_radius_m": 90.0, "spectrum_occupancy_percent": 8.0},
+        {"name": "433 MHz", "frequency_mhz": 433.0, "tx_power_dbm": 10.0, "channel": "", "channel_width_mhz": 0.2, "cutoff_radius_m": 0.0, "spectrum_occupancy_percent": 5.0},
+        {"name": "868 MHz", "frequency_mhz": 868.0, "tx_power_dbm": 14.0, "channel": "", "channel_width_mhz": 0.2, "cutoff_radius_m": 0.0, "spectrum_occupancy_percent": 8.0},
     ],
     "Private 5G indoor": [
-        {"name": "3.5 GHz", "frequency_mhz": 3500.0, "tx_power_dbm": 24.0, "channel": "n78", "channel_width_mhz": 100.0, "cutoff_radius_m": 40.0, "spectrum_occupancy_percent": 20.0},
+        {"name": "3.5 GHz", "frequency_mhz": 3500.0, "tx_power_dbm": 24.0, "channel": "n78", "channel_width_mhz": 100.0, "cutoff_radius_m": 0.0, "spectrum_occupancy_percent": 20.0},
     ],
 }
 
@@ -446,7 +448,7 @@ class APRadio:
     tx_power_dbm: float = 20.0
     antenna_pattern: str = "Omni ceiling AP"
     enabled: bool = True
-    cutoff_radius_m: float = 0.0  # 0 means use settings/default; samples outside this radius are disconnected/skipped
+    cutoff_radius_m: float = 0.0  # Retained for legacy plans/UI; simulation no longer hard-clips by radius.
     antenna_gain_dbi: float = 0.0  # Additional configured gain beyond the selected pattern data.
     channel: str = ""
     channel_width_mhz: float = 20.0
@@ -834,13 +836,13 @@ class HeatmapSettings:
     # zones it remains at the disconnected RSSI value.
     enable_ap_cutoff_zones: bool = True
     disconnected_rssi_dbm: float = -120.0
-    default_ap_cutoff_radius_m: float = 45.0
+    default_ap_cutoff_radius_m: float = 0.0
     ap_cutoff_radius_by_frequency_m: Dict[float, float] = field(default_factory=lambda: {
-        433.0: 120.0,
-        868.0: 90.0,
-        2400.0: 45.0,
-        5000.0: 35.0,
-        6000.0: 30.0,
+        433.0: 0.0,
+        868.0: 0.0,
+        2400.0: 0.0,
+        5000.0: 0.0,
+        6000.0: 0.0,
     })
     show_ap_cutoff_zones: bool = True
     ap_cutoff_zone_line_width: float = 0.12
@@ -928,9 +930,9 @@ class HeatmapSettings:
         "other": {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0},
     })
     default_ap_radios: List[Dict[str, object]] = field(default_factory=lambda: [
-        {"name": "2.4 GHz", "frequency_mhz": 2400.0, "tx_power_dbm": 20.0, "antenna_pattern": "Omni ceiling AP", "enabled": True, "cutoff_radius_m": 45.0, "antenna_gain_dbi": 0.0, "channel": "1", "channel_width_mhz": 20.0, "spectrum_occupancy_percent": 35.0},
-        {"name": "5 GHz", "frequency_mhz": 5000.0, "tx_power_dbm": 20.0, "antenna_pattern": "Omni ceiling AP", "enabled": True, "cutoff_radius_m": 35.0, "antenna_gain_dbi": 0.0, "channel": "36", "channel_width_mhz": 40.0, "spectrum_occupancy_percent": 20.0},
-        {"name": "6 GHz", "frequency_mhz": 6000.0, "tx_power_dbm": 20.0, "antenna_pattern": "Omni ceiling AP", "enabled": False, "cutoff_radius_m": 30.0, "antenna_gain_dbi": 0.0, "channel": "5", "channel_width_mhz": 80.0, "spectrum_occupancy_percent": 10.0}
+        {"name": "2.4 GHz", "frequency_mhz": 2400.0, "tx_power_dbm": 20.0, "antenna_pattern": "Omni ceiling AP", "enabled": True, "cutoff_radius_m": 0.0, "antenna_gain_dbi": 0.0, "channel": "1", "channel_width_mhz": 20.0, "spectrum_occupancy_percent": 35.0},
+        {"name": "5 GHz", "frequency_mhz": 5000.0, "tx_power_dbm": 20.0, "antenna_pattern": "Omni ceiling AP", "enabled": True, "cutoff_radius_m": 0.0, "antenna_gain_dbi": 0.0, "channel": "36", "channel_width_mhz": 40.0, "spectrum_occupancy_percent": 20.0},
+        {"name": "6 GHz", "frequency_mhz": 6000.0, "tx_power_dbm": 20.0, "antenna_pattern": "Omni ceiling AP", "enabled": False, "cutoff_radius_m": 0.0, "antenna_gain_dbi": 0.0, "channel": "5", "channel_width_mhz": 80.0, "spectrum_occupancy_percent": 10.0}
     ])
     custom_radio_profiles: Dict[str, List[Dict[str, object]]] = field(default_factory=dict)
     auto_planner_settings: Dict[str, object] = field(default_factory=lambda: AutoPlannerSettings().to_dict())
@@ -1194,7 +1196,7 @@ class HeatmapSettings:
         settings.common_frequencies_mhz = [float(v) for v in data.get("common_frequencies_mhz", data.get("common_frequencies", settings.common_frequencies_mhz))]
         settings.enable_ap_cutoff_zones = bool(data.get("enable_ap_cutoff_zones", data.get("enable_ap_cutoff_zone", True)))
         settings.disconnected_rssi_dbm = float(data.get("disconnected_rssi_dbm", -120.0))
-        settings.default_ap_cutoff_radius_m = float(data.get("default_ap_cutoff_radius_m", 45.0))
+        settings.default_ap_cutoff_radius_m = float(data.get("default_ap_cutoff_radius_m", 0.0))
         settings.show_ap_cutoff_zones = bool(data.get("show_ap_cutoff_zones", True))
         settings.ap_cutoff_zone_line_width = float(data.get("ap_cutoff_zone_line_width", 0.12))
         settings.ap_cutoff_zone_alpha = int(data.get("ap_cutoff_zone_alpha", 120))
@@ -2535,22 +2537,12 @@ class RFEngine:
     def cutoff_radius_m_for_radio(radio: APRadio, settings: Optional[HeatmapSettings] = None) -> float:
         """Return the effective planning cut-off radius for one AP radio.
 
-        A radio-specific value wins. If omitted/zero, the settings frequency
-        table is used, falling back to default_ap_cutoff_radius_m. Values <= 0
-        disable the cut-off for that radio.
+        Hard RF cut-off radii are disabled for simulation. RSSI now decays from
+        the link budget and model attenuation rather than being clamped at an
+        arbitrary AP/frequency radius. Stored radio/profile values are retained
+        only for compatibility with older RF plans and UI tables.
         """
-        explicit = float(getattr(radio, "cutoff_radius_m", 0.0) or 0.0)
-        if explicit > 0.0:
-            return explicit
-        if settings is None:
-            return 0.0
-        table = getattr(settings, "ap_cutoff_radius_by_frequency_m", {}) or {}
-        if table:
-            bands = sorted(float(k) for k in table.keys())
-            freq = float(radio.frequency_mhz)
-            closest = min(bands, key=lambda b: abs(b - freq))
-            return float(table.get(closest, settings.default_ap_cutoff_radius_m))
-        return float(getattr(settings, "default_ap_cutoff_radius_m", 0.0) or 0.0)
+        return 0.0
 
     @staticmethod
     def ap_cutoff_radius_for_frequency(frequency_mhz: float, settings: Optional[HeatmapSettings] = None) -> float:
@@ -2560,18 +2552,7 @@ class RFEngine:
         mirrors cutoff_radius_m_for_radio() for radios that do not have an
         explicit per-radio cut-off value.
         """
-        if settings is None:
-            return 0.0
-        table = getattr(settings, "ap_cutoff_radius_by_frequency_m", {}) or {}
-        if table:
-            try:
-                freq = float(frequency_mhz)
-                bands = sorted(float(k) for k in table.keys())
-                closest = min(bands, key=lambda b: abs(b - freq))
-                return float(table.get(closest, getattr(settings, "default_ap_cutoff_radius_m", 0.0)))
-            except Exception:
-                pass
-        return float(getattr(settings, "default_ap_cutoff_radius_m", 0.0) or 0.0)
+        return 0.0
 
     @staticmethod
     def point_is_inside_radio_cutoff(x: float, y: float, receiver_floor: FloorModel, ap: AccessPoint, floors: Dict[str, FloorModel], radio: APRadio, settings: Optional[HeatmapSettings]) -> bool:
@@ -3574,8 +3555,19 @@ class RFEngine:
         resolution_m: float,
         calculation_boundary=None,
         floors: Optional[Dict[str, FloorModel]] = None,
+        calculation_extent: Optional[Tuple[float, float, float, float]] = None,
     ) -> Tuple[np.ndarray, np.ndarray, object]:
         minx, miny, maxx, maxy = RFEngine._floor_bounds(floor, aps, floors)
+        if calculation_extent is not None:
+            try:
+                ex_minx, ex_miny, ex_maxx, ex_maxy = [float(value) for value in calculation_extent]
+                if ex_maxx > ex_minx and ex_maxy > ex_miny:
+                    minx = min(minx, ex_minx)
+                    miny = min(miny, ex_miny)
+                    maxx = max(maxx, ex_maxx)
+                    maxy = max(maxy, ex_maxy)
+            except Exception:
+                pass
         boundary = calculation_boundary
         if boundary is not None:
             try:
@@ -3901,9 +3893,7 @@ class RFEngine:
             if ap_floor is None:
                 continue
             frequency = float(radio.frequency_mhz)
-            cutoff = float(getattr(radio, "cutoff_radius_m", 0.0) or 0.0)
-            if cutoff <= 0.0:
-                cutoff = RFEngine.ap_cutoff_radius_for_frequency(frequency, heatmap_settings)
+            cutoff = RFEngine.cutoff_radius_m_for_radio(radio, heatmap_settings)
             cutoff2 = cutoff * cutoff if cutoff > 0.0 else 0.0
             ap_z = float(ap_floor.elevation) + float(ap.mount_height_m)
             rx_z = float(floor.elevation) + float(ap.rx_height_m)
@@ -4023,6 +4013,7 @@ class RFEngine:
         heatmap_settings: Optional[HeatmapSettings] = None,
         progress_callback=None,
         calculation_boundary=None,
+        calculation_extent: Optional[Tuple[float, float, float, float]] = None,
         evaluation_mask: Optional[np.ndarray] = None,
         grid_override: Optional[Tuple[np.ndarray, np.ndarray]] = None,
         progressive_callback=None,
@@ -4060,7 +4051,7 @@ class RFEngine:
         group_order = list(group_aps.keys())
         if grid_override is None:
             xs, ys, calculation_boundary = RFEngine._grid_for_floor(
-                floor, all_aps, resolution_m, calculation_boundary, floors
+                floor, all_aps, resolution_m, calculation_boundary, floors, calculation_extent
             )
         else:
             xs = np.asarray(grid_override[0], dtype=float); ys = np.asarray(grid_override[1], dtype=float)
@@ -4337,6 +4328,7 @@ class RFEngine:
         heatmap_settings: Optional[HeatmapSettings],
         progress_callback,
         calculation_boundary,
+        calculation_extent: Optional[Tuple[float, float, float, float]] = None,
         progressive_callback=None,
     ) -> Dict[object, SimulationResult]:
         settings = heatmap_settings
@@ -4344,7 +4336,8 @@ class RFEngine:
         if not bool(getattr(settings, "enable_adaptive_rf_grid", True)) or coarse_resolution <= float(resolution_m) * 1.15:
             return RFEngine._simulate_groups_uniform(
                 floor, floors, group_aps, resolution_m, patterns, include_inter_floor,
-                settings, progress_callback, calculation_boundary, progressive_callback=progressive_callback,
+                settings, progress_callback, calculation_boundary, calculation_extent,
+                progressive_callback=progressive_callback,
             )
 
         def coarse_progress(done, total):
@@ -4352,13 +4345,13 @@ class RFEngine:
                 progress_callback(int(250 * float(done) / max(1, float(total))), 1000)
         coarse = RFEngine._simulate_groups_uniform(
             floor, floors, group_aps, coarse_resolution, patterns, include_inter_floor,
-            settings, coarse_progress, calculation_boundary,
+            settings, coarse_progress, calculation_boundary, calculation_extent,
         )
         if not coarse:
             return {}
         all_aps = [ap for aps in group_aps.values() for ap in aps]
         fine_xs, fine_ys, calculation_boundary = RFEngine._grid_for_floor(
-            floor, all_aps, resolution_m, calculation_boundary, floors
+            floor, all_aps, resolution_m, calculation_boundary, floors, calculation_extent
         )
         fine_valid = RFEngine._boundary_mask(fine_xs, fine_ys, calculation_boundary)
         def resample_dense(source_result, values):
@@ -4424,7 +4417,7 @@ class RFEngine:
                 progress_callback(250 + int(750 * float(done) / max(1, float(total))), 1000)
         exact = RFEngine._simulate_groups_uniform(
             floor, floors, group_aps, resolution_m, patterns, include_inter_floor,
-            settings, fine_progress, calculation_boundary, refine_mask, (fine_xs, fine_ys),
+            settings, fine_progress, calculation_boundary, calculation_extent, refine_mask, (fine_xs, fine_ys),
             progressive_callback=None,
         )
         final = {}
@@ -4466,6 +4459,7 @@ class RFEngine:
         heatmap_settings: Optional[HeatmapSettings] = None,
         progress_callback=None,
         calculation_boundary=None,
+        calculation_extent: Optional[Tuple[float, float, float, float]] = None,
         progressive_callback=None,
         profile_override: Optional[str] = None,
     ) -> Dict[object, SimulationResult]:
@@ -4479,7 +4473,7 @@ class RFEngine:
         if not use_cache:
             return RFEngine._simulate_groups_adaptive(
                 floor, floors, group_aps, resolution_m, patterns, include_inter_floor,
-                settings, progress_callback, calculation_boundary, progressive_callback,
+                settings, progress_callback, calculation_boundary, calculation_extent, progressive_callback,
             )
         _RF_AP_FIELD_CACHE.configure(
             int(getattr(settings, "per_ap_heatmap_cache_entries", 192)),
@@ -4489,6 +4483,7 @@ class RFEngine:
         settings_revision = RFEngine._settings_revision(settings)
         pattern_revision = RFEngine._pattern_revision(patterns)
         boundary_revision = RFEngine._boundary_revision(calculation_boundary)
+        extent_revision = tuple(round(float(value), 5) for value in calculation_extent) if calculation_extent is not None else None
         cached_by_group: Dict[object, List[SimulationResult]] = {key: [] for key in group_aps}
         missing_groups = {}
         missing_cache_keys = {}
@@ -4497,7 +4492,7 @@ class RFEngine:
             for index, ap in enumerate(aps):
                 cache_key = (
                     floor.name, model_revision, settings_revision, pattern_revision, boundary_revision,
-                    bool(include_inter_floor), round(float(resolution_m), 5), RFEngine._ap_revision(ap),
+                    extent_revision, bool(include_inter_floor), round(float(resolution_m), 5), RFEngine._ap_revision(ap),
                 )
                 cached = _RF_AP_FIELD_CACHE.get(cache_key)
                 if cached is not None:
@@ -4535,7 +4530,7 @@ class RFEngine:
 
             missing_results = RFEngine._simulate_groups_adaptive(
                 floor, floors, missing_groups, resolution_m, patterns, include_inter_floor,
-                settings, progress_callback, calculation_boundary,
+                settings, progress_callback, calculation_boundary, calculation_extent,
                 progressive_callback=missing_progress if progressive_callback is not None else None,
             )
             for field_key, result in missing_results.items():
@@ -4556,6 +4551,21 @@ class RFEngine:
         return combined
 
     @staticmethod
+    def _uses_subghz_iot_floor(frequency_mhz: float) -> bool:
+        try:
+            frequency = float(frequency_mhz)
+        except Exception:
+            return False
+        return 300.0 <= frequency <= 1000.0
+
+    @staticmethod
+    def _iot_rssi_floor_settings(settings: Optional[HeatmapSettings]) -> HeatmapSettings:
+        effective = replace(settings) if settings is not None else HeatmapSettings.default()
+        effective.minimum_client_rssi_dbm = min(float(getattr(effective, "minimum_client_rssi_dbm", -82.0)), -168.0)
+        effective.disconnected_rssi_dbm = min(float(getattr(effective, "disconnected_rssi_dbm", -120.0)), -168.0)
+        return effective
+
+    @staticmethod
     def simulate_frequencies(
         floor: FloorModel,
         floors: Dict[str, FloorModel],
@@ -4567,6 +4577,7 @@ class RFEngine:
         heatmap_settings: Optional[HeatmapSettings] = None,
         progress_callback=None,
         calculation_boundary=None,
+        calculation_extent: Optional[Tuple[float, float, float, float]] = None,
         progressive_callback=None,
         profile_override: Optional[str] = None,
     ) -> Dict[float, SimulationResult]:
@@ -4589,19 +4600,49 @@ class RFEngine:
                     aps_for_frequency.append(replace(ap, radios=radios))
             if aps_for_frequency:
                 groups[float(frequency)] = aps_for_frequency
-        results = RFEngine._simulate_groups(
-            floor,
-            floors,
-            groups,
-            resolution_m,
-            patterns,
-            include_inter_floor,
-            heatmap_settings,
-            progress_callback,
-            calculation_boundary,
-            progressive_callback,
-            profile_override,
-        )
+        if not groups:
+            return {}
+
+        iot_groups = {
+            key: value for key, value in groups.items()
+            if RFEngine._uses_subghz_iot_floor(float(key))
+        }
+        normal_groups = {
+            key: value for key, value in groups.items()
+            if key not in iot_groups
+        }
+        results: Dict[object, SimulationResult] = {}
+        if normal_groups:
+            results.update(RFEngine._simulate_groups(
+                floor,
+                floors,
+                normal_groups,
+                resolution_m,
+                patterns,
+                include_inter_floor,
+                heatmap_settings,
+                progress_callback,
+                calculation_boundary,
+                calculation_extent,
+                progressive_callback,
+                profile_override,
+            ))
+        if iot_groups:
+            iot_settings = RFEngine._iot_rssi_floor_settings(heatmap_settings)
+            results.update(RFEngine._simulate_groups(
+                floor,
+                floors,
+                iot_groups,
+                resolution_m,
+                patterns,
+                include_inter_floor,
+                iot_settings,
+                progress_callback,
+                calculation_boundary,
+                calculation_extent,
+                progressive_callback,
+                profile_override,
+            ))
         effective_settings = RFEngine._profiled_settings(heatmap_settings, profile_override)
         render_override = str(getattr(effective_settings, "heatmap_render_mode", "") or "")
         for value in results.values():
@@ -4619,6 +4660,7 @@ class RFEngine:
         heatmap_settings: Optional[HeatmapSettings] = None,
         progress_callback=None,
         calculation_boundary=None,
+        calculation_extent: Optional[Tuple[float, float, float, float]] = None,
         progressive_callback=None,
         profile_override: Optional[str] = None,
     ) -> Optional[SimulationResult]:
@@ -4633,6 +4675,7 @@ class RFEngine:
             heatmap_settings,
             progress_callback,
             calculation_boundary,
+            calculation_extent,
             progressive_callback,
             profile_override,
         )
@@ -4756,6 +4799,68 @@ class DxfOverlay:
     source_to_scene_matrix: Optional[Tuple[float, float, float, float, float, float]] = None
     alignment_method: str = ""
     alignment_applied: bool = False
+
+
+@dataclass
+class SatelliteOverlay:
+    path: str
+    source_name: str = "OpenStreetMap"
+    tile_url_template: str = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+    attribution: str = "© OpenStreetMap contributors"
+    center_lat: float = 51.0
+    center_lon: float = 0.0
+    zoom: int = 17
+    tile_radius: int = 2
+    center_scene_x: float = 0.0
+    center_scene_y: float = 0.0
+    metres_per_scene_metre: float = 1.0
+    rotation_deg: float = 0.0
+    opacity: float = 0.65
+    visible: bool = True
+    pixmap: object = field(default=None, repr=False, compare=False)
+    extent_m: Tuple[float, float] = field(default=(0.0, 0.0), repr=False, compare=False)
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "path": str(self.path),
+            "source_name": str(self.source_name),
+            "tile_url_template": str(self.tile_url_template),
+            "attribution": str(self.attribution),
+            "center_lat": float(self.center_lat),
+            "center_lon": float(self.center_lon),
+            "zoom": int(self.zoom),
+            "tile_radius": int(self.tile_radius),
+            "center_scene_x": float(self.center_scene_x),
+            "center_scene_y": float(self.center_scene_y),
+            "metres_per_scene_metre": float(self.metres_per_scene_metre),
+            "rotation_deg": float(self.rotation_deg),
+            "opacity": float(self.opacity),
+            "visible": bool(self.visible),
+        }
+
+    @classmethod
+    def from_dict(cls, data: object) -> Optional["SatelliteOverlay"]:
+        if not isinstance(data, dict):
+            return None
+        try:
+            return cls(
+                path=str(data.get("path", "")).strip(),
+                source_name=str(data.get("source_name", "OpenStreetMap")),
+                tile_url_template=str(data.get("tile_url_template", "https://tile.openstreetmap.org/{z}/{x}/{y}.png")),
+                attribution=str(data.get("attribution", "© OpenStreetMap contributors")),
+                center_lat=max(-85.05112878, min(85.05112878, float(data.get("center_lat", 51.0)))),
+                center_lon=max(-180.0, min(180.0, float(data.get("center_lon", 0.0)))),
+                zoom=max(0, min(22, int(data.get("zoom", 17)))),
+                tile_radius=max(0, min(6, int(data.get("tile_radius", 2)))),
+                center_scene_x=float(data.get("center_scene_x", data.get("origin_x", 0.0))),
+                center_scene_y=float(data.get("center_scene_y", data.get("origin_y", 0.0))),
+                metres_per_scene_metre=max(0.000001, float(data.get("metres_per_scene_metre", 1.0))),
+                rotation_deg=float(data.get("rotation_deg", 0.0)),
+                opacity=max(0.0, min(1.0, float(data.get("opacity", 0.65)))),
+                visible=bool(data.get("visible", True)),
+            )
+        except Exception:
+            return None
 
 
 DXF_INSUNITS_TO_METRES: Dict[int, Tuple[str, float]] = {
@@ -5536,12 +5641,13 @@ def _rf_write_worker_context_file(
     heatmap_settings: Optional[HeatmapSettings],
 ) -> str:
     """Serialise static model geometry once; AP/radio groups travel separately."""
+    worker_settings = replace(heatmap_settings) if heatmap_settings is not None else None
     handle = tempfile.NamedTemporaryFile(prefix="rf_sim_context_", suffix=".pickle", delete=False)
     path = handle.name
     try:
         with handle:
             pickle.dump(
-                (floor, floors, patterns, include_inter_floor, heatmap_settings),
+                (floor, floors, patterns, include_inter_floor, worker_settings),
                 handle,
                 protocol=pickle.HIGHEST_PROTOCOL,
             )
@@ -5824,6 +5930,7 @@ def _rf_grid_multi_tile_worker(args):
 # ----------------------------- Drawing layers -----------------------------
 # Higher z-values are drawn above lower z-values. Keep heatmap colour below IFC
 # geometry, but keep contour boundaries, sample markers and text readable above it.
+Z_SATELLITE_OVERLAY = -40
 Z_HEATMAP_FILL = -30
 Z_IFC_SPACE_FILL = -20
 Z_IFC_SPACE_OUTLINE = -10
@@ -7916,8 +8023,8 @@ class RadioProfileManagerDialog(QDialog):
 
     def _default_radios(self) -> List[Dict[str, object]]:
         return [
-            {"name": "2.4 GHz", "frequency_mhz": 2400.0, "tx_power_dbm": 20.0, "antenna_pattern": "Omni ceiling AP", "enabled": True, "channel": "1", "channel_width_mhz": 20.0, "spectrum_occupancy_percent": 35.0, "cutoff_radius_m": 45.0},
-            {"name": "5 GHz", "frequency_mhz": 5000.0, "tx_power_dbm": 20.0, "antenna_pattern": "Omni ceiling AP", "enabled": True, "channel": "36", "channel_width_mhz": 40.0, "spectrum_occupancy_percent": 20.0, "cutoff_radius_m": 35.0},
+            {"name": "2.4 GHz", "frequency_mhz": 2400.0, "tx_power_dbm": 20.0, "antenna_pattern": "Omni ceiling AP", "enabled": True, "channel": "1", "channel_width_mhz": 20.0, "spectrum_occupancy_percent": 35.0, "cutoff_radius_m": 0.0},
+            {"name": "5 GHz", "frequency_mhz": 5000.0, "tx_power_dbm": 20.0, "antenna_pattern": "Omni ceiling AP", "enabled": True, "channel": "36", "channel_width_mhz": 40.0, "spectrum_occupancy_percent": 20.0, "cutoff_radius_m": 0.0},
         ]
 
     def _add_profile_item(self, name: str, radios: List[Dict[str, object]]):
@@ -8847,6 +8954,198 @@ class APArrayPlacementDialog(QDialog):
         }
 
 
+class SatelliteOverlayDialog(QDialog):
+    """Configure an online XYZ map layer used as estate context."""
+
+    def __init__(self, parent=None, overlay: Optional[SatelliteOverlay] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Estate map imagery")
+        self.setModal(True)
+        overlay = overlay or SatelliteOverlay(path="")
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.source = QComboBox()
+        self.source.addItem("OpenStreetMap Standard", (
+            "OpenStreetMap",
+            "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+            "© OpenStreetMap contributors",
+        ))
+        self.source.addItem("Custom XYZ / satellite", (
+            str(overlay.source_name or "Custom imagery"),
+            str(overlay.tile_url_template or ""),
+            str(overlay.attribution or ""),
+        ))
+        self.source.currentIndexChanged.connect(self._source_changed)
+        form.addRow("Source", self.source)
+
+        self.name_edit = QLineEdit(str(overlay.source_name or "OpenStreetMap"))
+        form.addRow("Source name", self.name_edit)
+        self.url_edit = QLineEdit(str(overlay.tile_url_template or "https://tile.openstreetmap.org/{z}/{x}/{y}.png"))
+        form.addRow("Tile URL", self.url_edit)
+        self.attribution_edit = QLineEdit(str(overlay.attribution or "© OpenStreetMap contributors"))
+        form.addRow("Attribution", self.attribution_edit)
+
+        self.center_lat = QDoubleSpinBox()
+        self.center_lat.setRange(-85.05112878, 85.05112878)
+        self.center_lat.setDecimals(8)
+        self.center_lat.setValue(float(overlay.center_lat))
+        form.addRow("Centre latitude", self.center_lat)
+
+        self.center_lon = QDoubleSpinBox()
+        self.center_lon.setRange(-180.0, 180.0)
+        self.center_lon.setDecimals(8)
+        self.center_lon.setValue(float(overlay.center_lon))
+        form.addRow("Centre longitude", self.center_lon)
+
+        self.zoom = QSpinBox()
+        self.zoom.setRange(0, 22)
+        self.zoom.setValue(int(overlay.zoom))
+        form.addRow("Zoom", self.zoom)
+
+        self.tile_radius = QSpinBox()
+        self.tile_radius.setRange(0, 6)
+        self.tile_radius.setValue(int(overlay.tile_radius))
+        self.tile_radius.setToolTip("0 loads one tile; 2 loads a 5 x 5 tile block. Keep this modest for public tile services.")
+        form.addRow("Tile radius", self.tile_radius)
+
+        self.center_scene_x = QDoubleSpinBox()
+        self.center_scene_x.setRange(-1_000_000_000.0, 1_000_000_000.0)
+        self.center_scene_x.setDecimals(3)
+        self.center_scene_x.setSuffix(" m")
+        self.center_scene_x.setValue(float(overlay.center_scene_x))
+        form.addRow("Scene centre X", self.center_scene_x)
+
+        self.center_scene_y = QDoubleSpinBox()
+        self.center_scene_y.setRange(-1_000_000_000.0, 1_000_000_000.0)
+        self.center_scene_y.setDecimals(3)
+        self.center_scene_y.setSuffix(" m")
+        self.center_scene_y.setValue(float(overlay.center_scene_y))
+        form.addRow("Scene centre Y", self.center_scene_y)
+
+        self.metres_per_scene_metre = QDoubleSpinBox()
+        self.metres_per_scene_metre.setRange(0.000001, 1_000_000.0)
+        self.metres_per_scene_metre.setDecimals(6)
+        self.metres_per_scene_metre.setValue(float(overlay.metres_per_scene_metre))
+        form.addRow("Map metres per scene metre", self.metres_per_scene_metre)
+
+        self.rotation_deg = QDoubleSpinBox()
+        self.rotation_deg.setRange(-360.0, 360.0)
+        self.rotation_deg.setDecimals(4)
+        self.rotation_deg.setSuffix(" deg")
+        self.rotation_deg.setValue(float(overlay.rotation_deg))
+        form.addRow("Rotation", self.rotation_deg)
+
+        self.opacity = QDoubleSpinBox()
+        self.opacity.setRange(0.05, 1.0)
+        self.opacity.setDecimals(2)
+        self.opacity.setSingleStep(0.05)
+        self.opacity.setValue(max(0.05, min(1.0, float(overlay.opacity))))
+        form.addRow("Opacity", self.opacity)
+
+        self.visible = QCheckBox("Show estate map imagery")
+        self.visible.setChecked(bool(overlay.visible))
+        form.addRow(self.visible)
+
+        layout.addLayout(form)
+        note = QLabel(
+            "OpenStreetMap is useful as a basemap, but not satellite imagery. For aerial photography, choose Custom XYZ / satellite and use a tile service URL that you are licensed to use."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        if "tile.openstreetmap.org" not in str(overlay.tile_url_template):
+            self.source.setCurrentIndex(1)
+        self._source_changed(self.source.currentIndex())
+
+    def _source_changed(self, index: int):
+        data = self.source.itemData(index)
+        if not data:
+            return
+        name, url, attribution = data
+        if index == 0:
+            self.name_edit.setText(name)
+            self.url_edit.setText(url)
+            self.attribution_edit.setText(attribution)
+
+    def overlay(self) -> SatelliteOverlay:
+        return SatelliteOverlay(
+            path="",
+            source_name=self.name_edit.text().strip() or "Map imagery",
+            tile_url_template=self.url_edit.text().strip(),
+            attribution=self.attribution_edit.text().strip(),
+            center_lat=float(self.center_lat.value()),
+            center_lon=float(self.center_lon.value()),
+            zoom=int(self.zoom.value()),
+            tile_radius=int(self.tile_radius.value()),
+            center_scene_x=float(self.center_scene_x.value()),
+            center_scene_y=float(self.center_scene_y.value()),
+            metres_per_scene_metre=float(self.metres_per_scene_metre.value()),
+            rotation_deg=float(self.rotation_deg.value()),
+            opacity=float(self.opacity.value()),
+            visible=bool(self.visible.isChecked()),
+        )
+
+
+class MapPointRotationAlignmentDialog(QDialog):
+    """Choose a real-world map point and rotation before clicking its IFC match."""
+
+    def __init__(self, parent=None, overlay: Optional[SatelliteOverlay] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Align map to IFC point")
+        self.setModal(True)
+        overlay = overlay or SatelliteOverlay(path="")
+        form = QFormLayout(self)
+
+        self.anchor_lat = QDoubleSpinBox()
+        self.anchor_lat.setRange(-85.05112878, 85.05112878)
+        self.anchor_lat.setDecimals(8)
+        self.anchor_lat.setValue(float(overlay.center_lat))
+        form.addRow("Map point latitude", self.anchor_lat)
+
+        self.anchor_lon = QDoubleSpinBox()
+        self.anchor_lon.setRange(-180.0, 180.0)
+        self.anchor_lon.setDecimals(8)
+        self.anchor_lon.setValue(float(overlay.center_lon))
+        form.addRow("Map point longitude", self.anchor_lon)
+
+        self.rotation_deg = QDoubleSpinBox()
+        self.rotation_deg.setRange(-360.0, 360.0)
+        self.rotation_deg.setDecimals(4)
+        self.rotation_deg.setSuffix(" deg")
+        self.rotation_deg.setValue(float(overlay.rotation_deg))
+        form.addRow("Map rotation", self.rotation_deg)
+
+        self.metres_per_scene_metre = QDoubleSpinBox()
+        self.metres_per_scene_metre.setRange(0.000001, 1_000_000.0)
+        self.metres_per_scene_metre.setDecimals(6)
+        self.metres_per_scene_metre.setValue(float(overlay.metres_per_scene_metre))
+        form.addRow("Map metres per scene metre", self.metres_per_scene_metre)
+
+        hint = QLabel("After pressing OK, click the matching point on the IFC plan. The selected map latitude/longitude will be pinned to that scene point.")
+        hint.setWordWrap(True)
+        form.addRow(hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def values(self) -> Dict[str, float]:
+        return {
+            "anchor_lat": float(self.anchor_lat.value()),
+            "anchor_lon": float(self.anchor_lon.value()),
+            "rotation_deg": float(self.rotation_deg.value()),
+            "metres_per_scene_metre": float(self.metres_per_scene_metre.value()),
+        }
+
+
 class APSpacePlacementDialog(QDialog):
     """Configure automatic AP placement inside IFC, inferred or user spaces."""
 
@@ -9737,7 +10036,7 @@ class PlanView(QGraphicsView):
             event.accept()
             return
 
-        if getattr(self.main, "alignment_pick_mode", None) in {"ifc_1", "ifc_2"}:
+        if getattr(self.main, "alignment_pick_mode", None) in {"ifc_1", "ifc_2", "map_ifc_anchor"}:
             pos = self.mapToScene(event.position().toPoint())
             snap = self.main.nearest_ifc_snap_point(pos)
             self.main.show_ifc_snap_marker(snap)
@@ -9798,7 +10097,11 @@ class PlanView(QGraphicsView):
             event.accept()
             return
 
-        if getattr(self.main, "alignment_pick_mode", None) in {"ifc_1", "ifc_2"}:
+        if getattr(self.main, "alignment_pick_mode", None) in {"ifc_1", "ifc_2", "map_ifc_anchor"}:
+            if event.button() == Qt.RightButton:
+                self.main.cancel_alignment_pick()
+                event.accept()
+                return
             if event.button() == Qt.LeftButton:
                 pos = self.mapToScene(event.position().toPoint())
                 snap = self.main.nearest_ifc_snap_point(pos)
@@ -9849,6 +10152,10 @@ class PlanView(QGraphicsView):
                 return
         if event.key() == Qt.Key_Escape and getattr(self.main, "ap_placement_mode", ""):
             self.main.cancel_ap_placement()
+            event.accept()
+            return
+        if event.key() == Qt.Key_Escape and getattr(self.main, "alignment_pick_mode", None):
+            self.main.cancel_alignment_pick()
             event.accept()
             return
         if event.key() == Qt.Key_Escape and getattr(self.main, "inferred_space_interaction_mode", False):
@@ -9981,10 +10288,13 @@ class MainWindow(QMainWindow):
         self._saved_simulation_root: Optional[Path] = None
         self.dxf_overlay: Optional[DxfOverlay] = None
         self.dxf_export_alignment: Optional[Dict[str, object]] = None
+        self.satellite_overlay: Optional[SatelliteOverlay] = None
+        self.rssi_calculation_extents: Dict[str, Tuple[float, float, float, float]] = {}
         self.ifc_alignment = AlignmentTransform()
         self.alignment_pick_mode: Optional[str] = None
         self.alignment_pick_points: Dict[str, Tuple[float, float]] = {}
         self._alignment_pick_sequence: List[str] = []
+        self._pending_satellite_alignment: Optional[Dict[str, float]] = None
         self._pending_dxf_alignment_path: Optional[Path] = None
         self._ifc_snap_marker_items: List[QGraphicsItem] = []
         self._ifc_pick_marker_items: List[QGraphicsItem] = []
@@ -10095,7 +10405,7 @@ class MainWindow(QMainWindow):
         self.ple.setRange(1.6, 5.0)
         self.ple.setValue(2.2)
         self.min_client_rssi = QDoubleSpinBox()
-        self.min_client_rssi.setRange(-100.0, -40.0)
+        self.min_client_rssi.setRange(-168.0, -40.0)
         self.min_client_rssi.setValue(self.heatmap_settings.minimum_client_rssi_dbm)
         self.min_client_rssi.setSuffix(" dBm")
         self.min_client_rssi.valueChanged.connect(self._minimum_rssi_changed)
@@ -10222,6 +10532,18 @@ class MainWindow(QMainWindow):
         self.add_action.triggered.connect(self.add_ifc)
         self.open_dxf_action = QAction("Open DXF overlay", self)
         self.open_dxf_action.triggered.connect(self.open_dxf_overlay)
+        self.open_satellite_action = QAction("Open estate map imagery", self)
+        self.open_satellite_action.triggered.connect(self.show_satellite_overlay_dialog)
+        self.edit_satellite_action = QAction("Edit estate map imagery", self)
+        self.edit_satellite_action.triggered.connect(self.show_satellite_overlay_dialog)
+        self.align_satellite_action = QAction("Align estate map to IFC point", self)
+        self.align_satellite_action.triggered.connect(self.start_satellite_point_rotation_alignment)
+        self.use_satellite_extent_action = QAction("Use map as RF area", self)
+        self.use_satellite_extent_action.triggered.connect(self.use_satellite_overlay_as_rssi_extent)
+        self.clear_rssi_extent_action = QAction("Clear RF area", self)
+        self.clear_rssi_extent_action.triggered.connect(self.clear_current_floor_rssi_extent)
+        self.clear_satellite_action = QAction("Clear estate map imagery", self)
+        self.clear_satellite_action.triggered.connect(self.clear_satellite_overlay)
         self.align_ifc_action = QAction("Align DXF base point to IFC", self)
         self.align_ifc_action.triggered.connect(self.show_dxf_alignment_dialog)
         self.two_point_align_action = QAction("2-point align IFC/DXF", self)
@@ -10348,6 +10670,156 @@ class MainWindow(QMainWindow):
         self.slab_att_24.valueChanged.connect(lambda *_: self._slab_attenuation_ui_changed())
         self.slab_att_5.valueChanged.connect(lambda *_: self._slab_attenuation_ui_changed())
         self.slab_att_6.valueChanged.connect(lambda *_: self._slab_attenuation_ui_changed())
+
+    def show_satellite_overlay_dialog(self):
+        initial = self.satellite_overlay
+        if initial is None and self.floor is not None:
+            try:
+                bounds = self._floor_geometry_bounds(self.floor)
+                if bounds:
+                    minx = min(item[0] for item in bounds)
+                    miny = min(item[1] for item in bounds)
+                    maxx = max(item[2] for item in bounds)
+                    maxy = max(item[3] for item in bounds)
+                    initial = SatelliteOverlay(
+                        path="",
+                        center_scene_x=(float(minx) + float(maxx)) * 0.5,
+                        center_scene_y=(float(miny) + float(maxy)) * 0.5,
+                    )
+            except Exception:
+                initial = None
+        dialog = SatelliteOverlayDialog(self, initial or SatelliteOverlay(path=""))
+        if dialog.exec() != QDialog.Accepted:
+            return
+        overlay = dialog.overlay()
+        if not str(overlay.tile_url_template or "").strip():
+            QMessageBox.warning(self, "Estate map imagery", "Enter an XYZ tile URL before loading estate map imagery.")
+            return
+        if "tile.openstreetmap.org" in overlay.tile_url_template and overlay.tile_radius > 2:
+            QMessageBox.warning(
+                self,
+                "OpenStreetMap tile use",
+                "OpenStreetMap public tiles are for modest interactive use. The tile radius has been reduced to 2 to avoid bulk fetching.",
+            )
+            overlay.tile_radius = 2
+        self.satellite_overlay = overlay
+        self.draw_floor()
+        self.statusBar().showMessage(f"Loaded estate map imagery from {overlay.source_name}")
+
+    def start_satellite_point_rotation_alignment(self):
+        if self.satellite_overlay is None:
+            self.show_satellite_overlay_dialog()
+            if self.satellite_overlay is None:
+                return
+        dialog = MapPointRotationAlignmentDialog(self, self.satellite_overlay)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        self._pending_satellite_alignment = dialog.values()
+        self.alignment_pick_mode = "map_ifc_anchor"
+        self.statusBar().showMessage("Click the matching IFC/model point for the selected map latitude/longitude. Right-click or Esc to cancel.")
+        self.view.setCursor(Qt.CrossCursor)
+
+    def clear_satellite_overlay(self):
+        self.satellite_overlay = None
+        self.draw_floor()
+        self.statusBar().showMessage("Cleared estate map imagery")
+
+    def _satellite_overlay_scene_bounds(self, overlay: Optional[SatelliteOverlay] = None) -> Optional[Tuple[float, float, float, float]]:
+        overlay = overlay or getattr(self, "satellite_overlay", None)
+        if overlay is None:
+            return None
+        z = max(0, min(22, int(overlay.zoom)))
+        radius = max(0, min(6, int(overlay.tile_radius)))
+        tile_count = radius * 2 + 1
+        tile_px = 256
+        centre_x, centre_y = self._lonlat_to_xyz_tile(float(overlay.center_lon), float(overlay.center_lat), z)
+        base_x = int(math.floor(centre_x)) - radius
+        base_y = int(math.floor(centre_y)) - radius
+        centre_px_x = (centre_x - float(base_x)) * tile_px
+        centre_px_y = (centre_y - float(base_y)) * tile_px
+        earth_circumference_m = 40075016.68557849
+        ground_m_per_px = (
+            math.cos(math.radians(float(overlay.center_lat)))
+            * earth_circumference_m
+            / (float(tile_px) * float(2 ** z))
+        )
+        scene_m_per_px = ground_m_per_px / max(0.000001, float(overlay.metres_per_scene_metre))
+        angle = math.radians(float(overlay.rotation_deg))
+        cos_a = math.cos(angle)
+        sin_a = math.sin(angle)
+        corners = []
+        width_px = float(tile_count * tile_px)
+        height_px = float(tile_count * tile_px)
+        for px, py in (
+            (-centre_px_x, -centre_px_y),
+            (width_px - centre_px_x, -centre_px_y),
+            (width_px - centre_px_x, height_px - centre_px_y),
+            (-centre_px_x, height_px - centre_px_y),
+        ):
+            x = px * scene_m_per_px
+            y = -py * scene_m_per_px
+            rx = float(overlay.center_scene_x) + x * cos_a - y * sin_a
+            ry = float(overlay.center_scene_y) + x * sin_a + y * cos_a
+            corners.append((rx, ry))
+        return (
+            min(point[0] for point in corners),
+            min(point[1] for point in corners),
+            max(point[0] for point in corners),
+            max(point[1] for point in corners),
+        )
+
+    def _rssi_extent_for_floor(self, floor: Optional[FloorModel] = None) -> Optional[Tuple[float, float, float, float]]:
+        target = str((floor or self.floor).name) if (floor or self.floor) is not None else ""
+        extent = self.rssi_calculation_extents.get(target)
+        if extent is None:
+            return None
+        try:
+            minx, miny, maxx, maxy = [float(value) for value in extent]
+        except Exception:
+            return None
+        if maxx <= minx or maxy <= miny:
+            return None
+        return minx, miny, maxx, maxy
+
+    def use_satellite_overlay_as_rssi_extent(self):
+        if self.floor is None:
+            QMessageBox.information(self, "No floor selected", "Select a floor before setting its RF simulation area.")
+            return
+        if self.satellite_overlay is None:
+            QMessageBox.information(self, "No estate map", "Load estate map imagery before using it as the RF simulation area.")
+            return
+        extent = self._satellite_overlay_scene_bounds(self.satellite_overlay)
+        if extent is None:
+            QMessageBox.warning(self, "Estate map extent", "The estate map extent could not be calculated.")
+            return
+        self.rssi_calculation_extents[str(self.floor.name)] = tuple(float(value) for value in extent)
+        self._clear_rssi_results()
+        self.draw_floor()
+        width = max(0.0, extent[2] - extent[0])
+        height = max(0.0, extent[3] - extent[1])
+        self.statusBar().showMessage(
+            f"RF simulation area for '{self.floor.name}' expanded to estate map extent ({width:.1f} m x {height:.1f} m)."
+        )
+
+    def clear_current_floor_rssi_extent(self):
+        if self.floor is None:
+            return
+        removed = self.rssi_calculation_extents.pop(str(self.floor.name), None)
+        self._clear_rssi_results()
+        self.draw_floor()
+        if removed is None:
+            self.statusBar().showMessage(f"'{self.floor.name}' is already using the IFC/AP-derived RF simulation area.")
+        else:
+            self.statusBar().showMessage(f"Cleared custom RF simulation area for '{self.floor.name}'.")
+
+    def cancel_alignment_pick(self):
+        self.alignment_pick_mode = None
+        self.alignment_pick_points = {}
+        self._pending_satellite_alignment = None
+        self._ifc_snap_marker_items = []
+        self.view.setCursor(Qt.ArrowCursor)
+        self.draw_floor()
+        self.statusBar().showMessage("Alignment pick cancelled")
 
     def selectable_scene_items_at_view_pos(self, view: QGraphicsView, view_pos) -> List[QGraphicsItem]:
         selectable_types = (
@@ -10574,6 +11046,30 @@ class MainWindow(QMainWindow):
             "open_dxf_action": (
                 "Open DXF overlay", "Load a DXF drawing as a visual alignment reference.",
                 "SP_DirOpenIcon", ""
+            ),
+            "open_satellite_action": (
+                "Open estate map", "Load online XYZ map or imagery tiles as an estate-wide survey background. OpenStreetMap is available as a basemap; use Custom XYZ for licensed satellite imagery.",
+                "SP_DriveNetIcon", ""
+            ),
+            "edit_satellite_action": (
+                "Edit estate map", "Adjust estate map centre, zoom, source URL, scene alignment, rotation, scale and opacity.",
+                "SP_FileDialogDetailedView", ""
+            ),
+            "align_satellite_action": (
+                "Align map to IFC", "Pin a chosen map latitude/longitude to a clicked IFC point and apply a manual map rotation.",
+                "SP_DialogApplyButton", ""
+            ),
+            "use_satellite_extent_action": (
+                "Use map as RF area", "Expand the current floor's RSSI simulation grid to the visible estate map tile area.",
+                "SP_TitleBarMaxButton", ""
+            ),
+            "clear_rssi_extent_action": (
+                "Clear RF area", "Return the current floor's RSSI simulation grid to the IFC/AP-derived area.",
+                "SP_DialogResetButton", ""
+            ),
+            "clear_satellite_action": (
+                "Clear estate map", "Remove the estate map imagery layer from the current project.",
+                "SP_DialogDiscardButton", ""
             ),
             "align_ifc_action": (
                 "Align DXF base point", "Move the DXF base point onto the IFC insertion/base point without modifying IFC geometry.",
@@ -10843,6 +11339,7 @@ class MainWindow(QMainWindow):
         ribbon.addTab(self._make_ribbon_page([
             ("IFC information", ["ifc_origin_action", "building_3d_view_action"]),
             ("DXF and alignment", ["open_dxf_action", "align_ifc_action", "two_point_align_action", "clear_dxf_action"]),
+            ("Estate map", ["open_satellite_action", "edit_satellite_action", "align_satellite_action", "use_satellite_extent_action", "clear_rssi_extent_action", "clear_satellite_action"]),
             ("View orientation", ["rotate_left_action", "rotate_right_action", "reset_rotation_action"]),
         ]), "Model and view")
         ribbon.addTab(self._make_ribbon_page([
@@ -11744,6 +12241,7 @@ class MainWindow(QMainWindow):
         future: concurrent.futures.Future = concurrent.futures.Future()
         self._interactive_preview_future = future
         calculation_boundary = self._rssi_calculation_boundary()
+        calculation_extent = self._rssi_extent_for_floor(floor)
         include_inter_floor = self.include_inter_floor.isChecked()
 
         def calculate_preview():
@@ -11751,18 +12249,17 @@ class MainWindow(QMainWindow):
                 return
             try:
                 result = RFEngine.simulate_frequencies(
-                    floor,
-                    self.floors,
-                    aps_snapshot,
-                    active_freqs,
-                    resolution,
-                    patterns_snapshot,
-                    include_inter_floor,
-                    settings_snapshot,
-                    None,
-                    calculation_boundary,
-                    None,
-                    profile_override,
+                    floor=floor,
+                    floors=self.floors,
+                    aps=aps_snapshot,
+                    frequencies_mhz=active_freqs,
+                    resolution_m=resolution,
+                    patterns=patterns_snapshot,
+                    include_inter_floor=include_inter_floor,
+                    heatmap_settings=settings_snapshot,
+                    calculation_boundary=calculation_boundary,
+                    calculation_extent=calculation_extent,
+                    profile_override=profile_override,
                 )
             except BaseException as exc:
                 future.set_exception(exc)
@@ -14663,7 +15160,7 @@ class MainWindow(QMainWindow):
                 best_channel = channels[0]
                 best_cost = float("inf")
                 radius = req.cutoff_radius_m or float(
-                    self.heatmap_settings.ap_cutoff_radius_by_frequency_m.get(req.frequency_mhz, 35.0)
+                    self.heatmap_settings.ap_cutoff_radius_by_frequency_m.get(req.frequency_mhz, 0.0)
                 )
                 candidate_mask = overlap_mask(ap, req_index)
                 for channel in channels:
@@ -15752,6 +16249,11 @@ class MainWindow(QMainWindow):
             "selected_floor": self.floor.name if self.floor else "", "view_rotation_deg": self.view_rotation_deg,
             "ifc_alignment": {"dx": self.ifc_alignment.dx, "dy": self.ifc_alignment.dy, "rotation_deg": self.ifc_alignment.rotation_deg, "scale": self.ifc_alignment.scale},
             "dxf_alignment": dxf_export_alignment,
+            "satellite_overlay": self.satellite_overlay.to_dict() if self.satellite_overlay is not None else None,
+            "rssi_calculation_extents": {
+                str(floor): [float(value) for value in extent]
+                for floor, extent in sorted(getattr(self, "rssi_calculation_extents", {}).items())
+            },
             "auto_planner_settings": self.auto_planner_settings.to_dict(),
             "custom_radio_profiles": copy.deepcopy(getattr(self.heatmap_settings, "custom_radio_profiles", {})),
             "propagation_model": self.heatmap_settings.propagation_model_dict(),
@@ -15799,6 +16301,10 @@ class MainWindow(QMainWindow):
             "settings": RFEngine._settings_revision(self.heatmap_settings),
             "patterns": RFEngine._pattern_revision(self.antenna_patterns),
             "boundary_filter": bool(self.heatmap_settings.ignore_results_outside_planner_boundaries),
+            "calculation_extents": {
+                str(floor): tuple(round(float(value), 5) for value in extent)
+                for floor, extent in sorted(getattr(self, "rssi_calculation_extents", {}).items())
+            },
         }
 
     def _simulation_signature(
@@ -15828,6 +16334,11 @@ class MainWindow(QMainWindow):
             "geometry": RFEngine._geometry_revision(geometry_models),
             "aps": tuple(sorted(relevant_aps)),
             "boundary": RFEngine._boundary_revision(self._rssi_calculation_boundary(floor)),
+            "extent": (
+                None
+                if self._rssi_extent_for_floor(floor) is None
+                else tuple(round(float(value), 5) for value in self._rssi_extent_for_floor(floor))
+            ),
         })
 
     def _simulation_result_filename(self, floor_name: str, frequency_mhz: float) -> str:
@@ -16076,6 +16587,19 @@ class MainWindow(QMainWindow):
         # the original DXF file is unavailable.
         self.dxf_overlay = None
         self.dxf_export_alignment = self._validated_dxf_export_alignment(data.get("dxf_alignment"))
+        self.satellite_overlay = SatelliteOverlay.from_dict(data.get("satellite_overlay"))
+        self.rssi_calculation_extents = {}
+        raw_extents = data.get("rssi_calculation_extents", {})
+        if isinstance(raw_extents, dict):
+            for floor_name, values in raw_extents.items():
+                if not isinstance(values, (list, tuple)) or len(values) != 4:
+                    continue
+                try:
+                    minx, miny, maxx, maxy = [float(value) for value in values]
+                except Exception:
+                    continue
+                if maxx > minx and maxy > miny:
+                    self.rssi_calculation_extents[str(floor_name)] = (minx, miny, maxx, maxy)
         alignment_data = data.get("ifc_alignment", {}) or {}
         try:
             target_alignment = AlignmentTransform(
@@ -16383,6 +16907,18 @@ class MainWindow(QMainWindow):
         except Exception:
             return None
 
+    def _effective_minimum_rssi_for_frequency(self, frequency_mhz: Optional[float]) -> float:
+        base = float(getattr(self.heatmap_settings, "minimum_client_rssi_dbm", -82.0))
+        if frequency_mhz is not None and RFEngine._uses_subghz_iot_floor(float(frequency_mhz)):
+            return min(base, -168.0)
+        return base
+
+    def _effective_disconnected_rssi_for_frequency(self, frequency_mhz: Optional[float]) -> float:
+        base = float(getattr(self.heatmap_settings, "disconnected_rssi_dbm", -120.0))
+        if frequency_mhz is not None and RFEngine._uses_subghz_iot_floor(float(frequency_mhz)):
+            return min(base, -168.0)
+        return base
+
     def _rssi_view_frequency_changed(self, *_):
         freq = self._selected_rssi_view_frequency()
         if freq is not None and freq in getattr(self, "rssi_results_by_frequency", {}):
@@ -16519,7 +17055,7 @@ class MainWindow(QMainWindow):
             self.view.hide_rssi_hover()
             return
         frequency_text = f"{frequency / 1000.0:g} GHz" if frequency >= 1000.0 else f"{frequency:g} MHz"
-        disconnect = float(getattr(self.heatmap_settings, "disconnected_rssi_dbm", -120.0))
+        disconnect = self._effective_disconnected_rssi_for_frequency(frequency)
         rssi_text = f"≤ {disconnect:.0f} dBm" if value <= disconnect + 0.05 else f"{value:.1f} dBm"
         details = [f"{frequency_text}: {rssi_text}"]
         delay_grid = getattr(result, "delay_spread_ns", None)
@@ -16969,6 +17505,9 @@ class MainWindow(QMainWindow):
 
     def capture_alignment_point(self, x: float, y: float):
         key = getattr(self, "alignment_pick_mode", None)
+        if key == "map_ifc_anchor":
+            self.apply_satellite_point_rotation_alignment(float(x), float(y))
+            return
         if key not in {"ifc_1", "ifc_2"}:
             return
         self.alignment_pick_points[key] = (float(x), float(y))
@@ -16982,6 +17521,31 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Captured IFC point 2. Choose DXF file for separate pre-alignment window.")
         self._draw_alignment_pick_marks()
         self._open_dxf_prealign_dialog()
+
+    def apply_satellite_point_rotation_alignment(self, scene_x: float, scene_y: float):
+        overlay = getattr(self, "satellite_overlay", None)
+        values = getattr(self, "_pending_satellite_alignment", None)
+        if overlay is None or not isinstance(values, dict):
+            self.cancel_alignment_pick()
+            return
+        overlay.center_lat = max(-85.05112878, min(85.05112878, float(values.get("anchor_lat", overlay.center_lat))))
+        overlay.center_lon = max(-180.0, min(180.0, float(values.get("anchor_lon", overlay.center_lon))))
+        overlay.rotation_deg = float(values.get("rotation_deg", overlay.rotation_deg))
+        overlay.metres_per_scene_metre = max(
+            0.000001,
+            float(values.get("metres_per_scene_metre", overlay.metres_per_scene_metre)),
+        )
+        overlay.center_scene_x = float(scene_x)
+        overlay.center_scene_y = float(scene_y)
+        self.alignment_pick_mode = None
+        self._pending_satellite_alignment = None
+        self._ifc_snap_marker_items = []
+        self.view.setCursor(Qt.ArrowCursor)
+        self.draw_floor()
+        self.statusBar().showMessage(
+            f"Aligned estate map point {overlay.center_lat:.8f}, {overlay.center_lon:.8f} "
+            f"to IFC X {scene_x:.3f}, Y {scene_y:.3f}; rotation {overlay.rotation_deg:.4f} deg."
+        )
 
     def _open_dxf_prealign_dialog(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open DXF for pre-alignment", "", "DXF files (*.dxf);;All files (*.*)")
@@ -17129,6 +17693,158 @@ class MainWindow(QMainWindow):
                 path.lineTo(QPointF(x, y))
             item = scene.addPath(path, pen)
             item.setZValue(Z_DXF_OVERLAY)
+
+    @staticmethod
+    def _lonlat_to_xyz_tile(lon: float, lat: float, zoom: int) -> Tuple[float, float]:
+        lat = max(-85.05112878, min(85.05112878, float(lat)))
+        lon = max(-180.0, min(180.0, float(lon)))
+        n = float(2 ** int(zoom))
+        lat_rad = math.radians(lat)
+        x = (lon + 180.0) / 360.0 * n
+        y = (1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n
+        return x, y
+
+    def _tile_cache_file(self, overlay: SatelliteOverlay, z: int, x: int, y: int) -> Path:
+        source = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(overlay.source_name or "tiles")).strip("._") or "tiles"
+        return Path(__file__).with_name(".rf_tile_cache") / source / str(int(z)) / str(int(x)) / f"{int(y)}.png"
+
+    def _load_xyz_tile_pixmap(self, overlay: SatelliteOverlay, z: int, x: int, y: int) -> Optional[QPixmap]:
+        max_tile = (2 ** int(z)) - 1
+        if y < 0 or y > max_tile:
+            return None
+        x = int(x) % (max_tile + 1)
+        cache_file = self._tile_cache_file(overlay, z, x, y)
+        if cache_file.exists():
+            pixmap = QPixmap(str(cache_file))
+            if not pixmap.isNull():
+                return pixmap
+        template = str(overlay.tile_url_template or "").strip()
+        if not template:
+            return None
+        url = template.replace("{z}", str(int(z))).replace("{x}", str(int(x))).replace("{y}", str(int(y)))
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "RF-Attenuation-Simulator/1.0 estate-map-overlay",
+                "Accept": "image/png,image/jpeg,image/*;q=0.8,*/*;q=0.5",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=12) as response:
+                payload = response.read()
+            pixmap = QPixmap()
+            if not pixmap.loadFromData(payload) or pixmap.isNull():
+                return None
+            try:
+                cache_file.parent.mkdir(parents=True, exist_ok=True)
+                temporary = cache_file.with_name(f".{cache_file.name}.{uuid.uuid4().hex}.tmp")
+                temporary.write_bytes(payload)
+                os.replace(temporary, cache_file)
+            except Exception:
+                pass
+            return pixmap
+        except (urllib.error.URLError, TimeoutError, OSError):
+            return None
+
+    def _build_satellite_pixmap(self, overlay: SatelliteOverlay) -> Optional[Tuple[QPixmap, float, float, float]]:
+        z = max(0, min(22, int(overlay.zoom)))
+        radius = max(0, min(6, int(overlay.tile_radius)))
+        centre_x, centre_y = self._lonlat_to_xyz_tile(float(overlay.center_lon), float(overlay.center_lat), z)
+        base_x = int(math.floor(centre_x)) - radius
+        base_y = int(math.floor(centre_y)) - radius
+        tile_count = radius * 2 + 1
+        tile_px = 256
+        mosaic = QPixmap(tile_count * tile_px, tile_count * tile_px)
+        mosaic.fill(Qt.transparent)
+        painter = QPainter(mosaic)
+        loaded = 0
+        try:
+            for row in range(tile_count):
+                for col in range(tile_count):
+                    tile = self._load_xyz_tile_pixmap(overlay, z, base_x + col, base_y + row)
+                    if tile is None or tile.isNull():
+                        continue
+                    painter.drawPixmap(col * tile_px, row * tile_px, tile_px, tile_px, tile)
+                    loaded += 1
+        finally:
+            painter.end()
+        if loaded == 0:
+            return None
+        centre_px_x = (centre_x - float(base_x)) * tile_px
+        centre_px_y = (centre_y - float(base_y)) * tile_px
+        earth_circumference_m = 40075016.68557849
+        ground_m_per_px = (
+            math.cos(math.radians(float(overlay.center_lat)))
+            * earth_circumference_m
+            / (float(tile_px) * float(2 ** z))
+        )
+        scene_m_per_px = ground_m_per_px / max(0.000001, float(overlay.metres_per_scene_metre))
+        overlay.pixmap = mosaic
+        overlay.extent_m = (float(mosaic.width()) * scene_m_per_px, float(mosaic.height()) * scene_m_per_px)
+        return mosaic, centre_px_x, centre_px_y, scene_m_per_px
+
+    def _draw_satellite_overlay(self, scene: QGraphicsScene):
+        overlay = getattr(self, "satellite_overlay", None)
+        if overlay is None or not bool(getattr(overlay, "visible", True)):
+            return
+        built = self._build_satellite_pixmap(overlay)
+        if built is None:
+            self.statusBar().showMessage("Estate map imagery could not be loaded; check the network connection, tile URL or source policy.")
+            return
+        pixmap, centre_px_x, centre_px_y, scene_m_per_px = built
+        item = QGraphicsPixmapItem(pixmap)
+        item.setOffset(-centre_px_x, -centre_px_y)
+        transform = QTransform()
+        transform.rotate(float(overlay.rotation_deg))
+        transform.scale(scene_m_per_px, -scene_m_per_px)
+        item.setTransform(transform)
+        item.setPos(float(overlay.center_scene_x), float(overlay.center_scene_y))
+        item.setOpacity(max(0.0, min(1.0, float(overlay.opacity))))
+        item.setZValue(Z_SATELLITE_OVERLAY)
+        item.setAcceptedMouseButtons(Qt.NoButton)
+        try:
+            item.setTransformationMode(Qt.SmoothTransformation)
+        except Exception:
+            pass
+        scene.addItem(item)
+        attribution = str(overlay.attribution or "").strip()
+        if attribution:
+            width_m, height_m = overlay.extent_m
+            label = self._add_upright_text(
+                scene,
+                attribution,
+                float(overlay.center_scene_x) + width_m * 0.5,
+                float(overlay.center_scene_y) - height_m * 0.5,
+                QColor("#202020"),
+                max(7, int(getattr(self.heatmap_settings, "space_label_font_size", 9))),
+                Z_SATELLITE_OVERLAY + 1,
+                bold=False,
+            )
+            label.setAcceptedMouseButtons(Qt.NoButton)
+
+    def _draw_rssi_extent_overlay(self, scene: QGraphicsScene):
+        extent = self._rssi_extent_for_floor(self.floor)
+        if extent is None:
+            return
+        minx, miny, maxx, maxy = extent
+        rect = QRectF(float(minx), float(miny), float(maxx - minx), float(maxy - miny))
+        colour = QColor("#D946EF")
+        pen = QPen(colour, 0.0)
+        pen.setCosmetic(True)
+        pen.setStyle(Qt.DashLine)
+        item = scene.addRect(rect, pen, QBrush(Qt.NoBrush))
+        item.setAcceptedMouseButtons(Qt.NoButton)
+        item.setZValue(Z_TEXT + 1)
+        self._add_upright_text(
+            scene,
+            "RF simulation area",
+            float(minx),
+            float(maxy),
+            colour,
+            max(4, int(getattr(self.heatmap_settings, "space_label_font_size", 9))),
+            Z_TEXT + 2,
+            bold=True,
+        )
 
     def _ifc_path_key(self, path_obj) -> str:
         path = Path(path_obj)
@@ -17634,6 +18350,8 @@ class MainWindow(QMainWindow):
             "planner_settings_action", "propagation_settings_action", "predict_aps_action", "bulk_ap_action", "draw_wall_action", "bulk_attenuation_action", "attenuation_review_action", "draw_space_action", "select_ap_spaces_action", "inferred_space_interaction_action",
             "draw_boundary_action", "draw_polygon_boundary_action", "suggest_external_boundary_action",
             "create_spaces_action", "clear_inferred_spaces_action", "clear_boundaries_action", "ifc_origin_action", "building_3d_view_action",
+            "open_satellite_action", "edit_satellite_action", "align_satellite_action",
+            "use_satellite_extent_action", "clear_rssi_extent_action", "clear_satellite_action",
             "rotate_left_action", "rotate_right_action", "reset_rotation_action", "save_plan_action", "load_plan_action",
         ):
             action = getattr(self, action_name, None)
@@ -17800,6 +18518,8 @@ class MainWindow(QMainWindow):
         if not self.floor:
             self._drawing_floor = False
             return
+        self._draw_satellite_overlay(scene)
+        self._draw_rssi_extent_overlay(scene)
         # Draw heatmap first so the building geometry remains visible above it.
         if self.last_result:
             self._draw_heatmap(self.last_result)
@@ -18396,10 +19116,17 @@ class MainWindow(QMainWindow):
             if self.heatmap_settings.ignore_results_outside_planner_boundaries
             else "boundary filter off"
         )
+        selected_frequency = self._selected_rssi_view_frequency()
+        disconnect_threshold = self._effective_minimum_rssi_for_frequency(selected_frequency)
+        threshold_note = (
+            f"Clients disconnect below {disconnect_threshold:.0f} dBm"
+            if selected_frequency is not None
+            else f"Clients disconnect below {self.heatmap_settings.minimum_client_rssi_dbm:.0f} dBm"
+        )
         pieces = [
             f"<b>RSSI isolines</b> &nbsp; "
             f"<span style='color:{legend_text};'>Bands: {band_text} dBm. "
-            f"Clients disconnect below {self.heatmap_settings.minimum_client_rssi_dbm:.0f} dBm. <br/> "
+            f"{threshold_note}. <br/> "
             f"Propagation: {reflection_text}, {diffraction_text}, {fading_text}, {combination_text}, {boundary_text}; "
             f"pattern files: {pattern_count}</span>"
         ]
@@ -18845,6 +19572,13 @@ class MainWindow(QMainWindow):
             calculation_boundary = context.get("calculation_boundary")
         else:
             calculation_boundary = self._rssi_calculation_boundary(floor)
+        calculation_extents_by_floor = context.get("calculation_extents_by_floor")
+        if isinstance(calculation_extents_by_floor, dict):
+            calculation_extent = calculation_extents_by_floor.get(str(floor.name))
+        elif "calculation_extent" in context:
+            calculation_extent = context.get("calculation_extent")
+        else:
+            calculation_extent = self._rssi_extent_for_floor(floor)
         return RFEngine.simulate_frequencies(
             floor,
             floors,
@@ -18856,6 +19590,7 @@ class MainWindow(QMainWindow):
             heatmap_settings=settings,
             progress_callback=progress_callback,
             calculation_boundary=calculation_boundary,
+            calculation_extent=calculation_extent,
             progressive_callback=progressive_callback,
         )
 
@@ -18869,6 +19604,7 @@ class MainWindow(QMainWindow):
         include_inter_floor: bool,
         settings: HeatmapSettings,
         calculation_boundary,
+        calculation_extent: Optional[Tuple[float, float, float, float]] = None,
     ) -> str:
         """Return a compact identity used to reject stale background output."""
         return stable_digest({
@@ -18880,6 +19616,7 @@ class MainWindow(QMainWindow):
             "include_inter_floor": bool(include_inter_floor),
             "settings": RFEngine._settings_revision(settings),
             "boundary": RFEngine._boundary_revision(calculation_boundary),
+            "extent": None if calculation_extent is None else tuple(round(float(value), 5) for value in calculation_extent),
         })
 
     def _current_rssi_request_token(
@@ -18889,6 +19626,7 @@ class MainWindow(QMainWindow):
             floor, frequencies_mhz, self.aps, float(self.resolution.value()),
             self.antenna_patterns, bool(self.include_inter_floor.isChecked()),
             self.heatmap_settings, self._rssi_calculation_boundary(floor),
+            self._rssi_extent_for_floor(floor),
         )
 
     def _set_rssi_calculation_ui(self, running: bool):
@@ -18906,6 +19644,8 @@ class MainWindow(QMainWindow):
                 "draw_boundary_action", "draw_polygon_boundary_action",
                 "suggest_external_boundary_action", "create_spaces_action",
                 "clear_inferred_spaces_action", "clear_boundaries_action", "building_3d_view_action",
+                "open_satellite_action", "edit_satellite_action", "align_satellite_action",
+                "use_satellite_extent_action", "clear_rssi_extent_action", "clear_satellite_action",
                 "rotate_left_action", "rotate_right_action", "reset_rotation_action",
                 "load_plan_action",
             )
@@ -19338,6 +20078,10 @@ class MainWindow(QMainWindow):
             str(floor.name): self._rssi_calculation_boundary(floor)
             for _, floor in floor_items
         }
+        calculation_extents_by_floor = {
+            str(floor.name): self._rssi_extent_for_floor(floor)
+            for _, floor in floor_items
+        }
         simulation_context: Dict[str, object] = {
             "floors": self.floors,
             "aps": aps_snapshot,
@@ -19346,6 +20090,7 @@ class MainWindow(QMainWindow):
             "include_inter_floor": include_inter_floor,
             "heatmap_settings": settings_snapshot,
             "calculation_boundaries_by_floor": calculation_boundaries_by_floor,
+            "calculation_extents_by_floor": calculation_extents_by_floor,
             "plan_path": (
                 Path(self.current_rf_plan_path)
                 if self.current_rf_plan_path is not None else None
@@ -19356,6 +20101,7 @@ class MainWindow(QMainWindow):
                 floor, selected_frequencies, aps_snapshot, resolution_m,
                 patterns_snapshot, include_inter_floor, settings_snapshot,
                 calculation_boundaries_by_floor.get(str(floor.name)),
+                calculation_extents_by_floor.get(str(floor.name)),
             )
             for _, floor in floor_items
         }
@@ -19366,6 +20112,11 @@ class MainWindow(QMainWindow):
             "settings": RFEngine._settings_revision(settings_snapshot),
             "patterns": RFEngine._pattern_revision(patterns_snapshot),
             "boundary_filter": bool(settings_snapshot.ignore_results_outside_planner_boundaries),
+            "calculation_extents": {
+                str(name): tuple(round(float(value), 5) for value in extent)
+                for name, extent in calculation_extents_by_floor.items()
+                if extent is not None
+            },
         }
 
         progress = QProgressDialog(
@@ -19767,7 +20518,7 @@ class MainWindow(QMainWindow):
             values = np.asarray(result.rssi, dtype=float)
             finite = values[np.isfinite(values)]
             if finite.size:
-                threshold = float(self.heatmap_settings.minimum_client_rssi_dbm)
+                threshold = self._effective_minimum_rssi_for_frequency(frequency_mhz)
                 covered = float(np.count_nonzero(finite >= threshold)) * 100.0 / float(finite.size)
                 propagation_lines.extend([
                     f"RSSI min / mean / max: {float(np.min(finite)):.1f} / {float(np.mean(finite)):.1f} / {float(np.max(finite)):.1f} dBm",
@@ -20154,6 +20905,8 @@ class MainWindow(QMainWindow):
         with open(path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["floor", "x", "y", "simulation_mode", "active_radio_frequencies_mhz", "rssi_dbm", "rms_delay_spread_ns", "contributing_path_count", "rssi_zone", "client_connected", "disconnect_threshold_dbm", "ap_count", "include_inter_floor", "slab_loss_24_db", "slab_loss_5_db", "slab_loss_6_db", "patterns_used"])
+            export_frequency = self._selected_rssi_view_frequency()
+            disconnect_threshold = self._effective_minimum_rssi_for_frequency(export_frequency)
             for iy, y in enumerate(self.last_result.ys):
                 for ix, x in enumerate(self.last_result.xs):
                     rssi = float(self.last_result.rssi[iy, ix])
@@ -20163,7 +20916,7 @@ class MainWindow(QMainWindow):
                     active_radios = [r for a in self.aps for r in a.active_radios()]
                     delay = float(self.last_result.delay_spread_ns[iy, ix]) if self.last_result.delay_spread_ns is not None else 0.0
                     path_count = int(self.last_result.path_count[iy, ix]) if self.last_result.path_count is not None else 1
-                    writer.writerow([self.floor.name if self.floor else "", x, y, self.heatmap_settings.combined_ap_mode, ";".join(str(int(r.frequency_mhz)) for r in active_radios), rssi, delay, path_count, zone.name, rssi >= self.heatmap_settings.minimum_client_rssi_dbm, self.heatmap_settings.minimum_client_rssi_dbm, len(self.aps), self.include_inter_floor.isChecked(), float(self.slab_att_24.value()), float(self.slab_att_5.value()), float(self.slab_att_6.value()), ";".join(sorted({r.antenna_pattern for r in active_radios}))])
+                    writer.writerow([self.floor.name if self.floor else "", x, y, self.heatmap_settings.combined_ap_mode, ";".join(str(int(r.frequency_mhz)) for r in active_radios), rssi, delay, path_count, zone.name, rssi >= disconnect_threshold, disconnect_threshold, len(self.aps), self.include_inter_floor.isChecked(), float(self.slab_att_24.value()), float(self.slab_att_5.value()), float(self.slab_att_6.value()), ";".join(sorted({r.antenna_pattern for r in active_radios}))])
 
     def export_ap_positions_csv(self):
         if not self.aps:
