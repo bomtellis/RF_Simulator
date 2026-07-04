@@ -88,7 +88,7 @@ try:
 except Exception:
     contourpy = None
 
-from PySide6.QtCore import QPointF, Qt, Slot, QTimer, QSize, QRectF, QMarginsF
+from PySide6.QtCore import QPointF, Qt, Slot, QTimer, QSize, QRectF, QMarginsF, QUrl
 from PySide6.QtGui import (
     QAction, QColor, QBrush, QFont, QPen, QPolygonF, QPainterPath, QPalette,
     QTransform, QIcon, QKeySequence, QPainter, QPdfWriter, QPageSize, QPageLayout,
@@ -137,9 +137,15 @@ from PySide6.QtWidgets import (
     QToolButton,
     QTextEdit,
     QVBoxLayout,
+    QWizard,
+    QWizardPage,
     QWidget,
     QProgressDialog,
 )
+try:
+    from PySide6.QtQuickWidgets import QQuickWidget
+except Exception:  # pragma: no cover
+    QQuickWidget = None
 
 try:
     import ifcopenshell
@@ -564,6 +570,7 @@ class AutoPlannerSettings:
     clients_per_ap: int = 50
     keep_existing_aps: bool = True
     remove_previous_planned_aps: bool = True
+    include_inter_floor_rf: bool = False
     ap_radio_profile: str = "Predictive planner"
     radio_requirements: List[PlannerRadioRequirement] = field(default_factory=lambda: [
         PlannerRadioRequirement(
@@ -602,6 +609,7 @@ class AutoPlannerSettings:
             "clients_per_ap": self.clients_per_ap,
             "keep_existing_aps": self.keep_existing_aps,
             "remove_previous_planned_aps": self.remove_previous_planned_aps,
+            "include_inter_floor_rf": self.include_inter_floor_rf,
             "ap_radio_profile": self.ap_radio_profile,
             "radio_requirements": [r.to_dict() for r in self.radio_requirements],
         }
@@ -646,6 +654,10 @@ class AutoPlannerSettings:
         base.clients_per_ap = max(1, int(data.get("clients_per_ap", base.clients_per_ap)))
         base.keep_existing_aps = bool(data.get("keep_existing_aps", base.keep_existing_aps))
         base.remove_previous_planned_aps = bool(data.get("remove_previous_planned_aps", base.remove_previous_planned_aps))
+        base.include_inter_floor_rf = bool(data.get(
+            "include_inter_floor_rf",
+            data.get("include_inter_floor", base.include_inter_floor_rf),
+        ))
         base.ap_radio_profile = str(data.get("ap_radio_profile", base.ap_radio_profile) or base.ap_radio_profile)
         return base
 
@@ -840,6 +852,8 @@ class HeatmapSettings:
         5000.0: 55.1581,
         6000.0: 60.0,
     })
+    enable_synthetic_floor_entities: bool = True
+    synthetic_floor_entity_thickness_m: float = 0.30
     default_wall_attenuation_by_material_db: Dict[str, Dict[float, float]] = field(default_factory=lambda: {
         "default": {433.0: 2.0, 868.0: 3.0, 2400.0: 5.0, 5000.0: 7.0, 6000.0: 8.0},
         "concrete": {433.0: 5.0, 868.0: 7.0, 2400.0: 12.0, 5000.0: 55.1581, 6000.0: 60.0},
@@ -1196,6 +1210,17 @@ class HeatmapSettings:
             data.get("default_floor_attenuation_by_frequency_db", data.get("floor_attenuation_by_frequency_db", {})),
             settings.default_floor_attenuation_by_frequency_db,
         )
+        settings.enable_synthetic_floor_entities = bool(data.get(
+            "enable_synthetic_floor_entities",
+            data.get("synthetic_floor_entities_enabled", settings.enable_synthetic_floor_entities),
+        ))
+        settings.synthetic_floor_entity_thickness_m = max(
+            0.01,
+            min(10.0, float(data.get(
+                "synthetic_floor_entity_thickness_m",
+                data.get("floor_entity_thickness_m", settings.synthetic_floor_entity_thickness_m),
+            ))),
+        )
         raw_materials = data.get("default_wall_attenuation_by_material_db", data.get("wall_attenuation_by_material_db", {}))
         if isinstance(raw_materials, dict):
             parsed = {}
@@ -1488,6 +1513,8 @@ class HeatmapSettings:
             "fading_seed": int(self.fading_seed),
             "calculate_delay_spread": bool(self.calculate_delay_spread),
             "combined_ap_mode": str(self.combined_ap_mode),
+            "enable_synthetic_floor_entities": bool(self.enable_synthetic_floor_entities),
+            "synthetic_floor_entity_thickness_m": float(self.synthetic_floor_entity_thickness_m),
             "reflection_material_properties": {
                 str(material): {
                     str(key): float(value) for key, value in dict(profile).items()
@@ -1580,6 +1607,17 @@ class HeatmapSettings:
         self.calculate_delay_spread = bool(data.get("calculate_delay_spread", self.calculate_delay_spread))
         combination = str(data.get("combined_ap_mode", self.combined_ap_mode)).strip().lower()
         self.combined_ap_mode = "power_sum" if combination in {"power_sum", "sum", "incoherent_power", "total_power"} else "strongest"
+        self.enable_synthetic_floor_entities = bool(data.get(
+            "enable_synthetic_floor_entities",
+            data.get("synthetic_floor_entities_enabled", self.enable_synthetic_floor_entities),
+        ))
+        self.synthetic_floor_entity_thickness_m = max(
+            0.01,
+            min(10.0, float(data.get(
+                "synthetic_floor_entity_thickness_m",
+                data.get("floor_entity_thickness_m", self.synthetic_floor_entity_thickness_m),
+            ))),
+        )
         raw_profiles = data.get("reflection_material_properties", {})
         if isinstance(raw_profiles, dict):
             for material, profile in raw_profiles.items():
@@ -2667,7 +2705,8 @@ class RFEngine:
         wall_loss = sum(wall.attenuation_db_for_frequency(radio.frequency_mhz) for wall in geometry["walls"])
         element_loss = sum(element.attenuation_db_for_frequency(radio.frequency_mhz) for element in geometry["elements"])
         floor_loss = RFEngine.floor_penetration_loss_db(
-            receiver_floor, geometry["ap_floor"], floors, radio.frequency_mhz, list(geometry["slabs"])
+            receiver_floor, geometry["ap_floor"], floors, radio.frequency_mhz,
+            list(geometry["slabs"]), heatmap_settings,
         )
         return (
             radio.tx_power_dbm + pattern_gain + float(getattr(radio, "antenna_gain_dbi", 0.0) or 0.0)
@@ -3211,15 +3250,26 @@ class RFEngine:
         floors: Dict[str, FloorModel],
         frequency_mhz: float,
         slab_elements: Optional[List[IFCElement2D]] = None,
+        heatmap_settings: Optional[HeatmapSettings] = None,
     ) -> float:
         if receiver_floor.name == ap_floor.name:
             return 0.0
+        synthetic_enabled = bool(
+            getattr(heatmap_settings, "enable_synthetic_floor_entities", True)
+            if heatmap_settings is not None else True
+        )
+        synthetic_thickness = max(
+            0.01,
+            float(getattr(heatmap_settings, "synthetic_floor_entity_thickness_m", 0.30) if heatmap_settings is not None else 0.30),
+        )
         ordered = sorted(floors.values(), key=lambda f: (f.elevation, f.name))
         try:
             rx_i = next(i for i, f in enumerate(ordered) if f.name == receiver_floor.name)
             ap_i = next(i for i, f in enumerate(ordered) if f.name == ap_floor.name)
         except StopIteration:
             crossed = max(1, int(round(abs(receiver_floor.elevation - ap_floor.elevation) / 3.5)))
+            if not synthetic_enabled:
+                return 0.0
             return crossed * receiver_floor.slab_attenuation_db_for_frequency(frequency_mhz)
         lo, hi = sorted((rx_i, ap_i))
         crossed_boundaries = ordered[lo + 1:hi + 1] or [receiver_floor]
@@ -3236,14 +3286,15 @@ class RFEngine:
                 z_min = min(float(element.z_min), float(element.z_max))
                 z_max = max(float(element.z_min), float(element.z_max))
                 centre = (z_min + z_max) / 2.0
-                distance = 0.0 if z_min - 0.35 <= boundary_z <= z_max + 0.35 else abs(centre - boundary_z)
-                if distance <= 1.25:
+                tolerance = max(0.35, synthetic_thickness * 0.5)
+                distance = 0.0 if z_min - tolerance <= boundary_z <= z_max + tolerance else abs(centre - boundary_z)
+                if distance <= max(1.25, synthetic_thickness):
                     matches.append((distance, -element.attenuation_db_for_frequency(frequency_mhz), identity, element))
             if matches:
                 _, _, identity, element = min(matches)
                 used.add(identity)
                 total += element.attenuation_db_for_frequency(frequency_mhz)
-            else:
+            elif synthetic_enabled:
                 total += boundary.slab_attenuation_db_for_frequency(frequency_mhz)
         return total
 
@@ -3522,8 +3573,9 @@ class RFEngine:
         aps: List[AccessPoint],
         resolution_m: float,
         calculation_boundary=None,
+        floors: Optional[Dict[str, FloorModel]] = None,
     ) -> Tuple[np.ndarray, np.ndarray, object]:
-        minx, miny, maxx, maxy = RFEngine._floor_bounds(floor, aps)
+        minx, miny, maxx, maxy = RFEngine._floor_bounds(floor, aps, floors)
         boundary = calculation_boundary
         if boundary is not None:
             try:
@@ -3614,6 +3666,10 @@ class RFEngine:
                 getattr(settings, "default_window_attenuation_by_material_db", {}),
                 getattr(settings, "default_ifc_element_attenuation_by_type_db", {}),
                 getattr(settings, "default_floor_attenuation_by_frequency_db", {}),
+            ],
+            "synthetic_floor_entities": [
+                getattr(settings, "enable_synthetic_floor_entities", True),
+                getattr(settings, "synthetic_floor_entity_thickness_m", 0.30),
             ],
         })
 
@@ -3853,7 +3909,7 @@ class RFEngine:
             rx_z = float(floor.elevation) + float(ap.rx_height_m)
             floor_loss = 0.0
             if ap_floor.name != floor.name:
-                floor_loss = RFEngine.floor_penetration_loss_db(floor, ap_floor, floors, frequency, [])
+                floor_loss = RFEngine.floor_penetration_loss_db(floor, ap_floor, floors, frequency, [], heatmap_settings)
             rows.append((
                 float(ap.x), float(ap.y), ap_z, rx_z,
                 float(radio.tx_power_dbm), float(getattr(radio, "antenna_gain_dbi", 0.0) or 0.0),
@@ -3973,7 +4029,13 @@ class RFEngine:
     ) -> Dict[object, SimulationResult]:
         """Uniform-grid exact evaluator with resident model and shared-memory workers."""
         started = time.perf_counter()
-        if not floor.walls and not floor.spaces and not getattr(floor, "elements", []):
+        synthetic_floor_enabled = bool(getattr(heatmap_settings, "enable_synthetic_floor_entities", True))
+        if (
+            not synthetic_floor_enabled
+            and not floor.walls
+            and not floor.spaces
+            and not getattr(floor, "elements", [])
+        ):
             return {}
         group_aps = {key: list(value) for key, value in group_aps.items() if value}
         if not group_aps:
@@ -3987,8 +4049,19 @@ class RFEngine:
                     seen.add(identity); all_aps.append(ap)
         if not all_aps:
             return {}
+        radio_links_by_group = {
+            key: RFEngine._active_radio_links(floor, aps, include_inter_floor)
+            for key, aps in group_aps.items()
+        }
+        radio_links_by_group = {key: links for key, links in radio_links_by_group.items() if links}
+        if not radio_links_by_group:
+            return {}
+        group_aps = {key: group_aps[key] for key in radio_links_by_group}
+        group_order = list(group_aps.keys())
         if grid_override is None:
-            xs, ys, calculation_boundary = RFEngine._grid_for_floor(floor, all_aps, resolution_m, calculation_boundary)
+            xs, ys, calculation_boundary = RFEngine._grid_for_floor(
+                floor, all_aps, resolution_m, calculation_boundary, floors
+            )
         else:
             xs = np.asarray(grid_override[0], dtype=float); ys = np.asarray(grid_override[1], dtype=float)
         boundary_mask = RFEngine._boundary_mask(xs, ys, calculation_boundary)
@@ -4003,15 +4076,6 @@ class RFEngine:
             if boundary_mask is not None:
                 work_mask &= boundary_mask
         disconnected = float(getattr(heatmap_settings, "disconnected_rssi_dbm", -120.0) if heatmap_settings else -120.0)
-        radio_links_by_group = {
-            key: RFEngine._active_radio_links(floor, aps, include_inter_floor)
-            for key, aps in group_aps.items()
-        }
-        radio_links_by_group = {key: links for key, links in radio_links_by_group.items() if links}
-        if not radio_links_by_group:
-            return {}
-        group_aps = {key: group_aps[key] for key in radio_links_by_group}
-        group_order = list(group_aps.keys())
         rows, cols = len(ys), len(xs)
         if boundary_mask is None:
             initial_rssi = np.full((rows, cols), disconnected, dtype=float)
@@ -4088,17 +4152,18 @@ class RFEngine:
         use_mp = bool(getattr(heatmap_settings, "enable_rf_multiprocessing", False)) if heatmap_settings else False
         threshold = int(getattr(heatmap_settings, "rf_multiprocessing_min_points", 5000) if heatmap_settings else 5000)
         fallback_note = ""
+        geometry_floors = floors if include_inter_floor else {str(floor.name): floor}
 
         if use_mp and work_units >= threshold and rows > 1:
             requested = int(getattr(heatmap_settings, "max_rf_worker_processes", 0) or 0)
             process_count = min(_logical_process_count(requested), rows)
             tile_rows = RFEngine._adaptive_rf_tile_rows(rows, process_count, heatmap_settings)
             model_key = stable_digest((
-                floor.name, RFEngine._geometry_revision(floors), RFEngine._settings_revision(heatmap_settings),
+                floor.name, RFEngine._geometry_revision(geometry_floors), RFEngine._settings_revision(heatmap_settings),
                 bool(include_inter_floor), RFEngine._pattern_revision(patterns),
             ))
             context_path = _rf_get_worker_context_file(
-                model_key, floor, floors, patterns, include_inter_floor, heatmap_settings,
+                model_key, floor, geometry_floors, patterns, include_inter_floor, heatmap_settings,
                 max(2, int(getattr(heatmap_settings, "rf_worker_index_cache_entries", 2) or 2)),
             )
             worker_cache_entries = max(1, int(getattr(heatmap_settings, "rf_worker_index_cache_entries", 2) or 2))
@@ -4205,9 +4270,9 @@ class RFEngine:
                     try: executor.shutdown(wait=True)
                     except Exception: pass
 
-        wall_indexes = RFEngine._build_wall_indexes(floors)
-        opening_indexes = RFEngine._build_opening_indexes(floors)
-        reflection_indexes = RFEngine._build_reflection_indexes(floors, heatmap_settings)
+        wall_indexes = RFEngine._build_wall_indexes(geometry_floors)
+        opening_indexes = RFEngine._build_opening_indexes(geometry_floors)
+        reflection_indexes = RFEngine._build_reflection_indexes(geometry_floors, heatmap_settings)
         if progress_callback:
             progress_callback(0, rows)
         cancel_event = getattr(heatmap_settings, "_cancel_event", None) if heatmap_settings is not None else None
@@ -4292,7 +4357,9 @@ class RFEngine:
         if not coarse:
             return {}
         all_aps = [ap for aps in group_aps.values() for ap in aps]
-        fine_xs, fine_ys, calculation_boundary = RFEngine._grid_for_floor(floor, all_aps, resolution_m, calculation_boundary)
+        fine_xs, fine_ys, calculation_boundary = RFEngine._grid_for_floor(
+            floor, all_aps, resolution_m, calculation_boundary, floors
+        )
         fine_valid = RFEngine._boundary_mask(fine_xs, fine_ys, calculation_boundary)
         def resample_dense(source_result, values):
             accelerated = gpu_resample_regular_grid(
@@ -4576,17 +4643,51 @@ class RFEngine:
         return result
 
     @staticmethod
-    def _floor_bounds(floor: FloorModel, aps: List[AccessPoint]) -> Tuple[float, float, float, float]:
+    def _floor_geometry_bounds(floor: FloorModel) -> List[Tuple[float, float, float, float]]:
         bounds = [w.polygon.bounds for w in floor.walls] + [s.polygon.bounds for s in floor.spaces]
         bounds += [
             element.polygon.bounds for element in getattr(floor, "elements", [])
             if getattr(element, "polygon", None) is not None and not element.polygon.is_empty
         ]
-        if not bounds:
-            bounds = [(0.0, 0.0, 1.0, 1.0)]
+        return bounds
+
+    @staticmethod
+    def _nearest_populated_floor_bounds(
+        floor: FloorModel,
+        floors: Optional[Dict[str, FloorModel]],
+    ) -> List[Tuple[float, float, float, float]]:
+        if not floors:
+            return []
+        candidates: List[Tuple[float, str, List[Tuple[float, float, float, float]]]] = []
+        for candidate in floors.values():
+            if candidate.name == floor.name:
+                continue
+            candidate_bounds = RFEngine._floor_geometry_bounds(candidate)
+            if candidate_bounds:
+                candidates.append((
+                    abs(float(candidate.elevation) - float(floor.elevation)),
+                    str(candidate.name),
+                    candidate_bounds,
+                ))
+        if not candidates:
+            return []
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        return list(candidates[0][2])
+
+    @staticmethod
+    def _floor_bounds(
+        floor: FloorModel,
+        aps: List[AccessPoint],
+        floors: Optional[Dict[str, FloorModel]] = None,
+    ) -> Tuple[float, float, float, float]:
+        bounds = RFEngine._floor_geometry_bounds(floor)
         for ap in aps:
             if ap.floor == floor.name:
                 bounds.append((ap.x, ap.y, ap.x, ap.y))
+        if not bounds:
+            bounds = RFEngine._nearest_populated_floor_bounds(floor, floors)
+        if not bounds:
+            bounds = [(ap.x, ap.y, ap.x, ap.y) for ap in aps] or [(0.0, 0.0, 1.0, 1.0)]
         minx = min(b[0] for b in bounds) - 5
         miny = min(b[1] for b in bounds) - 5
         maxx = max(b[2] for b in bounds) + 5
@@ -6127,6 +6228,270 @@ class BulkIFCAttenuationDialog(QDialog):
         return bool(self.current_floor_only.isChecked()), changes
 
 
+class IFCAttenuationReviewWizard(QWizard):
+    """Guided review for suspicious IFC attenuation profiles."""
+
+    def __init__(
+        self,
+        parent,
+        groups: List[Dict[str, object]],
+        bands: List[float],
+        profiles: Dict[str, Dict[float, float]],
+        current_floor_name: str = "",
+    ):
+        super().__init__(parent)
+        self.groups = list(groups)
+        self.bands = [float(value) for value in bands]
+        self.profiles = dict(profiles)
+        self.setWindowTitle("IFC attenuation review wizard")
+        self.resize(1160, 720)
+        self.setOption(QWizard.NoBackButtonOnStartPage, False)
+
+        self.addPage(self._build_summary_page(current_floor_name))
+        self.addPage(self._build_review_page(current_floor_name))
+
+    @staticmethod
+    def _frequency_label(mhz: float) -> str:
+        return f"{mhz / 1000:g} GHz dB" if mhz >= 1000.0 else f"{mhz:g} MHz dB"
+
+    @staticmethod
+    def _attenuation_values(group: Dict[str, object], bands: Sequence[float]) -> List[float]:
+        profile = dict(group.get("attenuation", {}) or {})
+        return [float(profile.get(float(band), 0.0)) for band in bands]
+
+    def _review_status(self, group: Dict[str, object]) -> Tuple[str, int]:
+        values = self._attenuation_values(group, self.bands)
+        category = str(group.get("category", "")).casefold()
+        display_type = str(group.get("display_type", "")).casefold()
+        material = str(group.get("material", "")).casefold()
+        text = f"{category} {display_type} {material}"
+        fabric_tokens = (
+            "wall", "door", "window", "slab", "roof", "column", "beam",
+            "curtain", "plate", "member", "concrete", "brick", "masonry",
+            "metal", "steel", "glass",
+        )
+        visual_tokens = (
+            "furniture", "equipment", "distribution", "transport", "proxy",
+            "assembly", "covering", "fixture", "flow", "duct", "pipe",
+        )
+        if any(value < -1e-6 for value in values):
+            return "Negative attenuation", 3
+        if any(value > 120.0 for value in values):
+            return "Very high attenuation", 3
+        if any(token in text for token in fabric_tokens) and all(abs(value) < 1e-6 for value in values):
+            return "Building fabric set to 0 dB", 2
+        if any(token in text for token in visual_tokens) and any(abs(value) > 1e-6 for value in values):
+            return "Visual/MEP type has RF loss", 1
+        if len(values) >= 2 and max(values) - min(values) > 80.0:
+            return "Large band-to-band jump", 1
+        return "Looks OK", 0
+
+    def _build_summary_page(self, current_floor_name: str) -> QWizardPage:
+        page = QWizardPage()
+        page.setTitle("Review IFC attenuation")
+        layout = QVBoxLayout(page)
+        total_instances = sum(int(group.get("count", 0)) for group in self.groups)
+        flagged = [group for group in self.groups if self._review_status(group)[1] > 0]
+        high = [group for group in self.groups if self._review_status(group)[1] >= 2]
+        text = QLabel(
+            f"This wizard checks {len(self.groups)} IFC/RF type row(s), covering "
+            f"{total_instances} imported or RF-model instance(s). It flags zero-loss building fabric, "
+            f"non-zero visual/MEP context, negative values, very high values and unusual band jumps."
+        )
+        text.setWordWrap(True)
+        layout.addWidget(text)
+
+        summary = QTableWidget(4, 2)
+        summary.setHorizontalHeaderLabels(["Check", "Count"])
+        rows = [
+            ("Rows to review", len(flagged)),
+            ("High priority rows", len(high)),
+            ("All type rows", len(self.groups)),
+            ("Current floor", current_floor_name or "No floor selected"),
+        ]
+        for row, (label, value) in enumerate(rows):
+            left = QTableWidgetItem(str(label))
+            left.setFlags(left.flags() & ~Qt.ItemIsEditable)
+            right = QTableWidgetItem(str(value))
+            right.setFlags(right.flags() & ~Qt.ItemIsEditable)
+            summary.setItem(row, 0, left)
+            summary.setItem(row, 1, right)
+        summary.resizeColumnsToContents()
+        summary.verticalHeader().setVisible(False)
+        layout.addWidget(summary)
+        layout.addStretch(1)
+        return page
+
+    def _build_review_page(self, current_floor_name: str) -> QWizardPage:
+        page = QWizardPage()
+        page.setTitle("Check and adjust values")
+        layout = QVBoxLayout(page)
+
+        controls = QHBoxLayout()
+        self.current_floor_only = QCheckBox(
+            f"Apply only to matching instances on {current_floor_name}" if current_floor_name else "Apply only to current floor"
+        )
+        controls.addWidget(self.current_floor_only)
+        controls.addStretch(1)
+        show_flagged = QPushButton("Show flagged only")
+        show_flagged.clicked.connect(lambda: self._set_flagged_visibility(True))
+        controls.addWidget(show_flagged)
+        show_all = QPushButton("Show all")
+        show_all.clicked.connect(lambda: self._set_flagged_visibility(False))
+        controls.addWidget(show_all)
+        select_flagged = QPushButton("Select flagged")
+        select_flagged.clicked.connect(self._select_flagged)
+        controls.addWidget(select_flagged)
+        layout.addLayout(controls)
+
+        preset_controls = QHBoxLayout()
+        preset_controls.addWidget(QLabel("Preset"))
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItems(sorted(self.profiles.keys()))
+        preset_controls.addWidget(self.preset_combo, 1)
+        apply_preset = QPushButton("Apply preset to highlighted / checked rows")
+        apply_preset.clicked.connect(self._apply_preset_to_targets)
+        preset_controls.addWidget(apply_preset)
+        zero_button = QPushButton("Set highlighted / checked rows to 0 dB")
+        zero_button.clicked.connect(self._zero_targets)
+        preset_controls.addWidget(zero_button)
+        layout.addLayout(preset_controls)
+
+        headers = ["Apply", "Review", "Category", "IFC / RF type", "Material", "Instances", "Current floor"]
+        headers += [self._frequency_label(value) for value in self.bands]
+        headers += ["Source IFC files"]
+        self.table = QTableWidget(len(self.groups), len(headers))
+        self.table.setHorizontalHeaderLabels(headers)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.verticalHeader().setVisible(False)
+        for row, group in enumerate(self.groups):
+            status, severity = self._review_status(group)
+            apply_item = QTableWidgetItem("")
+            apply_item.setFlags((apply_item.flags() | Qt.ItemIsUserCheckable) & ~Qt.ItemIsEditable)
+            apply_item.setCheckState(Qt.Checked if severity >= 2 else Qt.Unchecked)
+            apply_item.setData(Qt.UserRole, json.dumps(list(group.get("key", ())), separators=(",", ":")))
+            apply_item.setData(Qt.UserRole + 1, int(severity))
+            self.table.setItem(row, 0, apply_item)
+
+            status_item = QTableWidgetItem(status)
+            status_item.setFlags(status_item.flags() & ~Qt.ItemIsEditable)
+            if severity >= 2:
+                status_item.setBackground(QBrush(QColor("#FFD6D6")))
+            elif severity == 1:
+                status_item.setBackground(QBrush(QColor("#FFF0BA")))
+            self.table.setItem(row, 1, status_item)
+            values = [
+                str(group.get("category", "Other")),
+                str(group.get("display_type", "Unknown")),
+                str(group.get("material", "")),
+                str(group.get("count", 0)),
+                str(group.get("current_floor_count", 0)),
+            ]
+            for column, value in enumerate(values, start=2):
+                item = QTableWidgetItem(value)
+                if column != 3:
+                    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                self.table.setItem(row, column, item)
+            for offset, band in enumerate(self.bands):
+                value = self._attenuation_values(group, self.bands)[offset]
+                self.table.setItem(row, 7 + offset, QTableWidgetItem(f"{value:.3f}"))
+            source_item = QTableWidgetItem(str(group.get("sources", "")))
+            source_item.setFlags(source_item.flags() & ~Qt.ItemIsEditable)
+            self.table.setItem(row, 7 + len(self.bands), source_item)
+        self.table.resizeColumnsToContents()
+        layout.addWidget(self.table, 1)
+        return page
+
+    def _highlighted_rows(self) -> List[int]:
+        selection_model = self.table.selectionModel()
+        if selection_model is None:
+            return []
+        return sorted({index.row() for index in selection_model.selectedRows()})
+
+    def _checked_rows(self) -> List[int]:
+        return [
+            row for row in range(self.table.rowCount())
+            if self.table.item(row, 0).checkState() == Qt.Checked
+        ]
+
+    def _target_rows(self) -> List[int]:
+        highlighted = self._highlighted_rows()
+        return highlighted if highlighted else self._checked_rows()
+
+    def _set_flagged_visibility(self, flagged_only: bool):
+        for row in range(self.table.rowCount()):
+            severity = int(self.table.item(row, 0).data(Qt.UserRole + 1) or 0)
+            self.table.setRowHidden(row, bool(flagged_only and severity <= 0))
+
+    def _select_flagged(self):
+        for row in range(self.table.rowCount()):
+            severity = int(self.table.item(row, 0).data(Qt.UserRole + 1) or 0)
+            self.table.item(row, 0).setCheckState(Qt.Checked if severity > 0 else Qt.Unchecked)
+
+    def _profile_value(self, profile: Dict[float, float], band: float) -> float:
+        if not profile:
+            return 0.0
+        if float(band) in profile:
+            return float(profile[float(band)])
+        keys = sorted(float(value) for value in profile)
+        nearest = min(keys, key=lambda value: abs(value - float(band)))
+        return float(profile[nearest])
+
+    def _mark_rows_for_apply(self, rows: Iterable[int]):
+        for row in rows:
+            item = self.table.item(int(row), 0)
+            if item is not None:
+                item.setCheckState(Qt.Checked)
+
+    def _apply_preset_to_targets(self):
+        rows = self._target_rows()
+        if not rows:
+            QMessageBox.information(self, "No IFC types selected", "Highlight rows or tick their Apply boxes first.")
+            return
+        preset_name = self.preset_combo.currentText()
+        profile = self.profiles.get(preset_name, self.profiles.get("default", {}))
+        for row in rows:
+            self.table.item(row, 3).setText(preset_name.split(" / ", 1)[-1])
+            for offset, band in enumerate(self.bands):
+                self.table.item(row, 7 + offset).setText(f"{self._profile_value(profile, band):.3f}")
+        self._mark_rows_for_apply(rows)
+
+    def _zero_targets(self):
+        rows = self._target_rows()
+        if not rows:
+            QMessageBox.information(self, "No IFC types selected", "Highlight rows or tick their Apply boxes first.")
+            return
+        for row in rows:
+            for offset in range(len(self.bands)):
+                self.table.item(row, 7 + offset).setText("0.000")
+        self._mark_rows_for_apply(rows)
+
+    def values(self) -> Tuple[bool, List[Dict[str, object]]]:
+        changes = []
+        for row in range(self.table.rowCount()):
+            apply_item = self.table.item(row, 0)
+            if apply_item.checkState() != Qt.Checked:
+                continue
+            try:
+                key = tuple(json.loads(str(apply_item.data(Qt.UserRole))))
+            except Exception:
+                continue
+            attenuation = {}
+            for offset, band in enumerate(self.bands):
+                try:
+                    attenuation[float(band)] = float(self.table.item(row, 7 + offset).text())
+                except Exception:
+                    attenuation[float(band)] = 0.0
+            changes.append({
+                "key": key,
+                "rf_type": self.table.item(row, 3).text().strip(),
+                "attenuation": attenuation,
+            })
+        return bool(self.current_floor_only.isChecked()), changes
+
+
 class BulkAccessPointDialog(QDialog):
     """Apply selected physical and radio parameters to many APs at once."""
 
@@ -6286,6 +6651,12 @@ class AutoPlannerSettingsDialog(QDialog):
             "When enabled, wall-derived inferred spaces contribute coverage samples and AP candidate positions. "
             "Disable this to restrict space-based prediction to imported IFC and manually drawn spaces."
         )
+        self.include_inter_floor_rf = QCheckBox("Include RF from access points on other floors")
+        self.include_inter_floor_rf.setChecked(settings.include_inter_floor_rf)
+        self.include_inter_floor_rf.setToolTip(
+            "When enabled, existing APs on other floors are included in the predictive planner's RSSI and handover "
+            "scoring using the same inter-floor loss model as the heatmap simulation."
+        )
         self.expected_clients = QSpinBox(); self.expected_clients.setRange(0, 1000000); self.expected_clients.setValue(settings.expected_clients)
         self.clients_per_ap = QSpinBox(); self.clients_per_ap.setRange(1, 10000); self.clients_per_ap.setValue(settings.clients_per_ap)
         self.ap_radio_profile = QComboBox()
@@ -6312,6 +6683,7 @@ class AutoPlannerSettingsDialog(QDialog):
         form.addRow("Maximum planned APs", self.maximum_aps)
         form.addRow("Planning area source", self.area_mode)
         form.addRow(self.use_inferred_spaces)
+        form.addRow(self.include_inter_floor_rf)
         form.addRow("Inferred wall-footprint margin", self.wall_margin)
         form.addRow("Expected connected clients", self.expected_clients)
         form.addRow("Maximum clients per AP", self.clients_per_ap)
@@ -6463,6 +6835,7 @@ class AutoPlannerSettingsDialog(QDialog):
             planning_area_mode=str(self.area_mode.currentData() or "auto"),
             wall_footprint_margin_m=float(self.wall_margin.value()),
             use_inferred_spaces=self.use_inferred_spaces.isChecked(),
+            include_inter_floor_rf=self.include_inter_floor_rf.isChecked(),
             expected_clients=int(self.expected_clients.value()), clients_per_ap=int(self.clients_per_ap.value()),
             keep_existing_aps=self.keep_existing.isChecked(), remove_previous_planned_aps=self.remove_planned.isChecked(),
             ap_radio_profile=str(self.ap_radio_profile.currentText() or "Predictive planner").strip() or "Predictive planner",
@@ -8738,6 +9111,307 @@ class PolarPatternDialog(QDialog):
         )
 
 
+class Building3DViewDialog(QDialog):
+    """Separate Qt Quick 3D view of all loaded floors and wireless APs."""
+
+    def __init__(
+        self, parent, floors: Dict[str, FloorModel], aps: List[AccessPoint],
+        heatmap_settings: Optional[HeatmapSettings] = None,
+    ):
+        super().__init__(parent)
+        self.floors = dict(floors or {})
+        self.aps = list(aps or [])
+        self.heatmap_settings = heatmap_settings
+        self._qml_path: Optional[Path] = None
+        self.setWindowTitle("3D building and access point view")
+        self.resize(1180, 820)
+
+        layout = QVBoxLayout(self)
+        summary = QLabel(
+            f"{len(self.floors)} floor(s), {len(self.aps)} wireless access point(s). "
+            "Left-drag to orbit, right/middle-drag to pan, wheel to zoom."
+        )
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+
+        if QQuickWidget is None:
+            message = QLabel("Qt Quick 3D is not available in this Python environment.")
+            message.setWordWrap(True)
+            layout.addWidget(message, 1)
+        else:
+            self.view = QQuickWidget(self)
+            self.view.setResizeMode(QQuickWidget.SizeRootObjectToView)
+            self.view.setMinimumSize(640, 420)
+            self._qml_path = self._write_qml_scene()
+            self.view.setSource(QUrl.fromLocalFile(str(self._qml_path)))
+            if self.view.status() == QQuickWidget.Error:
+                message = QLabel("\n".join(error.toString() for error in self.view.errors()))
+                message.setWordWrap(True)
+                layout.addWidget(message, 1)
+            else:
+                layout.addWidget(self.view, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def closeEvent(self, event):
+        try:
+            if self._qml_path is not None:
+                self._qml_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+    def _all_model_bounds(self) -> Tuple[float, float, float, float]:
+        bounds = []
+        for floor in self.floors.values():
+            for collection_name in ("spaces", "walls", "elements"):
+                for obj in getattr(floor, collection_name, []):
+                    polygon = getattr(obj, "polygon", None)
+                    if polygon is None or polygon.is_empty:
+                        continue
+                    try:
+                        bounds.append(tuple(float(value) for value in polygon.bounds))
+                    except Exception:
+                        continue
+        for ap in self.aps:
+            bounds.append((float(ap.x), float(ap.y), float(ap.x), float(ap.y)))
+        if not bounds:
+            return (-10.0, -10.0, 10.0, 10.0)
+        minx = min(value[0] for value in bounds)
+        miny = min(value[1] for value in bounds)
+        maxx = max(value[2] for value in bounds)
+        maxy = max(value[3] for value in bounds)
+        if abs(maxx - minx) < 1e-6:
+            minx -= 5.0
+            maxx += 5.0
+        if abs(maxy - miny) < 1e-6:
+            miny -= 5.0
+            maxy += 5.0
+        return (minx, miny, maxx, maxy)
+
+    def _floor_bounds(self, floor: FloorModel) -> Optional[Tuple[float, float, float, float]]:
+        bounds = []
+        for collection_name in ("spaces", "walls", "elements"):
+            for obj in getattr(floor, collection_name, []):
+                polygon = getattr(obj, "polygon", None)
+                if polygon is None or polygon.is_empty:
+                    continue
+                try:
+                    bounds.append(tuple(float(value) for value in polygon.bounds))
+                except Exception:
+                    continue
+        for ap in [candidate for candidate in self.aps if str(candidate.floor) == str(floor.name)]:
+            bounds.append((float(ap.x), float(ap.y), float(ap.x), float(ap.y)))
+        if not bounds:
+            return None
+        return (
+            min(value[0] for value in bounds),
+            min(value[1] for value in bounds),
+            max(value[2] for value in bounds),
+            max(value[3] for value in bounds),
+        )
+
+    def _display_floor_levels(self) -> Dict[str, float]:
+        ordered = sorted(self.floors.values(), key=lambda floor: (float(floor.elevation), str(floor.name)))
+        elevations = [float(floor.elevation) for floor in ordered]
+        use_index_spacing = len({round(value, 3) for value in elevations}) <= 1
+        levels: Dict[str, float] = {}
+        for index, floor in enumerate(ordered):
+            if use_index_spacing:
+                level = index * 4.0
+            else:
+                level = float(floor.elevation) - min(elevations)
+            levels[str(floor.name)] = float(level)
+        return levels
+
+    def _model_point(self, x: float, y: float, z: float = 0.0) -> Tuple[float, float, float]:
+        minx, miny, maxx, maxy = self.model_bounds
+        cx = (minx + maxx) * 0.5
+        cy = (miny + maxy) * 0.5
+        return (float(x) - cx, float(z), cy - float(y))
+
+    @staticmethod
+    def _qml_number(value: float) -> str:
+        return f"{float(value):.6g}"
+
+    @staticmethod
+    def _qml_colour(colour: str, alpha: int = 255) -> str:
+        qcolour = QColor(colour)
+        if not qcolour.isValid():
+            qcolour = QColor("#FFFFFF")
+        qcolour.setAlpha(max(0, min(255, int(alpha))))
+        return qcolour.name(QColor.HexArgb)
+
+    def _model_qml(
+        self, source: str, x: float, y: float, z: float,
+        sx: float, sy: float, sz: float, colour: str, alpha: int = 255,
+    ) -> str:
+        return (
+            f'Model {{ source: "{source}"; position: Qt.vector3d({self._qml_number(x)}, {self._qml_number(y)}, {self._qml_number(z)}); '
+            f'scale: Qt.vector3d({self._qml_number(max(0.001, sx / 100.0))}, {self._qml_number(max(0.001, sy / 100.0))}, {self._qml_number(max(0.001, sz / 100.0))}); '
+            f'materials: [ PrincipledMaterial {{ baseColor: "{self._qml_colour(colour, alpha)}"; roughness: 0.55; opacity: {self._qml_number(max(0.0, min(1.0, alpha / 255.0)))} }} ] }}'
+        )
+
+    def _scene_model_lines(self) -> List[str]:
+        self.model_bounds = self._all_model_bounds()
+        self.floor_levels = self._display_floor_levels()
+        minx, miny, maxx, maxy = self.model_bounds
+        self.scene_span = max(maxx - minx, maxy - miny, 1.0)
+        lines: List[str] = []
+        floor_colours = ["#2563EB", "#059669", "#D97706", "#7C3AED", "#0891B2", "#BE123C"]
+        ordered_floors = sorted(self.floors.values(), key=lambda floor: (self.floor_levels.get(str(floor.name), 0.0), str(floor.name)))
+        for index, floor in enumerate(ordered_floors):
+            level = self.floor_levels.get(str(floor.name), index * 4.0)
+            bounds = self._floor_bounds(floor) or self.model_bounds
+            fminx, fminy, fmaxx, fmaxy = bounds
+            centre = self._model_point((fminx + fmaxx) * 0.5, (fminy + fmaxy) * 0.5, level)
+            lines.append(self._model_qml(
+                "#Cube", *centre,
+                max(0.5, fmaxx - fminx),
+                max(0.05, float(getattr(self.heatmap_settings, "synthetic_floor_entity_thickness_m", 0.30) or 0.30)),
+                max(0.5, fmaxy - fminy),
+                floor_colours[index % len(floor_colours)], 85,
+            ))
+
+            wall_limit = 1800
+            for wall in floor.walls[:wall_limit]:
+                polygon = getattr(wall, "polygon", None)
+                if polygon is None or polygon.is_empty:
+                    continue
+                try:
+                    wminx, wminy, wmaxx, wmaxy = [float(value) for value in polygon.bounds]
+                except Exception:
+                    continue
+                wall_centre = self._model_point((wminx + wmaxx) * 0.5, (wminy + wmaxy) * 0.5, level + 0.55)
+                lines.append(self._model_qml(
+                    "#Cube", *wall_centre,
+                    max(0.08, wmaxx - wminx), 1.0, max(0.08, wmaxy - wminy),
+                    "#D1D5DB" if not getattr(wall, "is_user_created", False) else "#F97316", 170,
+                ))
+
+        for ap in self.aps:
+            level = self.floor_levels.get(str(ap.floor), 0.0)
+            z = level + max(0.4, float(getattr(ap, "mount_height_m", 2.7)))
+            point = self._model_point(float(ap.x), float(ap.y), z)
+            lines.extend(self._access_point_model_qml(ap, point))
+
+        lines.append(self._model_qml(
+            "#Cube", 0.0, -0.08, 0.0,
+            self.scene_span * 1.08, 0.04, self.scene_span * 1.08,
+            "#374151", 95,
+        ))
+        return lines
+
+    def _access_point_model_qml(self, ap: AccessPoint, point: Tuple[float, float, float]) -> List[str]:
+        ap_type = str(getattr(ap, "ap_type", "Ceiling AP"))
+        if "Directional" in ap_type:
+            colour = "#F59E0B"
+        elif "Wall" in ap_type:
+            colour = "#22C55E"
+        elif "Outdoor" in ap_type or "Industrial" in ap_type:
+            colour = "#EF4444"
+        elif "Gateway" in ap_type or "Cellular" in ap_type:
+            colour = "#A855F7"
+        else:
+            colour = "#38BDF8"
+        x, y, z = point
+        return [
+            self._model_qml("#Cylinder", x, y, z, 0.84, 0.18, 0.84, colour, 255),
+            self._model_qml("#Sphere", x, y + 0.24, z, 0.34, 0.34, 0.34, "#F8FAFC", 245),
+            self._model_qml("#Cone", x, y - 0.32, z, 0.64, 0.46, 0.64, colour, 210),
+            self._model_qml("#Cube", x - 0.32, y + 0.48, z, 0.06, 0.52, 0.06, "#F8FAFC", 245),
+            self._model_qml("#Cube", x + 0.32, y + 0.48, z, 0.06, 0.52, 0.06, "#F8FAFC", 245),
+        ]
+
+    def _write_qml_scene(self) -> Path:
+        model_lines = "\n                ".join(self._scene_model_lines())
+        max_level = max(self.floor_levels.values(), default=0.0) if hasattr(self, "floor_levels") else 0.0
+        distance = max(16.0, float(getattr(self, "scene_span", 20.0)) * 1.25)
+        min_zoom = max(0.25, min(3.0, float(getattr(self, "scene_span", 20.0)) * 0.01))
+        max_zoom = max(20.0, distance * 8.0)
+        qml = f"""
+import QtQuick
+import QtQuick3D
+
+Rectangle {{
+    id: root
+    color: "#0f172a"
+    property real yaw: -38
+    property real pitch: -24
+    property real zoom: {self._qml_number(distance * 1.35)}
+    property real panX: 0
+    property real panY: 0
+
+    View3D {{
+        anchors.fill: parent
+        environment: SceneEnvironment {{
+            clearColor: "#0f172a"
+            backgroundMode: SceneEnvironment.Color
+            antialiasingMode: SceneEnvironment.MSAA
+            antialiasingQuality: SceneEnvironment.High
+        }}
+        PerspectiveCamera {{
+            id: camera
+            position: Qt.vector3d(root.panX, root.panY + {self._qml_number(max_level * 0.45 + distance * 0.35)}, root.zoom)
+            eulerRotation.x: -12
+            clipFar: {self._qml_number(max(5000.0, distance * 12.0))}
+        }}
+        DirectionalLight {{
+            eulerRotation.x: -45
+            eulerRotation.y: 35
+            brightness: 1.4
+            castsShadow: false
+        }}
+        PointLight {{
+            position: Qt.vector3d(0, {self._qml_number(max_level + distance * 0.7)}, {self._qml_number(distance * 0.5)})
+            brightness: 70
+        }}
+        Node {{
+            id: sceneRoot
+            eulerRotation.x: root.pitch
+            eulerRotation.y: root.yaw
+            {model_lines}
+        }}
+    }}
+
+    MouseArea {{
+        anchors.fill: parent
+        acceptedButtons: Qt.LeftButton | Qt.RightButton | Qt.MiddleButton
+        property real lastX: 0
+        property real lastY: 0
+        onPressed: function(mouse) {{ lastX = mouse.x; lastY = mouse.y }}
+        onPositionChanged: function(mouse) {{
+            if (pressed) {{
+                var dx = mouse.x - lastX
+                var dy = mouse.y - lastY
+                if (mouse.buttons & Qt.LeftButton) {{
+                    root.yaw += dx * 0.35
+                    root.pitch = Math.max(-80, Math.min(20, root.pitch + dy * 0.25))
+                }} else if ((mouse.buttons & Qt.RightButton) || (mouse.buttons & Qt.MiddleButton)) {{
+                    var panScale = Math.max(0.002, root.zoom / Math.max(1, Math.max(width, height)) * 1.45)
+                    root.panX -= dx * panScale
+                    root.panY += dy * panScale
+                }}
+                lastX = mouse.x
+                lastY = mouse.y
+            }}
+        }}
+        onWheel: function(wheel) {{
+            var steps = wheel.angleDelta.y / 120.0
+            root.zoom = Math.max({self._qml_number(min_zoom)}, Math.min({self._qml_number(max_zoom)}, root.zoom * Math.pow(0.82, steps)))
+        }}
+    }}
+}}
+"""
+        handle, name = tempfile.mkstemp(prefix="rf_building_3d_", suffix=".qml")
+        os.close(handle)
+        path = Path(name)
+        path.write_text(qml, encoding="utf-8")
+        return path
+
+
 def _access_point_symbol_path(ap_type: str, radius: float) -> QPainterPath:
     definition = AP_TYPE_PRESETS.get(ap_type, AP_TYPE_PRESETS["Ceiling AP"])
     symbol = definition.get("symbol", "circle_cross")
@@ -9427,6 +10101,14 @@ class MainWindow(QMainWindow):
         self.min_client_rssi.valueChanged.connect(self._minimum_rssi_changed)
         self.include_inter_floor = QCheckBox("Include APs from other floors")
         self.include_inter_floor.setChecked(True)
+        self.synthetic_floor_entity_enabled = QCheckBox("Use floor entity at each level")
+        self.synthetic_floor_entity_enabled.setChecked(bool(self.heatmap_settings.enable_synthetic_floor_entities))
+        self.synthetic_floor_thickness = QDoubleSpinBox()
+        self.synthetic_floor_thickness.setRange(0.01, 10.0)
+        self.synthetic_floor_thickness.setDecimals(2)
+        self.synthetic_floor_thickness.setSingleStep(0.05)
+        self.synthetic_floor_thickness.setValue(float(self.heatmap_settings.synthetic_floor_entity_thickness_m))
+        self.synthetic_floor_thickness.setSuffix(" m")
         self.slab_att_24 = QDoubleSpinBox()
         self.slab_att_24.setRange(0.0, 80.0)
         self.slab_att_24.setValue(float(self.heatmap_settings.default_floor_attenuation_by_frequency_db.get(2400.0, 35.0)))
@@ -9461,6 +10143,8 @@ class MainWindow(QMainWindow):
         form.addRow("Path loss exponent", self.ple)
         form.addRow("Client disconnect RSSI", self.min_client_rssi)
         form.addRow("Inter-floor RF", self.include_inter_floor)
+        form.addRow("Synthetic floor entity", self.synthetic_floor_entity_enabled)
+        form.addRow("Floor entity thickness", self.synthetic_floor_thickness)
         form.addRow("Slab loss 2.4 GHz", self.slab_att_24)
         form.addRow("Slab loss 5 GHz", self.slab_att_5)
         form.addRow("Slab loss 6 GHz", self.slab_att_6)
@@ -9472,7 +10156,7 @@ class MainWindow(QMainWindow):
             self.floor_combo, self.rssi_view_frequency, self.ap_type_combo, self.radio_profile_combo, self.pattern_combo,
             self.resolution, self.tx_power, self.freq, self.azimuth,
             self.downtilt, self.mount_height, self.rx_height, self.ple,
-            self.min_client_rssi, self.slab_att_24, self.slab_att_5, self.slab_att_6,
+            self.min_client_rssi, self.synthetic_floor_thickness, self.slab_att_24, self.slab_att_5, self.slab_att_6,
         ):
             field.setMinimumWidth(170)
 
@@ -9603,6 +10287,8 @@ class MainWindow(QMainWindow):
         self.draw_wall_action.toggled.connect(self.toggle_wall_draw_mode)
         self.bulk_attenuation_action = QAction("Bulk IFC attenuation", self)
         self.bulk_attenuation_action.triggered.connect(self.show_bulk_ifc_attenuation)
+        self.attenuation_review_action = QAction("IFC attenuation wizard", self)
+        self.attenuation_review_action.triggered.connect(self.show_ifc_attenuation_review_wizard)
         self.draw_boundary_action = QAction("Draw rectangular boundary", self)
         self.draw_boundary_action.setCheckable(True)
         self.draw_boundary_action.toggled.connect(
@@ -9628,6 +10314,8 @@ class MainWindow(QMainWindow):
         self.clear_boundaries_action.triggered.connect(self.clear_planner_boundaries)
         self.ifc_origin_action = QAction("IFC origin / orientation", self)
         self.ifc_origin_action.triggered.connect(self.show_ifc_origin_dialog)
+        self.building_3d_view_action = QAction("3D building view", self)
+        self.building_3d_view_action.triggered.connect(self.show_3d_building_view)
         self.rotate_left_action = QAction("Rotate view left", self)
         self.rotate_left_action.triggered.connect(lambda: self.rotate_view(-15.0))
         self.rotate_right_action = QAction("Rotate view right", self)
@@ -9655,6 +10343,11 @@ class MainWindow(QMainWindow):
 
         self.floor_combo.currentTextChanged.connect(self.select_floor)
         self.include_inter_floor.stateChanged.connect(lambda *_: self.draw_floor())
+        self.synthetic_floor_entity_enabled.stateChanged.connect(lambda *_: self._synthetic_floor_entity_changed())
+        self.synthetic_floor_thickness.valueChanged.connect(lambda *_: self._synthetic_floor_entity_changed())
+        self.slab_att_24.valueChanged.connect(lambda *_: self._slab_attenuation_ui_changed())
+        self.slab_att_5.valueChanged.connect(lambda *_: self._slab_attenuation_ui_changed())
+        self.slab_att_6.valueChanged.connect(lambda *_: self._slab_attenuation_ui_changed())
 
     def selectable_scene_items_at_view_pos(self, view: QGraphicsView, view_pos) -> List[QGraphicsItem]:
         selectable_types = (
@@ -9994,6 +10687,10 @@ class MainWindow(QMainWindow):
                 "Bulk IFC attenuation", "Edit attenuation once per unique IFC wall/element type and apply it to every matching instance.",
                 "SP_FileDialogDetailedView", "Ctrl+Alt+T"
             ),
+            "attenuation_review_action": (
+                "IFC attenuation wizard", "Review IFC attenuation values, flag suspicious type rows and apply corrected per-band RF loss values.",
+                "SP_MessageBoxWarning", "Ctrl+Alt+Shift+T"
+            ),
             "draw_boundary_action": (
                 "Rectangle boundary", "Draw a rectangular hard boundary shared by all IFC floors.",
                 "SP_TitleBarMaxButton", ""
@@ -10029,6 +10726,10 @@ class MainWindow(QMainWindow):
             "ifc_origin_action": (
                 "IFC origin and orientation", "Inspect insertion points, site coordinates, CRS, map conversion and True North.",
                 "SP_MessageBoxInformation", ""
+            ),
+            "building_3d_view_action": (
+                "3D building view", "Open a separate 3D view showing all floors and wireless access point locations.",
+                "SP_ComputerIcon", "Ctrl+Alt+3"
             ),
             "rotate_left_action": (
                 "Rotate view left", "Rotate the display 15 degrees counter-clockwise without changing model coordinates.",
@@ -10140,12 +10841,12 @@ class MainWindow(QMainWindow):
             ("Space-assisted placement", ["space_ap_action", "select_ap_spaces_action"]),
         ]), "Access points")
         ribbon.addTab(self._make_ribbon_page([
-            ("IFC information", ["ifc_origin_action"]),
+            ("IFC information", ["ifc_origin_action", "building_3d_view_action"]),
             ("DXF and alignment", ["open_dxf_action", "align_ifc_action", "two_point_align_action", "clear_dxf_action"]),
             ("View orientation", ["rotate_left_action", "rotate_right_action", "reset_rotation_action"]),
         ]), "Model and view")
         ribbon.addTab(self._make_ribbon_page([
-            ("RF obstructions", ["draw_wall_action", "bulk_attenuation_action"]),
+            ("RF obstructions", ["draw_wall_action", "bulk_attenuation_action", "attenuation_review_action"]),
             ("Space creation", ["draw_space_action", "create_spaces_action"]),
             ("Space interaction", ["inferred_space_interaction_action", "select_ap_spaces_action", "clear_inferred_spaces_action"]),
             ("Permitted planning area", ["draw_boundary_action", "draw_polygon_boundary_action", "suggest_external_boundary_action", "clear_boundaries_action"]),
@@ -10581,6 +11282,7 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(
                     f"Placed {ap.name} at ({ap.x:.2f}, {ap.y:.2f}). Continue clicking or right-click to finish."
                 )
+                self._schedule_interactive_rf_preview()
             return
         if self.ap_placement_mode == "array":
             self.place_ap_array(float(pos.x()), float(pos.y()), self._array_placement_settings)
@@ -10619,6 +11321,8 @@ class MainWindow(QMainWindow):
         self.draw_floor()
         self.populate_ap_table()
         self.statusBar().showMessage(f"Placed {len(created)} access points in an axial/transverse array")
+        if created:
+            self._schedule_interactive_rf_preview()
 
     def show_space_ap_placement_dialog(self):
         if not self.floor:
@@ -10760,6 +11464,8 @@ class MainWindow(QMainWindow):
         self._ensure_ap_interaction_enabled()
         self.draw_floor()
         self.populate_ap_table()
+        if created:
+            self._schedule_interactive_rf_preview()
         QMessageBox.information(
             self, "Space-assisted AP placement",
             f"Placed {len(created)} access point(s) inside {successful_spaces} space(s)."
@@ -10896,6 +11602,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Pasted {len(created)} access point(s) onto {self.floor.name}; the pasted group remains selected."
         )
+        self._schedule_interactive_rf_preview()
         return True
 
     def _update_ap_table_positions(self, moved_aps: List[AccessPoint]):
@@ -11159,6 +11866,7 @@ class MainWindow(QMainWindow):
         self.draw_floor()
         self.populate_ap_table()
         self.statusBar().showMessage(f"Duplicated {ap.name} as {duplicate.name}")
+        self._schedule_interactive_rf_preview()
 
     def delete_access_point(self, ap: AccessPoint):
         self.aps = [candidate for candidate in self.aps if candidate is not ap]
@@ -11224,6 +11932,13 @@ class MainWindow(QMainWindow):
     def show_ifc_origin_dialog(self):
         dlg = IFCOriginDialog(self, self.ifc_origin_info, self.ifc_alignment)
         dlg.exec()
+
+    def show_3d_building_view(self):
+        if not self.floors:
+            QMessageBox.information(self, "No model loaded", "Load an IFC model before opening the 3D building view.")
+            return
+        dialog = Building3DViewDialog(self, self.floors, self.aps, self.heatmap_settings)
+        dialog.exec()
 
     # ----------------------------- RF wall creation/editing -----------------------------
 
@@ -11741,36 +12456,48 @@ class MainWindow(QMainWindow):
         return max(0.0, maxx - minx) * max(0.0, maxy - miny)
 
     def _wall_polygons_for_boundary_suggestion(self) -> Tuple[List[Polygon], str, int]:
-        """Return unique IFC and RF wall polygons for tracing the outer chain.
+        """Return unique wall polygons from every loaded floor for the outer chain.
 
-        All IFC walls are used rather than trusting an ``IsExternal`` flag,
-        because many authoring exports omit or only partially populate that
-        property. Manually placed RF walls are always included as well, so a
-        user can close missing facade sections before requesting a boundary
-        suggestion. Internal walls remain inside the union and therefore do
-        not alter the extracted outer ring.
+        All IFC wall footprints are used rather than trusting an ``IsExternal``
+        flag, because many authoring exports omit or only partially populate
+        that property. The external planner boundary is often accepted as the
+        baseline for multiple floors, so the wall evidence is gathered across
+        the full loaded model instead of only the active floor. Manually placed
+        RF walls are included as well, so a user can close missing facade
+        sections before requesting a boundary suggestion.
         """
-        if not self.floor:
+        if not self.floor or not self.floors:
             return [], "", 0
 
         unique = set()
         ifc_walls: List[Wall2D] = []
         manual_rf_walls: List[Wall2D] = []
         generated_rf_walls: List[Wall2D] = []
-        for wall in self.floor.walls:
-            polygon = getattr(wall, "polygon", None)
-            if polygon is None or polygon.is_empty or float(polygon.area) <= 1e-6:
-                continue
-            key = (str(wall.source_file), str(wall.guid), bytes(polygon.wkb))
-            if key in unique:
-                continue
-            unique.add(key)
-            if not wall.is_user_created:
-                ifc_walls.append(wall)
-            elif str(getattr(wall, "source_file", "")) == "RF simulator external baseline":
-                generated_rf_walls.append(wall)
-            else:
-                manual_rf_walls.append(wall)
+        floor_count = 0
+        for floor in self.floors.values():
+            floor_had_wall = False
+            for wall in getattr(floor, "walls", []) or []:
+                polygon = getattr(wall, "polygon", None)
+                if polygon is None or polygon.is_empty or float(polygon.area) <= 1e-6:
+                    continue
+                key = (
+                    str(getattr(wall, "source_file", "")),
+                    str(getattr(wall, "guid", "")),
+                    str(getattr(wall, "floor", getattr(floor, "name", ""))),
+                    bytes(polygon.wkb),
+                )
+                if key in unique:
+                    continue
+                unique.add(key)
+                floor_had_wall = True
+                if not wall.is_user_created:
+                    ifc_walls.append(wall)
+                elif str(getattr(wall, "source_file", "")) == "RF simulator external baseline":
+                    generated_rf_walls.append(wall)
+                else:
+                    manual_rf_walls.append(wall)
+            if floor_had_wall:
+                floor_count += 1
 
         selected = ifc_walls + manual_rf_walls + generated_rf_walls
         source_parts: List[str] = []
@@ -11792,6 +12519,8 @@ class MainWindow(QMainWindow):
             source_label = source_parts[0]
         else:
             source_label = ", ".join(source_parts[:-1]) + " and " + source_parts[-1]
+        if selected and floor_count > 1:
+            source_label += f" across {floor_count} floors"
         return [wall.polygon for wall in selected], source_label, len(selected)
 
     def suggest_external_planner_boundary(self):
@@ -11826,8 +12555,8 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(dialog)
 
         explanation = QLabel(
-            f"The magenta chain is derived from {source_label} on "
-            f"'{self.floor.name}'. If accepted, the resulting polygon boundary is shared by all IFC floors. "
+            f"The magenta chain is derived from {source_label} in the loaded model. "
+            f"If accepted, the resulting polygon boundary is saved on '{self.floor.name}'. "
             "Increase the bridge distance where doors or missing wall segments leave the chain open."
         )
         explanation.setWordWrap(True)
@@ -11877,7 +12606,7 @@ class MainWindow(QMainWindow):
 
         def update_preview():
             nonlocal current_polygons, current_metadata
-            self.statusBar().showMessage("Tracing the outermost IFC and RF wall chain...")
+            self.statusBar().showMessage("Tracing the outermost IFC and RF wall chain across all loaded floors...")
             QApplication.setOverrideCursor(Qt.WaitCursor)
             try:
                 current_polygons, current_metadata = suggest_external_boundary_polygons(
@@ -12735,6 +13464,23 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.Accepted:
             return
         current_floor_only, changes = dialog.values()
+        self._apply_ifc_attenuation_changes(current_floor_only, changes)
+
+    def show_ifc_attenuation_review_wizard(self):
+        groups = self._attenuation_groups()
+        if not groups:
+            QMessageBox.information(self, "No IFC attenuation types", "Load an IFC model before reviewing attenuation values.")
+            return
+        dialog = IFCAttenuationReviewWizard(
+            self, groups, self._frequency_bands(), self._combined_attenuation_presets(),
+            self.floor.name if self.floor else "",
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        current_floor_only, changes = dialog.values()
+        self._apply_ifc_attenuation_changes(current_floor_only, changes)
+
+    def _apply_ifc_attenuation_changes(self, current_floor_only: bool, changes: List[Dict[str, object]]):
         changed_objects = 0
         changed_types = 0
         for change in changes:
@@ -13729,7 +14475,17 @@ class MainWindow(QMainWindow):
             return np.logical_or.reduce(masks)
         return np.logical_and.reduce(masks)
 
-    def _planner_ap_rssi_values(self, ap: AccessPoint, requirements: List[PlannerRadioRequirement], samples: List[Tuple[float, float]], wall_tree, walls: List[Wall2D]) -> List[np.ndarray]:
+    def _planner_ap_rssi_values(
+        self,
+        ap: AccessPoint,
+        requirements: List[PlannerRadioRequirement],
+        samples: List[Tuple[float, float]],
+        wall_tree,
+        walls: List[Wall2D],
+        include_inter_floor: bool = False,
+        wall_indexes=None,
+        opening_indexes=None,
+    ) -> List[np.ndarray]:
         """Return the strongest RSSI from one physical AP for each required band.
 
         Multiple radios in the same band still count as one AP for handover. This
@@ -13738,6 +14494,14 @@ class MainWindow(QMainWindow):
         """
         disconnected = float(self.heatmap_settings.disconnected_rssi_dbm)
         values_by_radio: List[np.ndarray] = []
+        receiver_floor = self.floor
+        ap_floor_name = str(getattr(ap, "floor", ""))
+        use_engine_path = (
+            bool(include_inter_floor)
+            and receiver_floor is not None
+            and ap_floor_name != str(receiver_floor.name)
+            and ap_floor_name in self.floors
+        )
         for requirement in requirements:
             matching = [
                 radio for radio in ap.active_radios()
@@ -13745,10 +14509,23 @@ class MainWindow(QMainWindow):
             ]
             values = np.full(len(samples), disconnected, dtype=np.float32)
             for radio in matching:
-                radio_values = np.fromiter(
-                    (self._planner_rssi(x, y, ap, radio, wall_tree, walls) for x, y in samples),
-                    dtype=np.float32, count=len(samples),
-                )
+                if use_engine_path:
+                    radio_values = np.fromiter(
+                        (
+                            RFEngine.rssi_at(
+                                x, y, receiver_floor, ap, self.floors, self.antenna_patterns, radio,
+                                include_inter_floor=True, heatmap_settings=self.heatmap_settings,
+                                wall_indexes=wall_indexes, opening_indexes=opening_indexes,
+                            )
+                            for x, y in samples
+                        ),
+                        dtype=np.float32, count=len(samples),
+                    )
+                else:
+                    radio_values = np.fromiter(
+                        (self._planner_rssi(x, y, ap, radio, wall_tree, walls) for x, y in samples),
+                        dtype=np.float32, count=len(samples),
+                    )
                 np.maximum(values, radio_values, out=values)
             values_by_radio.append(values)
         return values_by_radio
@@ -13983,18 +14760,43 @@ class MainWindow(QMainWindow):
         reports: List[Dict[str, object]] = []
         failed_floors: List[str] = []
         cancelled = False
+        batch_progress = QProgressDialog(
+            "Preparing predictive AP planner...",
+            "Cancel",
+            0,
+            max(1, len(selected_floors) * max(1, int(settings.maximum_aps))),
+            self,
+        )
+        batch_progress.setWindowTitle("Predictive AP planner")
+        batch_progress.setWindowModality(Qt.WindowModal)
+        batch_progress.setMinimumDuration(0)
+        batch_progress.setAutoClose(False)
+        batch_progress.setAutoReset(False)
+        batch_progress.show()
         try:
             for floor_index, floor in enumerate(selected_floors, start=1):
+                if batch_progress.wasCanceled():
+                    cancelled = True
+                    break
                 self.floor = floor
                 self.statusBar().showMessage(
                     f"Predicting AP locations on {floor.name} "
                     f"({floor_index}/{len(selected_floors)})..."
                 )
+                batch_progress.setLabelText(
+                    f"Floor {floor_index}/{len(selected_floors)}: preparing {floor.name}..."
+                )
+                batch_progress.setValue((floor_index - 1) * max(1, int(settings.maximum_aps)))
+                QApplication.processEvents()
                 report = self._run_auto_planner_current_floor(
                     requirements_override=selected_requirements,
                     radio_profile=selected_radio_profile,
                     refresh_ui=False,
                     show_summary=False,
+                    progress_dialog=batch_progress,
+                    progress_value_offset=(floor_index - 1) * max(1, int(settings.maximum_aps)),
+                    progress_floor_index=floor_index,
+                    progress_floor_count=len(selected_floors),
                 )
                 if report is None:
                     message = self.statusBar().currentMessage().lower()
@@ -14006,6 +14808,7 @@ class MainWindow(QMainWindow):
                 reports.append(report)
         finally:
             self.floor = original_floor
+            batch_progress.close()
 
         self._invalidate_interactive_preview_requests()
         self.last_result = None
@@ -14034,7 +14837,8 @@ class MainWindow(QMainWindow):
             floor_lines.append(
                 f"{report.get('floor', 'Floor')}: added {int(report.get('added_aps', 0))} AP(s); "
                 f"coverage {float(report.get('overall_pct', 0.0)):.1f}%; "
-                f"handover {float(report.get('handover_pct', 0.0)):.1f}%"
+                f"handover {float(report.get('handover_pct', 0.0)):.1f}%; "
+                f"inter-floor RF {'included' if report.get('include_inter_floor_rf') else 'excluded'}"
             )
         failure_text = (
             "\n\nNo plan was produced for: " + ", ".join(failed_floors)
@@ -14058,6 +14862,10 @@ class MainWindow(QMainWindow):
         radio_profile: Optional[str] = None,
         refresh_ui: bool = True,
         show_summary: bool = True,
+        progress_dialog: Optional[QProgressDialog] = None,
+        progress_value_offset: int = 0,
+        progress_floor_index: int = 1,
+        progress_floor_count: int = 1,
     ) -> Optional[Dict[str, object]]:
         self._invalidate_interactive_preview_requests()
         self._rssi_result_stale = False
@@ -14077,7 +14885,15 @@ class MainWindow(QMainWindow):
 
         if settings.remove_previous_planned_aps:
             self.aps = [ap for ap in self.aps if not (ap.floor == self.floor.name and ap.planned)]
-        existing = [ap for ap in self.aps if ap.floor == self.floor.name and settings.keep_existing_aps]
+        retained_floor_aps = [ap for ap in self.aps if ap.floor == self.floor.name]
+        existing = [
+            ap for ap in self.aps
+            if settings.keep_existing_aps
+            and (
+                ap.floor == self.floor.name
+                or bool(getattr(settings, "include_inter_floor_rf", False))
+            )
+        ]
         area = self._planner_floor_area()
         if area is None or area.is_empty:
             if settings.planning_area_mode == "spaces":
@@ -14109,14 +14925,19 @@ class MainWindow(QMainWindow):
             wall_tree = STRtree([wall.polygon for wall in walls]) if walls else None
         except Exception:
             wall_tree = None
+        include_inter_floor_rf = bool(getattr(settings, "include_inter_floor_rf", False))
+        wall_indexes = RFEngine._build_wall_indexes(self.floors) if include_inter_floor_rf else None
+        opening_indexes = RFEngine._build_opening_indexes(self.floors) if include_inter_floor_rf else None
 
-        samples = self._planner_grid_points(area, settings.sample_spacing_m, wall_tree, walls, 2500)
-        candidate_location_limit = min(10_000, max(450, int(settings.maximum_aps) * 2))
+        samples = self._planner_grid_points(area, settings.sample_spacing_m, wall_tree, walls, 5000)
+        candidate_location_limit = min(20_000, max(1200, int(settings.maximum_aps) * 40))
         candidates = self._planner_grid_points(
             area, settings.candidate_spacing_m, wall_tree, walls, candidate_location_limit
         )
         # Room representative points supplement the global grid, but boundaries
-        # remain a hard limit even when IfcSpace geometry is present.
+        # remain a hard limit even when IfcSpace geometry is present.  They also
+        # supplement the sample set so small rooms are not stepped over by a
+        # coarse coverage grid.
         for space in self.floor.spaces:
             if space.is_inferred and not bool(getattr(settings, "use_inferred_spaces", True)):
                 continue
@@ -14133,6 +14954,12 @@ class MainWindow(QMainWindow):
                     and not self._planner_point_is_blocked(point, wall_tree, walls)
                 ):
                     candidates.append(candidate)
+                if (
+                    inside_area
+                    and candidate not in samples
+                    and not self._planner_point_is_blocked(point, wall_tree, walls)
+                ):
+                    samples.append(candidate)
             except Exception:
                 pass
         if not samples or not candidates:
@@ -14142,25 +14969,52 @@ class MainWindow(QMainWindow):
         directional = any(not req.antenna_pattern.lower().startswith("omni") for req in requirements)
         azimuths = list(range(0, 360, 45)) if directional else [0]
         candidate_specs = [(x, y, float(az)) for x, y in candidates for az in azimuths]
-        candidate_spec_limit = min(20_000, max(700, int(settings.maximum_aps) * 2))
+        candidate_spec_limit = min(40_000, max(2000, int(settings.maximum_aps) * 80))
         if len(candidate_specs) > candidate_spec_limit:
             indices = np.linspace(0, len(candidate_specs) - 1, candidate_spec_limit, dtype=int)
             candidate_specs = [candidate_specs[int(i)] for i in indices]
 
-        progress = QProgressDialog(
-            f"Building RSSI-driven AP coverage for {self.floor.name}...",
-            "Cancel", 0, max(1, settings.maximum_aps), self
-        )
-        progress.setWindowTitle(f"Predictive AP planner - {self.floor.name}")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.show()
+        progress_owner = progress_dialog is None
+        progress = progress_dialog
+        if progress is None:
+            progress = QProgressDialog(
+                f"Building RSSI-driven AP coverage for {self.floor.name}...",
+                "Cancel", 0, max(1, settings.maximum_aps), self
+            )
+            progress.setWindowTitle(f"Predictive AP planner - {self.floor.name}")
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.show()
+        else:
+            prefix = (
+                f"Floor {int(progress_floor_index)}/{int(progress_floor_count)} - "
+                if int(progress_floor_count) > 1 else ""
+            )
+            progress.setLabelText(f"{prefix}Building RSSI-driven AP coverage for {self.floor.name}...")
+            progress.setValue(int(progress_value_offset))
+            progress.show()
+            QApplication.processEvents()
+
+        def set_progress_label(text: str):
+            prefix = (
+                f"Floor {int(progress_floor_index)}/{int(progress_floor_count)} - "
+                if int(progress_floor_count) > 1 else ""
+            )
+            progress.setLabelText(prefix + text)
+
+        def set_progress_value(value: int):
+            offset = 0 if progress_owner else int(progress_value_offset)
+            progress.setValue(offset + max(0, int(value)))
 
         disconnected = float(self.heatmap_settings.disconnected_rssi_dbm)
         strongest_by_radio = [np.full(len(samples), disconnected, dtype=np.float32) for _ in requirements]
         second_by_radio = [np.full(len(samples), disconnected, dtype=np.float32) for _ in requirements]
         for ap in existing:
-            ap_values = self._planner_ap_rssi_values(ap, requirements, samples, wall_tree, walls)
+            ap_values = self._planner_ap_rssi_values(
+                ap, requirements, samples, wall_tree, walls,
+                include_inter_floor=include_inter_floor_rf,
+                wall_indexes=wall_indexes, opening_indexes=opening_indexes,
+            )
             updated = [
                 self._planner_insert_rssi(strongest, second, values)
                 for strongest, second, values in zip(strongest_by_radio, second_by_radio, ap_values)
@@ -14194,7 +15048,11 @@ class MainWindow(QMainWindow):
                 temp_ap = make_candidate_ap(float(x), float(y), float(azimuth))
                 values = [
                     candidate_values.astype(np.float16)
-                    for candidate_values in self._planner_ap_rssi_values(temp_ap, requirements, samples, wall_tree, walls)
+                    for candidate_values in self._planner_ap_rssi_values(
+                        temp_ap, requirements, samples, wall_tree, walls,
+                        include_inter_floor=include_inter_floor_rf,
+                        wall_indexes=wall_indexes, opening_indexes=opening_indexes,
+                    )
                 ]
                 cached = (temp_ap, values)
                 candidate_cache[index] = cached
@@ -14215,7 +15073,7 @@ class MainWindow(QMainWindow):
             effective_clients = max(1.0, settings.clients_per_ap * max(0.05, 1.0 - average_occupancy / 100.0))
             capacity_ap_count = int(math.ceil(settings.expected_clients / effective_clients)) if settings.expected_clients > 0 else 0
             selected: List[Tuple[AccessPoint, List[np.ndarray]]] = []
-            positions = [(ap.x, ap.y) for ap in existing]
+            positions = [(ap.x, ap.y) for ap in retained_floor_aps]
             other_floor_positions = [
                 (float(ap.x), float(ap.y))
                 for ap in self.aps
@@ -14225,6 +15083,7 @@ class MainWindow(QMainWindow):
             vertical_hard_overlap_m = min(0.75, vertical_avoidance_m * 0.25)
             remaining = set(range(len(candidate_specs)))
             sample_points = np.asarray(samples, dtype=np.float32)
+            candidate_spec_array = np.asarray(candidate_specs, dtype=np.float32)
 
             def coverage_fraction_now() -> float:
                 return float(np.count_nonzero(overall)) / max(1, len(overall))
@@ -14296,16 +15155,99 @@ class MainWindow(QMainWindow):
                     return []
                 if not focus_indices:
                     return list(remaining)[:limit]
-                focus = sample_points[focus_indices]
-                scored: List[Tuple[float, int]] = []
-                for index in remaining:
-                    x, y, _ = candidate_specs[index]
-                    dx = focus[:, 0] - float(x)
-                    dy = focus[:, 1] - float(y)
-                    distance = float(np.min(np.sqrt(dx * dx + dy * dy)))
-                    scored.append((distance, index))
-                scored.sort(key=lambda item: item[0])
-                return [index for _, index in scored[:limit]]
+                remaining_indices = np.fromiter(remaining, dtype=np.int64, count=len(remaining))
+                if remaining_indices.size == 0:
+                    return []
+                focus = sample_points[focus_indices, :2].astype(np.float32, copy=False)
+                points = candidate_spec_array[remaining_indices, :2]
+                dx = points[:, None, 0] - focus[None, :, 0]
+                dy = points[:, None, 1] - focus[None, :, 1]
+                distances = np.min(dx * dx + dy * dy, axis=1)
+                take = min(max(1, int(limit)), int(remaining_indices.size))
+                if take < remaining_indices.size:
+                    chosen = np.argpartition(distances, take - 1)[:take]
+                    chosen = chosen[np.argsort(distances[chosen])]
+                else:
+                    chosen = np.argsort(distances)
+                return [int(remaining_indices[int(i)]) for i in chosen]
+
+            def candidate_subset_rssi(index: int, subset_indices: Sequence[int]) -> Tuple[AccessPoint, List[np.ndarray]]:
+                x, y, azimuth = candidate_specs[index]
+                temp_ap = make_candidate_ap(float(x), float(y), float(azimuth))
+                subset_samples = [samples[int(i)] for i in subset_indices]
+                values = [
+                    candidate_values.astype(np.float32, copy=False)
+                    for candidate_values in self._planner_ap_rssi_values(
+                        temp_ap, requirements, subset_samples, wall_tree, walls,
+                        include_inter_floor=include_inter_floor_rf,
+                        wall_indexes=wall_indexes, opening_indexes=opening_indexes,
+                    )
+                ]
+                return temp_ap, values
+
+            def score_candidate_subset(
+                candidate_ap: AccessPoint,
+                candidate_rssi: List[np.ndarray],
+                subset_indices: Sequence[int],
+                min_distance: float,
+                vertical_distance: float,
+                coverage_needed: bool,
+                handover_needed: bool,
+                capacity_needed: bool,
+            ) -> float:
+                if not subset_indices:
+                    return -float("inf")
+                subset = np.asarray([int(i) for i in subset_indices], dtype=np.int64)
+                coverage_gain = 0.0
+                handover_gain = 0.0
+                newly_covered_masks: List[np.ndarray] = []
+                newly_handover_masks: List[np.ndarray] = []
+                for req, current_strongest, current_second, values in zip(
+                    requirements, strongest_by_radio, second_by_radio, candidate_rssi
+                ):
+                    before_strongest = np.asarray(current_strongest[subset], dtype=np.float32)
+                    before_second = np.asarray(current_second[subset], dtype=np.float32)
+                    candidate_values = np.asarray(values, dtype=np.float32)
+                    after_strongest = np.maximum(before_strongest, candidate_values)
+                    after_second = np.where(
+                        candidate_values >= before_strongest,
+                        before_strongest,
+                        np.maximum(before_second, candidate_values),
+                    )
+                    threshold = float(req.minimum_rssi_dbm)
+                    handover_threshold = threshold - float(settings.handover_margin_db)
+                    before_deficit = np.maximum(0.0, threshold - before_strongest)
+                    after_deficit = np.maximum(0.0, threshold - after_strongest)
+                    before_handover = np.maximum(0.0, handover_threshold - before_second)
+                    after_handover = np.maximum(0.0, handover_threshold - after_second)
+                    coverage_gain += float(np.sum(before_deficit - after_deficit))
+                    handover_gain += float(np.sum(before_handover - after_handover))
+                    newly_covered_masks.append((after_strongest >= threshold) & (before_strongest < threshold))
+                    newly_handover_masks.append((after_second >= handover_threshold) & (before_second < handover_threshold))
+
+                if str(settings.coverage_mode).lower() == "any":
+                    newly_covered = int(np.count_nonzero(np.logical_or.reduce(newly_covered_masks))) if newly_covered_masks else 0
+                    newly_handover = int(np.count_nonzero(np.logical_or.reduce(newly_handover_masks))) if newly_handover_masks else 0
+                else:
+                    newly_covered = int(sum(np.count_nonzero(mask) for mask in newly_covered_masks))
+                    newly_handover = int(sum(np.count_nonzero(mask) for mask in newly_handover_masks))
+                if (coverage_needed or handover_needed) and coverage_gain <= 1e-6 and handover_gain <= 1e-6:
+                    return -float("inf")
+                score = 0.0
+                if coverage_needed:
+                    score += coverage_gain * 20.0 + newly_covered * 250.0
+                else:
+                    score += coverage_gain * 2.0
+                if handover_needed:
+                    score += handover_gain * 12.0 + newly_handover * 160.0
+                elif settings.handover_enabled:
+                    score += handover_gain
+                if capacity_needed and not coverage_needed and not handover_needed:
+                    score += min_distance * 10.0
+                else:
+                    score += min_distance * 0.01
+                score -= vertical_spacing_penalty(vertical_distance)
+                return score
 
             def insert_candidate_state(candidate_rssi: List[np.ndarray]):
                 inserted = [
@@ -14410,8 +15352,8 @@ class MainWindow(QMainWindow):
                     candidate_ap, candidate_rssi = candidate_record(seed_index)
                     state = insert_candidate_state(candidate_rssi)
                     apply_selected(seed_index, candidate_ap, candidate_rssi, state)
-                    progress.setLabelText("Placed the first AP and calculated RSSI extremities...")
-                    progress.setValue(len(selected))
+                    set_progress_label("Placed the first AP and calculated RSSI extremities...")
+                    set_progress_value(len(selected))
                     QApplication.processEvents()
                     continue
 
@@ -14420,40 +15362,90 @@ class MainWindow(QMainWindow):
                 best_state = None
                 best_record = None
                 focus_indices = focus_sample_indices(coverage_needed, handover_needed, capacity_needed)
-                shortlist = nearby_candidate_indices(focus_indices)
+                scan_limit = max(48, min(600, int(getattr(settings, "planner_candidate_scan_limit", 240) or 240)))
+                full_eval_limit = max(4, min(80, int(getattr(settings, "planner_full_evaluation_limit", 18) or 18)))
+                shortlist = nearby_candidate_indices(focus_indices, limit=scan_limit)
                 if not shortlist:
                     shortlist = list(remaining)[:180]
-                for scan_index, record_index in enumerate(shortlist, start=1):
-                    if progress.wasCanceled():
-                        raise RuntimeError("Predictive AP planning cancelled")
-                    if scan_index == 1 or scan_index % 20 == 0 or scan_index == len(shortlist):
-                        progress.setLabelText(
-                            f"AP {len(selected) + 1}: checking {scan_index}/{len(shortlist)} locations near weakest RSSI samples..."
+                scanned_indices = set()
+
+                def scan_shortlist(indices: Sequence[int], phase_label: str):
+                    nonlocal best_index, best_score, best_state, best_record
+                    ranked: List[Tuple[float, int, AccessPoint]] = []
+                    neutral: List[Tuple[float, int, AccessPoint]] = []
+                    focus_for_scan = list(focus_indices)
+                    if not focus_for_scan:
+                        focus_for_scan = list(range(min(len(samples), 18)))
+                    for scan_index, record_index in enumerate(indices, start=1):
+                        if record_index in scanned_indices:
+                            continue
+                        scanned_indices.add(record_index)
+                        if progress.wasCanceled():
+                            raise RuntimeError("Predictive AP planning cancelled")
+                        if scan_index == 1 or scan_index % 20 == 0 or scan_index == len(indices):
+                            set_progress_label(
+                                f"AP {len(selected) + 1}: checking {scan_index}/{len(indices)} {phase_label}..."
+                            )
+                            set_progress_value(len(selected))
+                            QApplication.processEvents()
+                        x, y, azimuth = candidate_specs[record_index]
+                        candidate_ap = make_candidate_ap(float(x), float(y), float(azimuth))
+                        spacing_ok, min_distance, vertical_distance = candidate_spacing_ok(candidate_ap)
+                        if not spacing_ok:
+                            continue
+                        neutral.append((0.0, record_index, candidate_ap))
+                        try:
+                            subset_ap, subset_rssi = candidate_subset_rssi(record_index, focus_for_scan)
+                            quick_score = score_candidate_subset(
+                                subset_ap, subset_rssi, focus_for_scan, min_distance, vertical_distance,
+                                coverage_needed, handover_needed, capacity_needed,
+                            )
+                        except Exception:
+                            quick_score = -float("inf")
+                        if not math.isfinite(quick_score):
+                            continue
+                        ranked.append((quick_score, record_index, candidate_ap))
+                    if not ranked:
+                        ranked = neutral[:full_eval_limit]
+                    if not ranked:
+                        return
+                    ranked.sort(key=lambda item: item[0], reverse=True)
+                    for eval_index, (_quick_score, record_index, _candidate_ap) in enumerate(ranked[:full_eval_limit], start=1):
+                        if progress.wasCanceled():
+                            raise RuntimeError("Predictive AP planning cancelled")
+                        if eval_index == 1 or eval_index == len(ranked[:full_eval_limit]):
+                            set_progress_label(
+                                f"AP {len(selected) + 1}: fully evaluating {eval_index}/{min(full_eval_limit, len(ranked))} shortlisted {phase_label}..."
+                            )
+                            set_progress_value(len(selected))
+                            QApplication.processEvents()
+                        candidate_ap, candidate_rssi = candidate_record(record_index)
+                        spacing_ok, min_distance, vertical_distance = candidate_spacing_ok(candidate_ap)
+                        if not spacing_ok:
+                            continue
+                        score, state = score_candidate(
+                            candidate_ap, candidate_rssi, min_distance, vertical_distance,
+                            coverage_needed, handover_needed, capacity_needed,
                         )
-                        progress.setValue(len(selected))
-                        QApplication.processEvents()
-                    candidate_ap, candidate_rssi = candidate_record(record_index)
-                    spacing_ok, min_distance, vertical_distance = candidate_spacing_ok(candidate_ap)
-                    if not spacing_ok:
-                        continue
-                    score, state = score_candidate(
-                        candidate_ap, candidate_rssi, min_distance, vertical_distance,
-                        coverage_needed, handover_needed, capacity_needed,
-                    )
-                    if score > best_score:
-                        best_score = score
-                        best_index = record_index
-                        best_state = state
-                        best_record = (candidate_ap, candidate_rssi)
+                        if score > best_score:
+                            best_score = score
+                            best_index = record_index
+                            best_state = state
+                            best_record = (candidate_ap, candidate_rssi)
+
+                scan_shortlist(shortlist, "locations near weakest RSSI samples")
+                if best_index is None and remaining:
+                    fallback = nearby_candidate_indices(focus_indices, limit=max(scan_limit, 360)) or list(remaining)[:max(scan_limit, 360)]
+                    scan_shortlist(fallback, "spacing-valid fallback locations")
 
                 if best_index is None or best_state is None or best_record is None:
                     break
                 candidate_ap, candidate_rssi = best_record
                 apply_selected(best_index, candidate_ap, candidate_rssi, best_state)
-                progress.setLabelText(
+                set_progress_label(
                     f"Selected {len(selected)} AP(s): coverage {coverage_fraction_now() * 100.0:.1f}%"
                 )
-                progress.setValue(len(selected))
+                set_progress_value(len(selected))
                 QApplication.processEvents()
 
             new_aps: List[AccessPoint] = []
@@ -14475,15 +15467,18 @@ class MainWindow(QMainWindow):
             )
 
         except RuntimeError as exc:
-            progress.close()
+            if progress_owner:
+                progress.close()
             self.statusBar().showMessage(str(exc))
             return
         except Exception as exc:
-            progress.close()
+            if progress_owner:
+                progress.close()
             QMessageBox.warning(self, "Predictive AP planner failed", str(exc))
             return
         finally:
-            progress.close()
+            if progress_owner:
+                progress.close()
 
         self._invalidate_interactive_preview_requests()
         self.last_result = None
@@ -14523,6 +15518,7 @@ class MainWindow(QMainWindow):
             f"Added {len(new_aps)} RSSI-predicted AP(s) on {self.floor.name}.\n"
             f"AP radio profile: {selected_radio_profile}.\n"
             f"Planning area: {getattr(self, '_planner_area_source_label', 'selected floor geometry')}.\n"
+            f"Inter-floor RF: {'included' if include_inter_floor_rf else 'excluded'}.\n"
             f"Overall coverage ({'every selected radio' if settings.coverage_mode == 'all' else 'any selected radio'}): {overall_pct:.1f}%\n"
             + handover_summary
             + f"Effective client capacity after {average_occupancy:.1f}% average spectrum occupancy: approximately {available_capacity} clients.\n\n"
@@ -14542,6 +15538,7 @@ class MainWindow(QMainWindow):
             "planning_area": str(getattr(
                 self, "_planner_area_source_label", "selected floor geometry"
             )),
+            "include_inter_floor_rf": bool(include_inter_floor_rf),
             "band_lines": list(band_lines),
             "warnings": list(warnings),
             "summary": summary_text,
@@ -15320,6 +16317,12 @@ class MainWindow(QMainWindow):
             bool(self.heatmap_settings.ignore_results_outside_planner_boundaries)
         )
         self.boundary_result_filter_action.blockSignals(False)
+        self.synthetic_floor_entity_enabled.blockSignals(True)
+        self.synthetic_floor_entity_enabled.setChecked(bool(self.heatmap_settings.enable_synthetic_floor_entities))
+        self.synthetic_floor_entity_enabled.blockSignals(False)
+        self.synthetic_floor_thickness.blockSignals(True)
+        self.synthetic_floor_thickness.setValue(float(self.heatmap_settings.synthetic_floor_entity_thickness_m))
+        self.synthetic_floor_thickness.blockSignals(False)
         selected_floor = str(data.get("selected_floor", ""))
         self._suppress_saved_result_restore = True
         try:
@@ -16628,9 +17631,9 @@ class MainWindow(QMainWindow):
         self.clear_ap_action.setEnabled(not loading)
         self.load_pattern_action.setEnabled(not loading)
         for action_name in (
-            "planner_settings_action", "propagation_settings_action", "predict_aps_action", "bulk_ap_action", "draw_wall_action", "bulk_attenuation_action", "draw_space_action", "select_ap_spaces_action", "inferred_space_interaction_action",
+            "planner_settings_action", "propagation_settings_action", "predict_aps_action", "bulk_ap_action", "draw_wall_action", "bulk_attenuation_action", "attenuation_review_action", "draw_space_action", "select_ap_spaces_action", "inferred_space_interaction_action",
             "draw_boundary_action", "draw_polygon_boundary_action", "suggest_external_boundary_action",
-            "create_spaces_action", "clear_inferred_spaces_action", "clear_boundaries_action", "ifc_origin_action",
+            "create_spaces_action", "clear_inferred_spaces_action", "clear_boundaries_action", "ifc_origin_action", "building_3d_view_action",
             "rotate_left_action", "rotate_right_action", "reset_rotation_action", "save_plan_action", "load_plan_action",
         ):
             action = getattr(self, action_name, None)
@@ -17423,6 +18426,34 @@ class MainWindow(QMainWindow):
         if self.last_result is not None:
             self.draw_floor()
 
+    def _synthetic_floor_entity_changed(self):
+        if not hasattr(self, "synthetic_floor_entity_enabled"):
+            return
+        self.heatmap_settings.enable_synthetic_floor_entities = bool(self.synthetic_floor_entity_enabled.isChecked())
+        self.heatmap_settings.synthetic_floor_entity_thickness_m = max(0.01, float(self.synthetic_floor_thickness.value()))
+        self._invalidate_interactive_preview_requests()
+        self.last_result = None
+        self.rssi_results_by_frequency = {}
+        self._rssi_memory_results.clear()
+        state = "enabled" if self.heatmap_settings.enable_synthetic_floor_entities else "disabled"
+        self.statusBar().showMessage(
+            f"Synthetic floor entities {state}; thickness {self.heatmap_settings.synthetic_floor_entity_thickness_m:.2f} m"
+        )
+
+    def _slab_attenuation_ui_changed(self):
+        if not hasattr(self, "slab_att_24"):
+            return
+        self._sync_slab_attenuation_from_ui()
+        self._invalidate_interactive_preview_requests()
+        self.last_result = None
+        self.rssi_results_by_frequency = {}
+        self._rssi_memory_results.clear()
+        if self.floor is not None:
+            self.statusBar().showMessage(
+                f"Updated floor entity attenuation for {self.floor.name}: "
+                f"{self.slab_att_24.value():.1f} / {self.slab_att_5.value():.1f} / {self.slab_att_6.value():.1f} dB"
+            )
+
     def load_heatmap_settings(self):
         path, _ = QFileDialog.getOpenFileName(self, "Load heatmap settings", "rf_heatmap_settings.json", "JSON files (*.json);;All files (*.*)")
         if not path:
@@ -17436,6 +18467,14 @@ class MainWindow(QMainWindow):
                 bool(self.heatmap_settings.ignore_results_outside_planner_boundaries)
             )
             self.boundary_result_filter_action.blockSignals(False)
+            if hasattr(self, "synthetic_floor_entity_enabled"):
+                self.synthetic_floor_entity_enabled.blockSignals(True)
+                self.synthetic_floor_entity_enabled.setChecked(bool(self.heatmap_settings.enable_synthetic_floor_entities))
+                self.synthetic_floor_entity_enabled.blockSignals(False)
+            if hasattr(self, "synthetic_floor_thickness"):
+                self.synthetic_floor_thickness.blockSignals(True)
+                self.synthetic_floor_thickness.setValue(float(self.heatmap_settings.synthetic_floor_entity_thickness_m))
+                self.synthetic_floor_thickness.blockSignals(False)
             self._clear_rssi_results()
             self.min_client_rssi.blockSignals(True)
             self.min_client_rssi.setValue(self.heatmap_settings.minimum_client_rssi_dbm)
@@ -17862,11 +18901,11 @@ class MainWindow(QMainWindow):
                 "align_ifc_action", "clear_dxf_action", "clear_ap_action",
                 "planner_settings_action", "propagation_settings_action",
                 "performance_settings_action", "predict_aps_action", "bulk_ap_action",
-                "draw_wall_action", "bulk_attenuation_action", "draw_space_action",
+                "draw_wall_action", "bulk_attenuation_action", "attenuation_review_action", "draw_space_action",
                 "select_ap_spaces_action", "inferred_space_interaction_action",
                 "draw_boundary_action", "draw_polygon_boundary_action",
                 "suggest_external_boundary_action", "create_spaces_action",
-                "clear_inferred_spaces_action", "clear_boundaries_action",
+                "clear_inferred_spaces_action", "clear_boundaries_action", "building_3d_view_action",
                 "rotate_left_action", "rotate_right_action", "reset_rotation_action",
                 "load_plan_action",
             )

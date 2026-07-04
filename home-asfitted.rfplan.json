@@ -1,0 +1,386 @@
+{
+  "format": "rf-attenuation-plan",
+  "version": 9,
+  "ifc_paths": [
+    "C:\\Users\\tombe\\Desktop\\House Revit\\House.ifc"
+  ],
+  "selected_floor": "First Floor",
+  "view_rotation_deg": 0.0,
+  "ifc_alignment": {
+    "dx": 0.0,
+    "dy": 0.0,
+    "rotation_deg": 0.0,
+    "scale": 1.0
+  },
+  "dxf_alignment": null,
+  "auto_planner_settings": {
+    "target_coverage_percent": 95.0,
+    "coverage_mode": "all",
+    "handover_enabled": true,
+    "target_handover_percent": 20.0,
+    "handover_margin_db": 3.0,
+    "prefer_non_overlapping_handover_channels": true,
+    "sample_spacing_m": 3.0,
+    "candidate_spacing_m": 6.0,
+    "minimum_ap_spacing_m": 8.0,
+    "maximum_aps": 64,
+    "planning_area_mode": "auto",
+    "wall_footprint_margin_m": 0.0,
+    "use_inferred_spaces": true,
+    "expected_clients": 250,
+    "clients_per_ap": 50,
+    "keep_existing_aps": true,
+    "remove_previous_planned_aps": true,
+    "include_inter_floor_rf": false,
+    "ap_radio_profile": "Wi-Fi 7 tri-band",
+    "radio_requirements": [
+      {
+        "name": "2.4 GHz",
+        "enabled": true,
+        "frequency_mhz": 2400.0,
+        "tx_power_dbm": 13.0,
+        "antenna_pattern": "Omni ceiling AP",
+        "antenna_gain_dbi": 0.0,
+        "channel_width_mhz": 20.0,
+        "channels": [
+          "1"
+        ],
+        "spectrum_occupancy_percent": 25.0,
+        "minimum_rssi_dbm": -75.0,
+        "cutoff_radius_m": 45.0
+      },
+      {
+        "name": "5 GHz",
+        "enabled": true,
+        "frequency_mhz": 5000.0,
+        "tx_power_dbm": 20.0,
+        "antenna_pattern": "Omni ceiling AP",
+        "antenna_gain_dbi": 0.0,
+        "channel_width_mhz": 160.0,
+        "channels": [
+          "36"
+        ],
+        "spectrum_occupancy_percent": 15.0,
+        "minimum_rssi_dbm": -75.0,
+        "cutoff_radius_m": 35.0
+      },
+      {
+        "name": "6 GHz",
+        "enabled": true,
+        "frequency_mhz": 6000.0,
+        "tx_power_dbm": 18.0,
+        "antenna_pattern": "Omni ceiling AP",
+        "antenna_gain_dbi": 0.0,
+        "channel_width_mhz": 320.0,
+        "channels": [
+          "5"
+        ],
+        "spectrum_occupancy_percent": 8.0,
+        "minimum_rssi_dbm": -75.0,
+        "cutoff_radius_m": 30.0
+      }
+    ]
+  },
+  "custom_radio_profiles": {},
+  "propagation_model": {
+    "ignore_results_outside_planner_boundaries": false,
+    "enable_multipath_reflections": true,
+    "max_reflection_order": 1,
+    "max_reflection_surfaces": 6,
+    "max_reflection_paths": 8,
+    "reflection_search_radius_m": 18.0,
+    "minimum_reflection_coefficient": 0.025,
+    "enable_corner_diffraction": true,
+    "max_diffraction_paths": 3,
+    "diffraction_search_radius_m": 5.0,
+    "minimum_diffraction_loss_db": 5.0,
+    "enable_small_scale_fading": true,
+    "small_scale_fading_sigma_db": 1.5,
+    "fading_correlation_distance_m": 0.75,
+    "fading_seed": 1729,
+    "calculate_delay_spread": true,
+    "combined_ap_mode": "strongest",
+    "enable_synthetic_floor_entities": true,
+    "synthetic_floor_entity_thickness_m": 0.3,
+    "reflection_material_properties": {
+      "default": {
+        "relative_permittivity": 4.0,
+        "conductivity_s_per_m": 0.02,
+        "roughness_m": 0.003,
+        "reflection_scale": 1.0
+      },
+      "concrete": {
+        "relative_permittivity": 6.0,
+        "conductivity_s_per_m": 0.05,
+        "roughness_m": 0.006,
+        "reflection_scale": 1.0
+      },
+      "brick": {
+        "relative_permittivity": 4.4,
+        "conductivity_s_per_m": 0.03,
+        "roughness_m": 0.006,
+        "reflection_scale": 0.95
+      },
+      "masonry": {
+        "relative_permittivity": 5.0,
+        "conductivity_s_per_m": 0.04,
+        "roughness_m": 0.007,
+        "reflection_scale": 0.95
+      },
+      "plasterboard": {
+        "relative_permittivity": 2.5,
+        "conductivity_s_per_m": 0.01,
+        "roughness_m": 0.003,
+        "reflection_scale": 0.85
+      },
+      "partition": {
+        "relative_permittivity": 2.5,
+        "conductivity_s_per_m": 0.01,
+        "roughness_m": 0.003,
+        "reflection_scale": 0.85
+      },
+      "glass": {
+        "relative_permittivity": 6.5,
+        "conductivity_s_per_m": 0.004,
+        "roughness_m": 0.001,
+        "reflection_scale": 1.0
+      },
+      "metal": {
+        "relative_permittivity": 80.0,
+        "conductivity_s_per_m": 1000000.0,
+        "roughness_m": 0.001,
+        "reflection_scale": 1.0
+      },
+      "steel": {
+        "relative_permittivity": 80.0,
+        "conductivity_s_per_m": 1000000.0,
+        "roughness_m": 0.001,
+        "reflection_scale": 1.0
+      },
+      "timber": {
+        "relative_permittivity": 2.0,
+        "conductivity_s_per_m": 0.01,
+        "roughness_m": 0.004,
+        "reflection_scale": 0.75
+      },
+      "wood": {
+        "relative_permittivity": 2.0,
+        "conductivity_s_per_m": 0.01,
+        "roughness_m": 0.004,
+        "reflection_scale": 0.75
+      }
+    }
+  },
+  "rf_performance": {
+    "enable_ifc_multiprocessing": true,
+    "max_ifc_loader_processes": 0,
+    "max_parallel_huge_ifc_processes": 1,
+    "enable_rf_multiprocessing": true,
+    "max_rf_worker_processes": 0,
+    "rf_multiprocessing_min_points": 5000,
+    "rf_tile_rows": 16,
+    "rf_tiles_per_worker": 2,
+    "reuse_rf_process_pool": true,
+    "rf_worker_index_cache_entries": 2,
+    "contour_interpolation_factor": 4,
+    "calculation_profile": "detailed",
+    "enable_adaptive_grid": true,
+    "coarse_resolution_m": 1.0,
+    "gradient_threshold_db_per_m": 4.0,
+    "threshold_margin_db": 2.0,
+    "geometry_buffer_m": 1.5,
+    "ap_refine_radius_m": 6.0,
+    "enable_per_ap_cache": true,
+    "per_ap_cache_entries": 192,
+    "per_ap_cache_mb": 768,
+    "reuse_path_geometry_across_frequencies": true,
+    "precompute_reflection_candidates_per_tile": true,
+    "enable_tile_influence_pruning": true,
+    "tile_influence_margin_db": 8.0,
+    "enable_tile_local_geometry": true,
+    "multipath_relative_power_cutoff_db": 30.0,
+    "enable_numba_kernels": true,
+    "use_shared_memory_results": true,
+    "enable_opencl_gpu": true,
+    "force_gpu_when_available": true,
+    "opencl_device_preference": "auto",
+    "opencl_allow_cpu_device": false,
+    "opencl_min_work_items": 100000,
+    "cuda_chunk_points": 1048576,
+    "cuda_memory_fraction": 0.45,
+    "cuda_block_segment_threshold": 48,
+    "cuda_queue_depth": 3,
+    "cuda_max_barrier_checks_per_launch": 200000000,
+    "cuda_blocks_per_sm": 24,
+    "numba_chunk_points": 262144,
+    "opencl_accelerate_influence": true,
+    "opencl_accelerate_field_combine": true,
+    "opencl_accelerate_resampling": true,
+    "opencl_accelerate_raster": true,
+    "progressive_heatmap_updates": true,
+    "progressive_update_percent": 20,
+    "heatmap_render_mode": "raster_contours",
+    "interactive_preview_enabled": true,
+    "interactive_preview_delay_ms": 350,
+    "interactive_preview_resolution_m": 3.0,
+    "enable_quick_rssi_cutoff": false,
+    "quick_rssi_cutoff_dbm": -80.0,
+    "save_simulation_results_to_disk": true,
+    "load_saved_simulation_results": true
+  },
+  "planner_boundaries": [],
+  "excluded_ifc_elements": [],
+  "selected_ap_spaces": [],
+  "user_spaces": [],
+  "inferred_spaces": [],
+  "access_points": [
+    {
+      "name": "AP-1",
+      "x": 0.11549402665809633,
+      "y": -2.8873506664524085,
+      "floor": "Foundation Top",
+      "tx_power_dbm": 20.0,
+      "frequency_mhz": 2400.0,
+      "reference_loss_db_at_1m": 40.0,
+      "path_loss_exponent": 2.2,
+      "antenna_pattern": "Omni ceiling AP",
+      "azimuth_deg": 0.0,
+      "downtilt_deg": 0.0,
+      "mount_height_m": 2.7,
+      "rx_height_m": 1.2,
+      "ap_type": "Ceiling AP",
+      "radio_profile": "Wi-Fi 6 dual-band",
+      "max_clients": 50,
+      "planned": false,
+      "radios": [
+        {
+          "name": "2.4 GHz",
+          "frequency_mhz": 2400.0,
+          "tx_power_dbm": 20.0,
+          "antenna_pattern": "Omni ceiling AP",
+          "enabled": true,
+          "cutoff_radius_m": 45.0,
+          "antenna_gain_dbi": 0.0,
+          "channel": "1",
+          "channel_width_mhz": 20.0,
+          "spectrum_occupancy_percent": 30.0
+        },
+        {
+          "name": "5 GHz",
+          "frequency_mhz": 5000.0,
+          "tx_power_dbm": 20.0,
+          "antenna_pattern": "Omni ceiling AP",
+          "enabled": true,
+          "cutoff_radius_m": 35.0,
+          "antenna_gain_dbi": 0.0,
+          "channel": "36",
+          "channel_width_mhz": 80.0,
+          "spectrum_occupancy_percent": 18.0
+        }
+      ]
+    },
+    {
+      "name": "AP-2",
+      "x": 0.2472962376359702,
+      "y": 2.059910822686649,
+      "floor": "First Floor",
+      "tx_power_dbm": 20.0,
+      "frequency_mhz": 2400.0,
+      "reference_loss_db_at_1m": 40.0,
+      "path_loss_exponent": 2.2,
+      "antenna_pattern": "Omni ceiling AP",
+      "azimuth_deg": 0.0,
+      "downtilt_deg": 0.0,
+      "mount_height_m": 2.7,
+      "rx_height_m": 1.2,
+      "ap_type": "Ceiling AP",
+      "radio_profile": "Wi-Fi 7 tri-band",
+      "max_clients": 50,
+      "planned": false,
+      "radios": [
+        {
+          "name": "2.4 GHz",
+          "frequency_mhz": 2400.0,
+          "tx_power_dbm": 20.0,
+          "antenna_pattern": "Omni ceiling AP",
+          "enabled": true,
+          "cutoff_radius_m": 45.0,
+          "antenna_gain_dbi": 0.0,
+          "channel": "1",
+          "channel_width_mhz": 20.0,
+          "spectrum_occupancy_percent": 25.0
+        },
+        {
+          "name": "5 GHz",
+          "frequency_mhz": 5000.0,
+          "tx_power_dbm": 20.0,
+          "antenna_pattern": "Omni ceiling AP",
+          "enabled": true,
+          "cutoff_radius_m": 35.0,
+          "antenna_gain_dbi": 0.0,
+          "channel": "36",
+          "channel_width_mhz": 160.0,
+          "spectrum_occupancy_percent": 15.0
+        },
+        {
+          "name": "6 GHz",
+          "frequency_mhz": 6000.0,
+          "tx_power_dbm": 20.0,
+          "antenna_pattern": "Omni ceiling AP",
+          "enabled": true,
+          "cutoff_radius_m": 30.0,
+          "antenna_gain_dbi": 0.0,
+          "channel": "5",
+          "channel_width_mhz": 320.0,
+          "spectrum_occupancy_percent": 8.0
+        }
+      ]
+    }
+  ],
+  "user_walls": [],
+  "wall_overrides": [],
+  "element_overrides": [],
+  "simulation_results": {
+    "format": "rf-simulation-result-set",
+    "version": 1,
+    "directory": "home-asfitted_rf_results",
+    "files": [
+      {
+        "floor": "First Floor",
+        "frequency_mhz": 2400.0,
+        "file": "floor_First_Floor__frequency_2400MHz.rfsim.npz",
+        "signature": "3210a8b0f7b616b55639b6f4dcd012ff"
+      },
+      {
+        "floor": "First Floor",
+        "frequency_mhz": 5000.0,
+        "file": "floor_First_Floor__frequency_5000MHz.rfsim.npz",
+        "signature": "6bf5c3d4951f3f56096e535124e6c995"
+      },
+      {
+        "floor": "First Floor",
+        "frequency_mhz": 6000.0,
+        "file": "floor_First_Floor__frequency_6000MHz.rfsim.npz",
+        "signature": "bd78d5e680d581b258f1beea48175c04"
+      },
+      {
+        "floor": "Foundation Top",
+        "frequency_mhz": 2400.0,
+        "file": "floor_Foundation_Top__frequency_2400MHz.rfsim.npz",
+        "signature": "4e92a926ce86e118f85cad6a75c757ef"
+      },
+      {
+        "floor": "Foundation Top",
+        "frequency_mhz": 5000.0,
+        "file": "floor_Foundation_Top__frequency_5000MHz.rfsim.npz",
+        "signature": "b1d28a8fe79494b54c193cac05f9c6b6"
+      },
+      {
+        "floor": "Foundation Top",
+        "frequency_mhz": 6000.0,
+        "file": "floor_Foundation_Top__frequency_6000MHz.rfsim.npz",
+        "signature": "0afb9f508b5cd4b5d2a619b2da260342"
+      }
+    ]
+  }
+}

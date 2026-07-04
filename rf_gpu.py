@@ -1127,6 +1127,8 @@ _PREPARED_INPUT_CACHE_MAX = 8
 
 def _prepared_array_signature(array: np.ndarray) -> Tuple[Any, ...]:
     contiguous = np.ascontiguousarray(array)
+    if contiguous.size == 0:
+        return (contiguous.shape, contiguous.dtype.str, contiguous.nbytes, 0, 0)
     raw = memoryview(contiguous).cast("B")
     # Two inexpensive checksums make stale/colliding geometry entries
     # vanishingly unlikely while remaining much cheaper than Python AP×segment
