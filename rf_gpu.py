@@ -294,6 +294,7 @@ if cuda is not None:
 
     @cuda.jit(cache=True, fastmath=True)
     def _cuda_direct_rssi_paths(xs, ys, valid, ap_data, segments, segment_indices, segment_offsets,
+                                receiver_z, terrain_z, terrain_enabled, ground_loss_db, terrain_clearance,
                                 disconnected, start_gid, work_count, path_rssi, cols, rows):
         """One CUDA thread per AP/point path, ordered AP-major.
 
@@ -325,6 +326,10 @@ if cuda is not None:
             path_loss_factor = ap_data[ai, 5]
             cutoff2 = ap_data[ai, 6]
             dz2 = ap_data[ai, 7]
+            if terrain_enabled != 0:
+                rz = receiver_z[gid]
+                z_delta = rz - az
+                dz2 = z_delta * z_delta
             dx = x - ax
             dy = y - ay
             d2xy = dx * dx + dy * dy
@@ -361,6 +366,35 @@ if cuda is not None:
                     zhit = az + z_delta * t
                     if zhit >= segments[si, 4] and zhit <= segments[si, 5]:
                         wall_loss += segments[si, 6]
+            if terrain_enabled != 0 and ground_loss_db > 0.0:
+                spacing_x = abs(xs[1] - xs[0]) if cols > 1 else 2.0
+                spacing_y = abs(ys[1] - ys[0]) if rows > 1 else 2.0
+                spacing = spacing_x if spacing_x < spacing_y else spacing_y
+                if spacing < 1.0:
+                    spacing = 1.0
+                steps = int(math.ceil(math.sqrt(d2xy) / spacing))
+                if steps < 4:
+                    steps = 4
+                elif steps > 32:
+                    steps = 32
+                for step in range(1, steps):
+                    tline = step / steps
+                    sx = ax + dx * tline
+                    sy = ay + dy * tline
+                    tx = int(math.floor(((sx - xs[0]) / (xs[cols - 1] - xs[0]) * (cols - 1)) + 0.5)) if cols > 1 else 0
+                    ty = int(math.floor(((sy - ys[0]) / (ys[rows - 1] - ys[0]) * (rows - 1)) + 0.5)) if rows > 1 else 0
+                    if tx < 0:
+                        tx = 0
+                    elif tx >= cols:
+                        tx = cols - 1
+                    if ty < 0:
+                        ty = 0
+                    elif ty >= rows:
+                        ty = rows - 1
+                    los_z = az + z_delta * tline
+                    if terrain_z[ty * cols + tx] >= los_z - terrain_clearance:
+                        wall_loss += ground_loss_db
+                        break
             rssi = base_dbm - path_loss_factor * math.log10(d3) - wall_loss
             if rssi < disconnected:
                 rssi = disconnected
@@ -368,6 +402,7 @@ if cuda is not None:
 
     @cuda.jit(cache=True, fastmath=True)
     def _cuda_direct_rssi_paths_block(xs, ys, valid, ap_data, segments, segment_indices, segment_offsets,
+                                      receiver_z, terrain_z, terrain_enabled, ground_loss_db, terrain_clearance,
                                       disconnected, start_gid, work_count, path_rssi, cols, rows):
         """Use one CUDA block per AP/point path for barrier-heavy IFC models.
 
@@ -411,6 +446,10 @@ if cuda is not None:
                 path_loss_factor = ap_data[ai, 5]
                 cutoff2 = ap_data[ai, 6]
                 dz2 = ap_data[ai, 7]
+                if terrain_enabled != 0:
+                    rz = receiver_z[gid]
+                    z_delta = rz - az
+                    dz2 = z_delta * z_delta
                 dx = x - ax
                 dy = y - ay
                 d2xy = dx * dx + dy * dy
@@ -442,6 +481,35 @@ if cuda is not None:
                         zhit = az + z_delta * t
                         if zhit >= segments[si, 4] and zhit <= segments[si, 5]:
                             partial_loss += segments[si, 6]
+                if tid == 0 and ground_loss_db > 0.0 and terrain_enabled != 0:
+                    spacing_x = abs(xs[1] - xs[0]) if cols > 1 else 2.0
+                    spacing_y = abs(ys[1] - ys[0]) if rows > 1 else 2.0
+                    spacing = spacing_x if spacing_x < spacing_y else spacing_y
+                    if spacing < 1.0:
+                        spacing = 1.0
+                    steps = int(math.ceil(math.sqrt(d2xy) / spacing))
+                    if steps < 4:
+                        steps = 4
+                    elif steps > 32:
+                        steps = 32
+                    for step in range(1, steps):
+                        tline = step / steps
+                        sx = ax + dx * tline
+                        sy = ay + dy * tline
+                        tx = int(math.floor(((sx - xs[0]) / (xs[cols - 1] - xs[0]) * (cols - 1)) + 0.5)) if cols > 1 else 0
+                        ty = int(math.floor(((sy - ys[0]) / (ys[rows - 1] - ys[0]) * (rows - 1)) + 0.5)) if rows > 1 else 0
+                        if tx < 0:
+                            tx = 0
+                        elif tx >= cols:
+                            tx = cols - 1
+                        if ty < 0:
+                            ty = 0
+                        elif ty >= rows:
+                            ty = rows - 1
+                        los_z = az + z_delta * tline
+                        if terrain_z[ty * cols + tx] >= los_z - terrain_clearance:
+                            partial_loss += ground_loss_db
+                            break
             shared_loss[tid] = partial_loss
             cuda.syncthreads()
             stride = cuda.blockDim.x // 2
@@ -712,7 +780,11 @@ class NumbaCUDARFAccelerator:
 
     def direct_rssi_grid(self, xs: np.ndarray, ys: np.ndarray, ap_data: np.ndarray,
                          segments: np.ndarray, valid_mask: Optional[np.ndarray],
-                         disconnected: float, combine_mode: int, settings: Any = None
+                         disconnected: float, combine_mode: int, settings: Any = None,
+                         receiver_z_grid: Optional[np.ndarray] = None,
+                         terrain_elevation_grid: Optional[np.ndarray] = None,
+                         ground_loss_db: float = 0.0,
+                         terrain_clearance_m: float = 0.5,
                          ) -> Tuple[np.ndarray, np.ndarray]:
         compact_aps, prepared_segments, segment_indices, segment_offsets = _prepare_direct_inputs(
             ap_data, segments, np.float32
@@ -743,6 +815,19 @@ class NumbaCUDARFAccelerator:
             d_aps, d_segments, d_segment_indices, d_offsets = self._model_buffers(
                 compact_aps, prepared_segments, segment_indices, segment_offsets, stream
             )
+            terrain_enabled = (
+                receiver_z_grid is not None
+                and terrain_elevation_grid is not None
+                and float(ground_loss_db) > 0.0
+            )
+            if terrain_enabled:
+                receiver_z = np.ascontiguousarray(receiver_z_grid, dtype=np.float32).reshape(rows, cols)
+                terrain_z = np.ascontiguousarray(terrain_elevation_grid, dtype=np.float32).reshape(rows, cols)
+            else:
+                receiver_z = np.zeros((1,), dtype=np.float32)
+                terrain_z = np.zeros((1,), dtype=np.float32)
+            d_receiver_z = cuda.to_device(receiver_z.ravel(), stream=stream)
+            d_terrain_z = cuda.to_device(terrain_z.ravel(), stream=stream)
 
             # Scale the point/AP temporary field to the currently free device
             # memory rather than an arbitrary 256 MB ceiling.  This cuts launch
@@ -795,6 +880,8 @@ class NumbaCUDARFAccelerator:
                     path_blocks, threads = self._block_launch_shape(path_items, cooperative_threads)
                     _cuda_direct_rssi_paths_block[path_blocks, threads, stream](
                         d_xs, d_ys, d_valid, d_aps, d_segments, d_segment_indices, d_offsets,
+                        d_receiver_z, d_terrain_z, np.int32(1 if terrain_enabled else 0),
+                        np.float32(ground_loss_db), np.float32(terrain_clearance_m),
                         np.float32(disconnected), np.int64(start_gid), np.int64(work_count),
                         d_path_rssi, np.int32(cols), np.int32(rows),
                     )
@@ -802,6 +889,8 @@ class NumbaCUDARFAccelerator:
                     path_blocks, threads = self._launch_shape(path_items)
                     _cuda_direct_rssi_paths[path_blocks, threads, stream](
                         d_xs, d_ys, d_valid, d_aps, d_segments, d_segment_indices, d_offsets,
+                        d_receiver_z, d_terrain_z, np.int32(1 if terrain_enabled else 0),
+                        np.float32(ground_loss_db), np.float32(terrain_clearance_m),
                         np.float32(disconnected), np.int64(start_gid), np.int64(work_count),
                         d_path_rssi, np.int32(cols), np.int32(rows),
                     )
@@ -1042,7 +1131,9 @@ class OpenCLRFAccelerator:
             cl.enqueue_nd_range_kernel(self.queue,self._colour_kernel,global_size,local_size);cl.enqueue_copy(self.queue,output,out).wait();return output.reshape((*source.shape,4))
         finally:self._lock.release()
 
-    def direct_rssi_grid(self, xs, ys, ap_data, segments, valid_mask, disconnected, combine_mode, settings=None):
+    def direct_rssi_grid(self, xs, ys, ap_data, segments, valid_mask, disconnected, combine_mode, settings=None,
+                         receiver_z_grid=None, terrain_elevation_grid=None, ground_loss_db=0.0,
+                         terrain_clearance_m=0.5):
         compact_aps, prepared_segments, segment_indices, offsets = _prepare_direct_inputs(
             ap_data, segments, np.float32
         )
@@ -1303,7 +1394,10 @@ else:
 
 def gpu_direct_rssi_grid(xs: np.ndarray, ys: np.ndarray, ap_data: np.ndarray, segments: np.ndarray,
                          valid_mask: Optional[np.ndarray], disconnected: float, combine_mode: int,
-                         settings: Any) -> Optional[Tuple[np.ndarray, np.ndarray, str]]:
+                         settings: Any, receiver_z_grid: Optional[np.ndarray] = None,
+                         terrain_elevation_grid: Optional[np.ndarray] = None,
+                         ground_loss_db: float = 0.0,
+                         terrain_clearance_m: float = 0.5) -> Optional[Tuple[np.ndarray, np.ndarray, str]]:
     if not _enabled(settings):
         return None
     ap_array = np.asarray(ap_data)
@@ -1315,8 +1409,12 @@ def gpu_direct_rssi_grid(xs: np.ndarray, ys: np.ndarray, ap_data: np.ndarray, se
     def _run_direct(backend):
         if not hasattr(backend, "direct_rssi_grid"):
             return None
+        terrain_active = receiver_z_grid is not None and terrain_elevation_grid is not None and float(ground_loss_db) > 0.0
+        if terrain_active and getattr(backend, "backend_name", "") != "CUDA":
+            return None
         grids = backend.direct_rssi_grid(
-            xs, ys, ap_data, segments, valid_mask, disconnected, combine_mode, settings
+            xs, ys, ap_data, segments, valid_mask, disconnected, combine_mode, settings,
+            receiver_z_grid, terrain_elevation_grid, ground_loss_db, terrain_clearance_m
         )
         return grids, backend.info.label, backend.backend_name, dict(getattr(backend, "last_direct_stats", {}) or {})
 

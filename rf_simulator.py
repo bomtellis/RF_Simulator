@@ -23,6 +23,7 @@ import os
 import pickle
 import re
 import shutil
+import struct
 import tempfile
 import threading
 import uuid
@@ -90,11 +91,11 @@ try:
 except Exception:
     contourpy = None
 
-from PySide6.QtCore import QPointF, Qt, Slot, QTimer, QSize, QRectF, QMarginsF, QUrl
+from PySide6.QtCore import QPointF, Qt, Slot, QTimer, QSize, QRectF, QMarginsF, QUrl, QByteArray
 from PySide6.QtGui import (
     QAction, QColor, QBrush, QFont, QPen, QPolygonF, QPainterPath, QPalette,
     QTransform, QIcon, QKeySequence, QPainter, QPdfWriter, QPageSize, QPageLayout,
-    QImage, QPixmap,
+    QImage, QPixmap, QVector3D,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -146,8 +147,12 @@ from PySide6.QtWidgets import (
 )
 try:
     from PySide6.QtQuickWidgets import QQuickWidget
+    from PySide6.QtQuick3D import QQuick3DGeometry
+    from PySide6.QtQml import qmlRegisterType
 except Exception:  # pragma: no cover
     QQuickWidget = None
+    QQuick3DGeometry = None
+    qmlRegisterType = None
 
 try:
     import ifcopenshell
@@ -325,7 +330,11 @@ class AntennaPattern:
     def gain_dbi(self, azimuth_rel_deg: float, elevation_rel_deg: float = 0.0) -> float:
         az_gain = self._interp_gain(self.azimuth_points, azimuth_rel_deg, self.peak_gain_dbi)
         el_gain = self._interp_gain(self.elevation_points, elevation_rel_deg, 0.0)
-        return az_gain + el_gain
+        # Azimuth and elevation cuts are stored as absolute gains at their
+        # respective cut planes. Combining both cuts must not count the antenna
+        # peak twice: an 8 dBi panel at az=0/el=0 should still be 8 dBi, not
+        # 16 dBi. Treat each cut as a deviation from the pattern peak.
+        return az_gain + el_gain - float(self.peak_gain_dbi)
 
     @staticmethod
     def _wrap_deg(angle: float) -> float:
@@ -1010,12 +1019,12 @@ class HeatmapSettings:
     opencl_min_work_items: int = 100000
     # Large GPU/Numba chunks keep kernels efficient while still allowing the
     # calculation worker to observe Cancel between launches.
-    cuda_chunk_points: int = 1048576
-    cuda_memory_fraction: float = 0.45
+    cuda_chunk_points: int = 4194304
+    cuda_memory_fraction: float = 0.60
     cuda_block_segment_threshold: int = 48
-    cuda_queue_depth: int = 3
-    cuda_max_barrier_checks_per_launch: int = 200000000
-    cuda_blocks_per_sm: int = 24
+    cuda_queue_depth: int = 4
+    cuda_max_barrier_checks_per_launch: int = 1000000000
+    cuda_blocks_per_sm: int = 32
     numba_chunk_points: int = 262144
     opencl_accelerate_influence: bool = True
     opencl_accelerate_field_combine: bool = True
@@ -1060,6 +1069,11 @@ class HeatmapSettings:
     fading_seed: int = 1729
     calculate_delay_spread: bool = True
     combined_ap_mode: str = "strongest"  # strongest or power_sum
+    # Distance loss model. The simulator anchors distance loss to ITU-R P.525
+    # free-space attenuation. The default retains the project-calibrated
+    # log-distance excess loss through each AP's path_loss_exponent; set this
+    # to "itu_r_p525_free_space" for strict free-space loss only.
+    propagation_distance_model: str = "itu_r_p525_log_distance"
     reflection_material_properties: Dict[str, Dict[str, float]] = field(default_factory=lambda: {
         "default": {"relative_permittivity": 4.0, "conductivity_s_per_m": 0.02, "roughness_m": 0.003, "reflection_scale": 1.0},
         "concrete": {"relative_permittivity": 6.0, "conductivity_s_per_m": 0.05, "roughness_m": 0.006, "reflection_scale": 1.0},
@@ -1378,6 +1392,17 @@ class HeatmapSettings:
         settings.calculate_delay_spread = bool(propagation.get("calculate_delay_spread", settings.calculate_delay_spread))
         combination = str(propagation.get("combined_ap_mode", data.get("combined_ap_mode", settings.combined_ap_mode))).strip().lower()
         settings.combined_ap_mode = "power_sum" if combination in {"power_sum", "sum", "incoherent_power", "total_power"} else "strongest"
+        distance_model = str(
+            propagation.get(
+                "propagation_distance_model",
+                data.get("propagation_distance_model", settings.propagation_distance_model),
+            )
+        ).strip().lower().replace("-", "_")
+        settings.propagation_distance_model = (
+            "itu_r_p525_free_space"
+            if distance_model in {"itu_r_p525_free_space", "p525", "p_525", "free_space", "fspl"}
+            else "itu_r_p525_log_distance"
+        )
         raw_reflection_profiles = propagation.get("reflection_material_properties", data.get("reflection_material_properties", {}))
         if isinstance(raw_reflection_profiles, dict):
             parsed_reflection_profiles = {}
@@ -1515,6 +1540,7 @@ class HeatmapSettings:
             "fading_seed": int(self.fading_seed),
             "calculate_delay_spread": bool(self.calculate_delay_spread),
             "combined_ap_mode": str(self.combined_ap_mode),
+            "propagation_distance_model": str(self.propagation_distance_model),
             "enable_synthetic_floor_entities": bool(self.enable_synthetic_floor_entities),
             "synthetic_floor_entity_thickness_m": float(self.synthetic_floor_entity_thickness_m),
             "reflection_material_properties": {
@@ -1609,6 +1635,12 @@ class HeatmapSettings:
         self.calculate_delay_spread = bool(data.get("calculate_delay_spread", self.calculate_delay_spread))
         combination = str(data.get("combined_ap_mode", self.combined_ap_mode)).strip().lower()
         self.combined_ap_mode = "power_sum" if combination in {"power_sum", "sum", "incoherent_power", "total_power"} else "strongest"
+        distance_model = str(data.get("propagation_distance_model", self.propagation_distance_model)).strip().lower().replace("-", "_")
+        self.propagation_distance_model = (
+            "itu_r_p525_free_space"
+            if distance_model in {"itu_r_p525_free_space", "p525", "p_525", "free_space", "fspl"}
+            else "itu_r_p525_log_distance"
+        )
         self.enable_synthetic_floor_entities = bool(data.get(
             "enable_synthetic_floor_entities",
             data.get("synthetic_floor_entities_enabled", self.enable_synthetic_floor_entities),
@@ -2524,14 +2556,46 @@ class RFEngine:
 
     @staticmethod
     @functools.lru_cache(maxsize=64)
-    def free_space_loss_db_at_1m(frequency_mhz: float) -> float:
-        """Free-space path loss at 1 metre for the selected Wi-Fi band.
+    def itu_r_p525_free_space_loss_db(frequency_mhz: float, distance_m: float) -> float:
+        """ITU-R P.525 free-space basic transmission loss.
 
-        FSPL(dB) = 32.44 + 20 log10(distance_km) + 20 log10(frequency_MHz).
-        At 1 m, distance_km is 0.001.
+        The equivalent engineering form is:
+        Lbf(dB) = 32.44 + 20 log10(distance_km) + 20 log10(frequency_MHz).
         """
         frequency_mhz = max(float(frequency_mhz), 1.0)
-        return 32.44 + 20.0 * math.log10(0.001) + 20.0 * math.log10(frequency_mhz)
+        distance_km = max(float(distance_m), 1.0) / 1000.0
+        return 32.44 + 20.0 * math.log10(distance_km) + 20.0 * math.log10(frequency_mhz)
+
+    @staticmethod
+    @functools.lru_cache(maxsize=64)
+    def free_space_loss_db_at_1m(frequency_mhz: float) -> float:
+        """ITU-R P.525 free-space basic transmission loss at 1 metre."""
+        return RFEngine.itu_r_p525_free_space_loss_db(float(frequency_mhz), 1.0)
+
+    @staticmethod
+    def _uses_strict_p525_distance_model(heatmap_settings: Optional[HeatmapSettings] = None) -> bool:
+        model = str(getattr(heatmap_settings, "propagation_distance_model", "itu_r_p525_log_distance") or "").lower()
+        return model in {"itu_r_p525_free_space", "p525", "p_525", "free_space", "fspl"}
+
+    @staticmethod
+    def distance_path_loss_exponent(path_loss_exponent: float, heatmap_settings: Optional[HeatmapSettings] = None) -> float:
+        return 2.0 if RFEngine._uses_strict_p525_distance_model(heatmap_settings) else float(path_loss_exponent)
+
+    @staticmethod
+    def distance_path_loss_db(
+        frequency_mhz: float,
+        distance_m: float,
+        path_loss_exponent: float,
+        heatmap_settings: Optional[HeatmapSettings] = None,
+    ) -> float:
+        distance_m = max(1.0, float(distance_m))
+        if RFEngine._uses_strict_p525_distance_model(heatmap_settings):
+            return RFEngine.itu_r_p525_free_space_loss_db(float(frequency_mhz), distance_m)
+        # Calibrated log-distance model anchored to the ITU-R P.525 loss at 1 m.
+        return (
+            RFEngine.free_space_loss_db_at_1m(float(frequency_mhz))
+            + 10.0 * float(path_loss_exponent) * math.log10(distance_m)
+        )
 
     @staticmethod
     def cutoff_radius_m_for_radio(radio: APRadio, settings: Optional[HeatmapSettings] = None) -> float:
@@ -2555,7 +2619,16 @@ class RFEngine:
         return 0.0
 
     @staticmethod
-    def point_is_inside_radio_cutoff(x: float, y: float, receiver_floor: FloorModel, ap: AccessPoint, floors: Dict[str, FloorModel], radio: APRadio, settings: Optional[HeatmapSettings]) -> bool:
+    def point_is_inside_radio_cutoff(
+        x: float,
+        y: float,
+        receiver_floor: FloorModel,
+        ap: AccessPoint,
+        floors: Dict[str, FloorModel],
+        radio: APRadio,
+        settings: Optional[HeatmapSettings],
+        receiver_z_override: Optional[float] = None,
+    ) -> bool:
         if not settings or not getattr(settings, "enable_ap_cutoff_zones", True):
             return True
         radius = RFEngine.cutoff_radius_m_for_radio(radio, settings)
@@ -2566,17 +2639,24 @@ class RFEngine:
             return False
         horizontal_d = math.hypot(x - ap.x, y - ap.y)
         ap_z = float(ap_floor.elevation) + float(ap.mount_height_m)
-        rx_z = float(receiver_floor.elevation) + float(ap.rx_height_m)
+        rx_z = float(receiver_z_override) if receiver_z_override is not None else float(receiver_floor.elevation) + float(ap.rx_height_m)
         d_3d = math.hypot(horizontal_d, ap_z - rx_z)
         return d_3d <= radius
 
     @staticmethod
-    def _link_geometry_key(x: float, y: float, receiver_floor: FloorModel, ap: AccessPoint) -> tuple:
+    def _link_geometry_key(
+        x: float,
+        y: float,
+        receiver_floor: FloorModel,
+        ap: AccessPoint,
+        receiver_z_override: Optional[float] = None,
+    ) -> tuple:
         return (
             str(ap.name), str(ap.floor), round(float(ap.x), 6), round(float(ap.y), 6),
             round(float(ap.mount_height_m), 4), round(float(ap.rx_height_m), 4),
             round(float(ap.azimuth_deg), 3), round(float(ap.downtilt_deg), 3),
             str(receiver_floor.name), round(float(x), 6), round(float(y), 6),
+            None if receiver_z_override is None else round(float(receiver_z_override), 4),
         )
 
     @staticmethod
@@ -2590,8 +2670,9 @@ class RFEngine:
         wall_indexes=None,
         opening_indexes=None,
         geometry_cache: Optional[Dict[object, object]] = None,
+        receiver_z_override: Optional[float] = None,
     ) -> Optional[Dict[str, object]]:
-        key = ("direct",) + RFEngine._link_geometry_key(x, y, receiver_floor, ap)
+        key = ("direct",) + RFEngine._link_geometry_key(x, y, receiver_floor, ap, receiver_z_override)
         if geometry_cache is not None and key in geometry_cache:
             return geometry_cache[key]
         ap_floor = floors.get(ap.floor)
@@ -2599,7 +2680,7 @@ class RFEngine:
             return None
         horizontal_d = max(math.hypot(float(x) - ap.x, float(y) - ap.y), 0.1)
         ap_z = float(ap_floor.elevation) + float(ap.mount_height_m)
-        rx_z = float(receiver_floor.elevation) + float(ap.rx_height_m)
+        rx_z = float(receiver_z_override) if receiver_z_override is not None else float(receiver_floor.elevation) + float(ap.rx_height_m)
         d_3d = max(math.hypot(horizontal_d, ap_z - rx_z), 1.0)
         bearing = math.degrees(math.atan2(float(y) - ap.y, float(x) - ap.x))
         elev_angle = math.degrees(math.atan2(rx_z - ap_z, horizontal_d))
@@ -2662,20 +2743,26 @@ class RFEngine:
         wall_indexes=None,
         opening_indexes=None,
         geometry_cache: Optional[Dict[object, object]] = None,
+        receiver_z_override: Optional[float] = None,
+        extra_path_loss_db: float = 0.0,
     ) -> float:
         """Calculate direct 3D RSSI while reusing frequency-independent link geometry."""
         radio = radio or ap.active_radios()[0]
         disconnected = float(getattr(heatmap_settings, "disconnected_rssi_dbm", -120.0) if heatmap_settings else -120.0)
-        if not RFEngine.point_is_inside_radio_cutoff(x, y, receiver_floor, ap, floors, radio, heatmap_settings):
+        if not RFEngine.point_is_inside_radio_cutoff(x, y, receiver_floor, ap, floors, radio, heatmap_settings, receiver_z_override):
             return disconnected
         geometry = RFEngine._direct_link_geometry(
             x, y, receiver_floor, ap, floors, include_inter_floor,
-            wall_indexes, opening_indexes, geometry_cache,
+            wall_indexes, opening_indexes, geometry_cache, receiver_z_override,
         )
         if geometry is None:
             return disconnected
-        reference_loss = RFEngine.free_space_loss_db_at_1m(radio.frequency_mhz)
-        path_loss = reference_loss + 10.0 * ap.path_loss_exponent * math.log10(float(geometry["distance_3d"]))
+        path_loss = RFEngine.distance_path_loss_db(
+            radio.frequency_mhz,
+            float(geometry["distance_3d"]),
+            ap.path_loss_exponent,
+            heatmap_settings,
+        )
         az_rel = AntennaPattern._wrap_deg(float(geometry["bearing"]) - ap.azimuth_deg)
         elev_rel = float(geometry["elevation"]) + ap.downtilt_deg
         pattern_gain = 0.0
@@ -2691,8 +2778,110 @@ class RFEngine:
         )
         return (
             radio.tx_power_dbm + pattern_gain + float(getattr(radio, "antenna_gain_dbi", 0.0) or 0.0)
-            - path_loss - wall_loss - element_loss - floor_loss
+            - path_loss - wall_loss - element_loss - floor_loss - max(0.0, float(extra_path_loss_db))
         )
+
+    @staticmethod
+    def link_budget_breakdown(
+        x: float,
+        y: float,
+        receiver_floor: FloorModel,
+        ap: AccessPoint,
+        floors: Dict[str, FloorModel],
+        patterns: Optional[Dict[str, AntennaPattern]] = None,
+        radio: Optional[APRadio] = None,
+        include_inter_floor: bool = True,
+        heatmap_settings: Optional[HeatmapSettings] = None,
+        wall_indexes=None,
+        opening_indexes=None,
+        geometry_cache: Optional[Dict[object, object]] = None,
+        receiver_z_override: Optional[float] = None,
+        extra_path_loss_db: float = 0.0,
+        extra_path_loss_label: str = "Extra path loss",
+    ) -> Dict[str, object]:
+        """Return the direct-link RSSI terms used by rssi_at for inspection."""
+        radio = radio or ap.active_radios()[0]
+        disconnected = float(getattr(heatmap_settings, "disconnected_rssi_dbm", -120.0) if heatmap_settings else -120.0)
+        if not RFEngine.point_is_inside_radio_cutoff(x, y, receiver_floor, ap, floors, radio, heatmap_settings, receiver_z_override):
+            return {
+                "available": False,
+                "reason": "Receiver is outside the radio cut-off radius.",
+                "rssi_dbm": disconnected,
+                "ap": ap,
+                "radio": radio,
+            }
+        geometry = RFEngine._direct_link_geometry(
+            x, y, receiver_floor, ap, floors, include_inter_floor,
+            wall_indexes, opening_indexes, geometry_cache, receiver_z_override,
+        )
+        if geometry is None:
+            reason = "AP is on another floor and inter-floor RF is disabled." if ap.floor != receiver_floor.name else "No valid AP-to-receiver geometry."
+            return {
+                "available": False,
+                "reason": reason,
+                "rssi_dbm": disconnected,
+                "ap": ap,
+                "radio": radio,
+            }
+        distance_3d = float(geometry["distance_3d"])
+        path_loss = RFEngine.distance_path_loss_db(
+            radio.frequency_mhz,
+            distance_3d,
+            ap.path_loss_exponent,
+            heatmap_settings,
+        )
+        az_rel = AntennaPattern._wrap_deg(float(geometry["bearing"]) - ap.azimuth_deg)
+        elev_rel = float(geometry["elevation"]) + ap.downtilt_deg
+        pattern_gain = 0.0
+        pattern_name = str(getattr(radio, "antenna_pattern", "") or "")
+        if patterns:
+            pattern = patterns.get(pattern_name)
+            if pattern:
+                pattern_gain = pattern.gain_dbi(az_rel, elev_rel)
+        radio_gain = float(getattr(radio, "antenna_gain_dbi", 0.0) or 0.0)
+        walls = [
+            (wall, float(wall.attenuation_db_for_frequency(radio.frequency_mhz)))
+            for wall in geometry["walls"]
+        ]
+        elements = [
+            (element, float(element.attenuation_db_for_frequency(radio.frequency_mhz)))
+            for element in geometry["elements"]
+        ]
+        slabs = list(geometry["slabs"])
+        floor_loss = RFEngine.floor_penetration_loss_db(
+            receiver_floor, geometry["ap_floor"], floors, radio.frequency_mhz,
+            slabs, heatmap_settings,
+        )
+        extra_loss = max(0.0, float(extra_path_loss_db))
+        rssi = float(radio.tx_power_dbm) + pattern_gain + radio_gain - path_loss
+        rssi -= sum(loss for _, loss in walls)
+        rssi -= sum(loss for _, loss in elements)
+        rssi -= floor_loss + extra_loss
+        return {
+            "available": True,
+            "rssi_dbm": rssi,
+            "ap": ap,
+            "radio": radio,
+            "geometry": geometry,
+            "tx_power_dbm": float(radio.tx_power_dbm),
+            "antenna_pattern": pattern_name,
+            "pattern_gain_dbi": float(pattern_gain),
+            "radio_antenna_gain_dbi": float(radio_gain),
+            "azimuth_relative_deg": float(az_rel),
+            "elevation_relative_deg": float(elev_rel),
+            "path_loss_db": float(path_loss),
+            "path_loss_model": (
+                "ITU-R P.525 free-space"
+                if RFEngine._uses_strict_p525_distance_model(heatmap_settings)
+                else f"ITU-R P.525 at 1 m + log-distance exponent {float(ap.path_loss_exponent):g}"
+            ),
+            "walls": walls,
+            "elements": elements,
+            "slabs": slabs,
+            "floor_loss_db": float(floor_loss),
+            "extra_path_loss_db": float(extra_loss),
+            "extra_path_loss_label": str(extra_path_loss_label or "Extra path loss"),
+        }
 
     @staticmethod
     def _wall_identity(wall: Wall2D) -> str:
@@ -2919,7 +3108,7 @@ class RFEngine:
             return 0.0
         az_max = max([float(value[1]) for value in (pattern.azimuth_points or [])] or [float(pattern.peak_gain_dbi)])
         el_max = max([float(value[1]) for value in (pattern.elevation_points or [])] or [0.0])
-        return az_max + el_max
+        return az_max + el_max - float(pattern.peak_gain_dbi)
 
     @staticmethod
     def propagation_at(
@@ -2938,6 +3127,8 @@ class RFEngine:
         geometry_cache: Optional[Dict[object, object]] = None,
         reflection_index_override: Optional[ReflectionIndex] = None,
         reflection_sequences_override: Optional[Sequence[Sequence[ReflectionSurface]]] = None,
+        receiver_z_override: Optional[float] = None,
+        extra_path_loss_db: float = 0.0,
     ) -> PropagationSample:
         radio = radio or ap.active_radios()[0]
         disconnected = float(getattr(heatmap_settings, "disconnected_rssi_dbm", -120.0) if heatmap_settings else -120.0)
@@ -2947,7 +3138,7 @@ class RFEngine:
         if ap.floor != receiver_floor.name and not include_inter_floor:
             return PropagationSample(disconnected, 0.0, 0, disconnected)
         if not RFEngine.point_is_inside_radio_cutoff(
-            x, y, receiver_floor, ap, floors, radio, heatmap_settings
+            x, y, receiver_floor, ap, floors, radio, heatmap_settings, receiver_z_override
         ):
             return PropagationSample(disconnected, 0.0, 0, disconnected)
         quick_cutoff_enabled = bool(getattr(heatmap_settings, "enable_quick_rssi_cutoff", False)) if heatmap_settings is not None else False
@@ -2961,15 +3152,19 @@ class RFEngine:
         if quick_cutoff_enabled:
             horizontal_distance = math.hypot(float(x) - float(ap.x), float(y) - float(ap.y))
             ap_height = float(ap_floor.elevation) + float(ap.mount_height_m)
-            receiver_height = float(receiver_floor.elevation) + float(ap.rx_height_m)
+            receiver_height = float(receiver_z_override) if receiver_z_override is not None else float(receiver_floor.elevation) + float(ap.rx_height_m)
             distance_3d = max(1.0, math.hypot(horizontal_distance, ap_height - receiver_height))
             maximum_pattern_gain = RFEngine._maximum_pattern_gain(patterns, radio.antenna_pattern)
             unobstructed_upper = (
                 float(radio.tx_power_dbm)
                 + float(getattr(radio, "antenna_gain_dbi", 0.0) or 0.0)
                 + maximum_pattern_gain
-                - RFEngine.free_space_loss_db_at_1m(float(radio.frequency_mhz))
-                - 10.0 * float(ap.path_loss_exponent) * math.log10(distance_3d)
+                - RFEngine.distance_path_loss_db(
+                    radio.frequency_mhz,
+                    distance_3d,
+                    ap.path_loss_exponent,
+                    heatmap_settings,
+                )
             )
             if unobstructed_upper < quick_cutoff_dbm:
                 return PropagationSample(disconnected, 0.0, 0, disconnected)
@@ -2986,12 +3181,14 @@ class RFEngine:
             wall_indexes,
             opening_indexes,
             geometry_cache,
+            receiver_z_override,
+            extra_path_loss_db,
         )
         source = (float(ap.x), float(ap.y))
         receiver = (float(x), float(y))
         horizontal_direct = max(0.1, math.hypot(receiver[0] - source[0], receiver[1] - source[1]))
         ap_z = float(ap_floor.elevation) + float(ap.mount_height_m)
-        rx_z = float(receiver_floor.elevation) + float(ap.rx_height_m)
+        rx_z = float(receiver_z_override) if receiver_z_override is not None else float(receiver_floor.elevation) + float(ap.rx_height_m)
         direct_length_3d = max(1.0, math.hypot(horizontal_direct, ap_z - rx_z))
         path_powers: List[PathPower] = [PathPower(
             power_dbm=float(direct_rssi),
@@ -3003,7 +3200,6 @@ class RFEngine:
         same_floor = ap_floor.name == receiver_floor.name
         index = reflection_index_override or (reflection_indexes or {}).get(receiver_floor.name)
         material_profiles = getattr(heatmap_settings, "reflection_material_properties", {}) or {}
-        reference_loss = RFEngine.free_space_loss_db_at_1m(float(radio.frequency_mhz))
         radio_gain = float(getattr(radio, "antenna_gain_dbi", 0.0) or 0.0)
         if same_floor and index is not None and heatmap_settings is not None:
             if bool(getattr(heatmap_settings, "enable_multipath_reflections", False)):
@@ -3013,7 +3209,7 @@ class RFEngine:
                     int(getattr(heatmap_settings, "max_reflection_surfaces", 6)),
                     int(getattr(heatmap_settings, "max_reflection_paths", 8)),
                     round(float(getattr(heatmap_settings, "reflection_search_radius_m", 18.0)), 3),
-                ) + RFEngine._link_geometry_key(x, y, receiver_floor, ap)
+                ) + RFEngine._link_geometry_key(x, y, receiver_floor, ap, receiver_z_override)
                 reflected_geometries = geometry_cache.get(geometry_key) if geometry_cache is not None else None
                 if reflected_geometries is None:
                     reflected_geometries = generate_reflection_geometries(
@@ -3038,7 +3234,12 @@ class RFEngine:
                 for ray in reflected_paths:
                     horizontal_length = max(0.1, float(ray.length_m))
                     distance_3d = max(1.0, math.hypot(horizontal_length, ap_z - rx_z))
-                    path_loss = reference_loss + 10.0 * ap.path_loss_exponent * math.log10(distance_3d)
+                    path_loss = RFEngine.distance_path_loss_db(
+                        radio.frequency_mhz,
+                        distance_3d,
+                        ap.path_loss_exponent,
+                        heatmap_settings,
+                    )
                     pattern_gain = RFEngine._departure_pattern_gain(
                         ap, radio, patterns, ray.points[1], horizontal_length, ap_z, rx_z
                     )
@@ -3080,7 +3281,7 @@ class RFEngine:
             if bool(getattr(heatmap_settings, "enable_corner_diffraction", False)):
                 blocked_key = (
                     "direct_blockers", id(wall_indexes),
-                ) + RFEngine._link_geometry_key(x, y, receiver_floor, ap)
+                ) + RFEngine._link_geometry_key(x, y, receiver_floor, ap, receiver_z_override)
                 blocked_ids = geometry_cache.get(blocked_key) if geometry_cache is not None else None
                 if blocked_ids is None:
                     blocked_ids = RFEngine._direct_blocking_object_ids(
@@ -3093,7 +3294,7 @@ class RFEngine:
                         "diffraction", id(index), tuple(sorted(blocked_ids)),
                         int(getattr(heatmap_settings, "max_diffraction_paths", 3)),
                         round(float(getattr(heatmap_settings, "diffraction_search_radius_m", 5.0)), 3),
-                    ) + RFEngine._link_geometry_key(x, y, receiver_floor, ap)
+                    ) + RFEngine._link_geometry_key(x, y, receiver_floor, ap, receiver_z_override)
                     diffraction_geometries = geometry_cache.get(diffraction_key) if geometry_cache is not None else None
                     if diffraction_geometries is None:
                         diffraction_geometries = generate_diffraction_geometries(
@@ -3114,7 +3315,12 @@ class RFEngine:
                     for ray in diffracted_paths:
                         horizontal_length = max(0.1, float(ray.length_m))
                         distance_3d = max(1.0, math.hypot(horizontal_length, ap_z - rx_z))
-                        path_loss = reference_loss + 10.0 * ap.path_loss_exponent * math.log10(distance_3d)
+                        path_loss = RFEngine.distance_path_loss_db(
+                            radio.frequency_mhz,
+                            distance_3d,
+                            ap.path_loss_exponent,
+                            heatmap_settings,
+                        )
                         pattern_gain = RFEngine._departure_pattern_gain(
                             ap, radio, patterns, ray.points[1], horizontal_length, ap_z, rx_z
                         )
@@ -3540,6 +3746,7 @@ class RFEngine:
             profiled.multipath_relative_power_cutoff_db = min(20.0, float(profiled.multipath_relative_power_cutoff_db))
             profiled.heatmap_render_mode = "raster"
         elif profile == "balanced":
+            profiled.enable_adaptive_rf_grid = False
             profiled.max_reflection_order = min(2, int(profiled.max_reflection_order))
             profiled.max_diffraction_paths = min(2, int(profiled.max_diffraction_paths))
             profiled.multipath_relative_power_cutoff_db = min(30.0, float(profiled.multipath_relative_power_cutoff_db))
@@ -3842,6 +4049,12 @@ class RFEngine:
         def add_polygon_edges(polygon, z_min: float, z_max: float, loss: float):
             if polygon is None or getattr(polygon, "is_empty", True) or abs(float(loss)) <= 1e-9:
                 return
+            # The exact link-budget path counts one wall/element attenuation
+            # when its solid footprint intersects the ray. A closed polygon
+            # boundary is normally crossed twice (entry and exit), so each edge
+            # carries half the object loss to keep the accelerated grid aligned
+            # with the right-click loss breakdown.
+            edge_loss = float(loss) * 0.5
             polygons = [polygon] if getattr(polygon, "geom_type", "") == "Polygon" else list(getattr(polygon, "geoms", []) or [])
             for poly in polygons:
                 if getattr(poly, "geom_type", "") != "Polygon":
@@ -3855,7 +4068,7 @@ class RFEngine:
                         x2, y2 = float(b[0]), float(b[1])
                         if math.hypot(x2 - x1, y2 - y1) < 1.0e-6:
                             continue
-                        rows.append((x1, y1, x2, y2, float(z_min), float(z_max), float(loss)))
+                        rows.append((x1, y1, x2, y2, float(z_min), float(z_max), edge_loss))
 
         for wall in list(getattr(floor, "walls", []) or []):
             add_polygon_edges(
@@ -3886,6 +4099,8 @@ class RFEngine:
         floors: Dict[str, FloorModel],
         links: Sequence[Tuple[AccessPoint, APRadio]],
         heatmap_settings: Optional[HeatmapSettings],
+        receiver_z_override: Optional[float] = None,
+        patterns: Optional[Dict[str, AntennaPattern]] = None,
     ) -> np.ndarray:
         rows: List[Tuple[float, float, float, float, float, float, float, float, float, float]] = []
         for ap, radio in links:
@@ -3896,14 +4111,16 @@ class RFEngine:
             cutoff = RFEngine.cutoff_radius_m_for_radio(radio, heatmap_settings)
             cutoff2 = cutoff * cutoff if cutoff > 0.0 else 0.0
             ap_z = float(ap_floor.elevation) + float(ap.mount_height_m)
-            rx_z = float(floor.elevation) + float(ap.rx_height_m)
+            rx_z = float(receiver_z_override) if receiver_z_override is not None else float(floor.elevation) + float(ap.rx_height_m)
             floor_loss = 0.0
             if ap_floor.name != floor.name:
                 floor_loss = RFEngine.floor_penetration_loss_db(floor, ap_floor, floors, frequency, [], heatmap_settings)
+            effective_ple = RFEngine.distance_path_loss_exponent(ap.path_loss_exponent, heatmap_settings)
+            pattern_gain = RFEngine._maximum_pattern_gain(patterns, radio.antenna_pattern)
             rows.append((
                 float(ap.x), float(ap.y), ap_z, rx_z,
-                float(radio.tx_power_dbm), float(getattr(radio, "antenna_gain_dbi", 0.0) or 0.0),
-                frequency, float(ap.path_loss_exponent), cutoff2, float(floor_loss),
+                float(radio.tx_power_dbm), float(getattr(radio, "antenna_gain_dbi", 0.0) or 0.0) + float(pattern_gain),
+                frequency, float(effective_ple), cutoff2, float(floor_loss),
             ))
         if not rows:
             return np.zeros((0, 10), dtype=np.float32)
@@ -3925,6 +4142,10 @@ class RFEngine:
         started: float,
         progress_callback=None,
         progressive_callback=None,
+        receiver_z_grid: Optional[np.ndarray] = None,
+        terrain_elevation_grid: Optional[np.ndarray] = None,
+        terrain_model: Optional["TerrainModel"] = None,
+        patterns: Optional[Dict[str, AntennaPattern]] = None,
     ) -> Optional[Dict[object, SimulationResult]]:
         if heatmap_settings is None:
             return None
@@ -3945,7 +4166,7 @@ class RFEngine:
             if cancel_event is not None and cancel_event.is_set():
                 raise RuntimeError("RSSI calculation cancelled")
             links = radio_links_by_group.get(key, [])
-            ap_rows = RFEngine._direct_accelerator_ap_rows(floor, floors, links, heatmap_settings)
+            ap_rows = RFEngine._direct_accelerator_ap_rows(floor, floors, links, heatmap_settings, patterns=patterns)
             if ap_rows.size == 0:
                 continue
             frequency = float(ap_rows[0, 6])
@@ -3953,7 +4174,18 @@ class RFEngine:
             accelerated = None
             try:
                 if gpu_enabled:
-                    accelerated = gpu_direct_rssi_grid(xs, ys, ap_rows, segments, valid, disconnected, combine_mode, heatmap_settings)
+                    terrain_clearance = 0.5
+                    ground_loss = 0.0
+                    if terrain_model is not None:
+                        terrain_clearance = max(0.05, min(
+                            0.75,
+                            float(getattr(terrain_model, "receiver_height_m", 1.0)) * 0.5,
+                        ))
+                        ground_loss = max(0.0, float(getattr(terrain_model, "ground_attenuation_db", 80.0)))
+                    accelerated = gpu_direct_rssi_grid(
+                        xs, ys, ap_rows, segments, valid, disconnected, combine_mode, heatmap_settings,
+                        receiver_z_grid, terrain_elevation_grid, ground_loss, terrain_clearance,
+                    )
             except GPUExecutionError:
                 # A selected/detected GPU failed. In forced mode this is a real
                 # calculation error and must not be hidden by CPU fallback.
@@ -3989,6 +4221,10 @@ class RFEngine:
                 "direct RSSI grid calculated with Numba parallel CPU fallback because GPU execution was unavailable or below the configured workload threshold"
             )
             note += "; attenuation uses GPU/Numba ray intersections against IFC/user RF barrier edges"
+            if receiver_z_grid is not None and terrain_elevation_grid is not None:
+                note += "; terrain receiver heights and ground obstruction loss included in the direct-grid batch"
+            if patterns:
+                note += "; antenna pattern peak gain included to match direct link-budget inspection"
             results[key] = SimulationResult(
                 xs=xs, ys=ys, rssi=rssi, delay_spread_ns=delays, path_count=counts,
                 valid_mask=None if boundary_mask is None else boundary_mask.copy(),
@@ -4001,6 +4237,209 @@ class RFEngine:
             if progressive_callback:
                 progressive_callback(dict(results), (index + 1) / total_groups)
         return results if results else None
+
+    @staticmethod
+    def _lonlat_to_xyz_tile(lon: float, lat: float, zoom: int) -> Tuple[float, float]:
+        lat = max(-85.05112878, min(85.05112878, float(lat)))
+        lon = max(-180.0, min(180.0, float(lon)))
+        n = float(2 ** int(zoom))
+        lat_rad = math.radians(lat)
+        x = (lon + 180.0) / 360.0 * n
+        y = (1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n
+        return x, y
+
+    @staticmethod
+    def _scene_to_lonlat(
+        x: float,
+        y: float,
+        overlay: Optional["SatelliteOverlay"],
+    ) -> Optional[Tuple[float, float]]:
+        if overlay is None:
+            return None
+        try:
+            metres_per_scene_metre = max(1e-9, float(overlay.metres_per_scene_metre))
+            dx = float(x) - float(overlay.center_scene_x)
+            dy = float(y) - float(overlay.center_scene_y)
+            angle = math.radians(float(overlay.rotation_deg))
+            cos_a = math.cos(angle)
+            sin_a = math.sin(angle)
+            east_m = (dx * cos_a + dy * sin_a) * metres_per_scene_metre
+            north_m = (-dx * sin_a + dy * cos_a) * metres_per_scene_metre
+            radius = 6378137.0
+            center_lon = max(-180.0, min(180.0, float(overlay.center_lon)))
+            center_lat = max(-85.05112878, min(85.05112878, float(overlay.center_lat)))
+            center_x = radius * math.radians(center_lon)
+            center_y = radius * math.log(math.tan(math.pi * 0.25 + math.radians(center_lat) * 0.5))
+            lon = math.degrees((center_x + east_m) / radius)
+            lat = math.degrees(2.0 * math.atan(math.exp((center_y + north_m) / radius)) - math.pi * 0.5)
+            return max(-180.0, min(180.0, lon)), max(-85.05112878, min(85.05112878, lat))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _terrain_cache_file(model: "TerrainModel", z: int, x: int, y: int) -> Path:
+        source = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(getattr(model, "source_name", "terrain") or "terrain")).strip("._") or "terrain"
+        return Path(__file__).with_name(".rf_terrain_cache") / source / str(int(z)) / str(int(x)) / f"{int(y)}.png"
+
+    @staticmethod
+    def _load_terrain_tile_image(model: "TerrainModel", z: int, x: int, y: int) -> Optional[QImage]:
+        max_tile = (2 ** int(z)) - 1
+        if y < 0 or y > max_tile:
+            return None
+        x = int(x) % (max_tile + 1)
+        cache_file = RFEngine._terrain_cache_file(model, z, x, y)
+        if cache_file.exists():
+            image = QImage(str(cache_file))
+            if not image.isNull():
+                return image.convertToFormat(QImage.Format_RGB32)
+        template = str(getattr(model, "tile_url_template", "") or "").strip()
+        if not template:
+            return None
+        url = template.replace("{z}", str(int(z))).replace("{x}", str(int(x))).replace("{y}", str(int(y)))
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "RF-Attenuation-Simulator/1.0 terrain-model",
+                "Accept": "image/png,image/*;q=0.8,*/*;q=0.5",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=12) as response:
+                payload = response.read()
+            image = QImage()
+            if not image.loadFromData(payload) or image.isNull():
+                return None
+            try:
+                cache_file.parent.mkdir(parents=True, exist_ok=True)
+                temporary = cache_file.with_name(f".{cache_file.name}.{uuid.uuid4().hex}.tmp")
+                temporary.write_bytes(payload)
+                os.replace(temporary, cache_file)
+            except Exception:
+                pass
+            return image.convertToFormat(QImage.Format_RGB32)
+        except (urllib.error.URLError, TimeoutError, OSError):
+            return None
+
+    @staticmethod
+    def _terrarium_elevation_at(image: QImage, px: float, py: float) -> Optional[float]:
+        if image.isNull() or image.width() <= 0 or image.height() <= 0:
+            return None
+        width = image.width()
+        height = image.height()
+        px = max(0.0, min(float(width - 1), float(px)))
+        py = max(0.0, min(float(height - 1), float(py)))
+        x0 = int(math.floor(px)); y0 = int(math.floor(py))
+        x1 = min(width - 1, x0 + 1); y1 = min(height - 1, y0 + 1)
+        fx = px - x0; fy = py - y0
+
+        def decode(ix: int, iy: int) -> float:
+            colour = image.pixelColor(ix, iy)
+            return float(colour.red()) * 256.0 + float(colour.green()) + float(colour.blue()) / 256.0 - 32768.0
+
+        top = decode(x0, y0) * (1.0 - fx) + decode(x1, y0) * fx
+        bottom = decode(x0, y1) * (1.0 - fx) + decode(x1, y1) * fx
+        return top * (1.0 - fy) + bottom * fy
+
+    @staticmethod
+    def _terrain_receiver_z_grid(
+        xs: np.ndarray,
+        ys: np.ndarray,
+        overlay: Optional["SatelliteOverlay"],
+        terrain_model: Optional["TerrainModel"],
+    ) -> Optional[np.ndarray]:
+        if overlay is None or terrain_model is None or not bool(getattr(terrain_model, "enabled", True)):
+            return None
+        if not len(xs) or not len(ys):
+            return None
+        z = max(0, min(15, int(getattr(terrain_model, "zoom", 14))))
+        receiver_height = max(0.0, float(getattr(terrain_model, "receiver_height_m", 1.0)))
+        tile_images: Dict[Tuple[int, int], Optional[QImage]] = {}
+        elevation_grid = np.empty((len(ys), len(xs)), dtype=float)
+
+        def elevation_for_scene_point(scene_x: float, scene_y: float) -> Optional[float]:
+            lonlat = RFEngine._scene_to_lonlat(float(scene_x), float(scene_y), overlay)
+            if lonlat is None:
+                return None
+            lon, lat = lonlat
+            tile_x, tile_y = RFEngine._lonlat_to_xyz_tile(float(lon), float(lat), z)
+            ix_tile = int(math.floor(tile_x)); iy_tile = int(math.floor(tile_y))
+            key = (ix_tile, iy_tile)
+            if key not in tile_images:
+                tile_images[key] = RFEngine._load_terrain_tile_image(terrain_model, z, ix_tile, iy_tile)
+            image = tile_images.get(key)
+            if image is None or image.isNull():
+                return None
+            return RFEngine._terrarium_elevation_at(
+                image,
+                (tile_x - ix_tile) * float(image.width()),
+                (tile_y - iy_tile) * float(image.height()),
+            )
+
+        for iy, yy in enumerate(ys):
+            for ix, xx in enumerate(xs):
+                elevation = elevation_for_scene_point(float(xx), float(yy))
+                if elevation is None:
+                    return None
+                elevation_grid[iy, ix] = float(elevation)
+        reference = elevation_for_scene_point(float(overlay.center_scene_x), float(overlay.center_scene_y))
+        if reference is None:
+            reference = float(elevation_grid[0, 0])
+        model_ground = float(getattr(terrain_model, "model_ground_elevation_m", 0.0))
+        return elevation_grid - float(reference) + model_ground + receiver_height
+
+    @staticmethod
+    def _sample_regular_grid_value(xs: np.ndarray, ys: np.ndarray, values: np.ndarray, x: float, y: float) -> Optional[float]:
+        if len(xs) < 2 or len(ys) < 2:
+            return None
+        if x < float(xs[0]) or x > float(xs[-1]) or y < float(ys[0]) or y > float(ys[-1]):
+            return None
+        ix = int(np.searchsorted(xs, x, side="right") - 1)
+        iy = int(np.searchsorted(ys, y, side="right") - 1)
+        ix = max(0, min(ix, len(xs) - 2))
+        iy = max(0, min(iy, len(ys) - 2))
+        x0, x1 = float(xs[ix]), float(xs[ix + 1])
+        y0, y1 = float(ys[iy]), float(ys[iy + 1])
+        tx = 0.0 if abs(x1 - x0) < 1e-12 else (float(x) - x0) / (x1 - x0)
+        ty = 0.0 if abs(y1 - y0) < 1e-12 else (float(y) - y0) / (y1 - y0)
+        v00 = float(values[iy, ix]); v10 = float(values[iy, ix + 1])
+        v01 = float(values[iy + 1, ix]); v11 = float(values[iy + 1, ix + 1])
+        top = v00 * (1.0 - tx) + v10 * tx
+        bottom = v01 * (1.0 - tx) + v11 * tx
+        return top * (1.0 - ty) + bottom * ty
+
+    @staticmethod
+    def _terrain_obstruction_loss_db(
+        ap: AccessPoint,
+        ap_floor: Optional[FloorModel],
+        rx_x: float,
+        rx_y: float,
+        rx_z: float,
+        xs: np.ndarray,
+        ys: np.ndarray,
+        terrain_elevation_grid: Optional[np.ndarray],
+        terrain_model: Optional["TerrainModel"],
+    ) -> float:
+        if ap_floor is None or terrain_elevation_grid is None or terrain_model is None:
+            return 0.0
+        attenuation = max(0.0, float(getattr(terrain_model, "ground_attenuation_db", 80.0)))
+        if attenuation <= 0.0:
+            return 0.0
+        ap_x = float(ap.x); ap_y = float(ap.y)
+        ap_z = float(ap_floor.elevation) + float(ap.mount_height_m)
+        distance = max(0.1, math.hypot(float(rx_x) - ap_x, float(rx_y) - ap_y))
+        steps = max(4, min(32, int(math.ceil(distance / max(1.0, min(abs(float(xs[1]) - float(xs[0])) if len(xs) > 1 else 2.0, abs(float(ys[1]) - float(ys[0])) if len(ys) > 1 else 2.0))))))
+        clearance = max(0.05, min(0.75, float(getattr(terrain_model, "receiver_height_m", 1.0)) * 0.5))
+        for step in range(1, steps):
+            t = float(step) / float(steps)
+            sx = ap_x + (float(rx_x) - ap_x) * t
+            sy = ap_y + (float(rx_y) - ap_y) * t
+            terrain_z = RFEngine._sample_regular_grid_value(xs, ys, terrain_elevation_grid, sx, sy)
+            if terrain_z is None:
+                continue
+            los_z = ap_z + (float(rx_z) - ap_z) * t
+            if float(terrain_z) >= los_z - clearance:
+                return attenuation
+        return 0.0
 
     @staticmethod
     def _simulate_groups_uniform(
@@ -4017,6 +4456,8 @@ class RFEngine:
         evaluation_mask: Optional[np.ndarray] = None,
         grid_override: Optional[Tuple[np.ndarray, np.ndarray]] = None,
         progressive_callback=None,
+        map_overlay: Optional["SatelliteOverlay"] = None,
+        terrain_model: Optional["TerrainModel"] = None,
     ) -> Dict[object, SimulationResult]:
         """Uniform-grid exact evaluator with resident model and shared-memory workers."""
         started = time.perf_counter()
@@ -4066,6 +4507,19 @@ class RFEngine:
                 raise ValueError("Adaptive evaluation mask does not match RF grid")
             if boundary_mask is not None:
                 work_mask &= boundary_mask
+        receiver_z_grid = RFEngine._terrain_receiver_z_grid(xs, ys, map_overlay, terrain_model)
+        terrain_elevation_grid = None
+        terrain_note = ""
+        if receiver_z_grid is not None:
+            terrain_elevation_grid = receiver_z_grid - max(0.0, float(getattr(terrain_model, "receiver_height_m", 1.0)))
+            terrain_note = (
+                f"; terrain receiver height {float(getattr(terrain_model, 'receiver_height_m', 1.0)):g} m above ground "
+                f"from {getattr(terrain_model, 'source_name', 'terrain')}; ground obstruction loss "
+                f"{float(getattr(terrain_model, 'ground_attenuation_db', 80.0)):g} dB; "
+                f"P.527 surface {getattr(terrain_model, 'ground_surface_type', 'average_ground')} "
+                f"epsr={float(getattr(terrain_model, 'ground_relative_permittivity', 15.0)):g}, "
+                f"sigma={float(getattr(terrain_model, 'ground_conductivity_s_per_m', 0.005)):g} S/m"
+            )
         disconnected = float(getattr(heatmap_settings, "disconnected_rssi_dbm", -120.0) if heatmap_settings else -120.0)
         rows, cols = len(ys), len(xs)
         if boundary_mask is None:
@@ -4084,6 +4538,8 @@ class RFEngine:
             floor, floors, xs, ys, group_order, radio_links_by_group, work_mask,
             boundary_mask, calculation_boundary, ignored, heatmap_settings, started,
             progress_callback, progressive_callback,
+            receiver_z_grid, terrain_elevation_grid, terrain_model,
+            patterns,
         )
         if accelerated is not None:
             return accelerated
@@ -4092,7 +4548,7 @@ class RFEngine:
         # the CPU workers start. This does not replace IFC ray tracing; it removes
         # points at which no AP/radio can possibly reach the active cutoff.
         gpu_prune_note = ""
-        if bool(getattr(heatmap_settings, "enable_opencl_gpu", True)) and bool(
+        if receiver_z_grid is None and bool(getattr(heatmap_settings, "enable_opencl_gpu", True)) and bool(
             getattr(heatmap_settings, "opencl_accelerate_influence", True)
         ):
             link_rows = []
@@ -4127,7 +4583,7 @@ class RFEngine:
                     link_rows.append((
                         float(ap.x), float(ap.y), float(dz),
                         RFEngine.free_space_loss_db_at_1m(radio.frequency_mhz),
-                        float(ap.path_loss_exponent), float(eirp), float(cutoff),
+                        RFEngine.distance_path_loss_exponent(ap.path_loss_exponent, heatmap_settings), float(eirp), float(cutoff),
                         float(radius * radius) if radius > 0.0 else -1.0,
                     ))
             gpu_mask = gpu_influence_mask(
@@ -4178,6 +4634,10 @@ class RFEngine:
                     jobs.append((
                         model_key, context_path, xs, ys[start_index:start_index + tile_rows],
                         None if work_mask is None else work_mask[start_index:start_index + tile_rows, :],
+                        None if receiver_z_grid is None else receiver_z_grid[start_index:start_index + tile_rows, :],
+                        ys,
+                        terrain_elevation_grid,
+                        terrain_model,
                         start_index, disconnected, worker_cache_entries, group_aps, group_order, shared_specs,
                     ))
                 process_count = min(process_count, max(1, len(jobs)))
@@ -4234,7 +4694,7 @@ class RFEngine:
                 )
                 note = (
                     f"resident static model; {len(jobs)} adaptive tile(s); shared-memory outputs "
-                    f"{'enabled' if use_shared else 'disabled'}; frequency-independent path geometry reused{quick_note}{gpu_prune_note}"
+                    f"{'enabled' if use_shared else 'disabled'}; frequency-independent path geometry reused{quick_note}{gpu_prune_note}{terrain_note}"
                 )
                 return {
                     key: SimulationResult(
@@ -4276,12 +4736,21 @@ class RFEngine:
                 geometry_cache = {} if bool(getattr(heatmap_settings, "reuse_path_geometry_across_frequencies", True)) else None
                 for key in group_order:
                     samples = []
+                    receiver_z = None if receiver_z_grid is None else float(receiver_z_grid[iy, ix])
                     for ap, radio in radio_links_by_group[key]:
-                        if RFEngine.point_is_inside_radio_cutoff(xx, yy, floor, ap, floors, radio, heatmap_settings):
+                        if RFEngine.point_is_inside_radio_cutoff(xx, yy, floor, ap, floors, radio, heatmap_settings, receiver_z):
+                            ap_floor = floors.get(ap.floor)
+                            ground_loss = RFEngine._terrain_obstruction_loss_db(
+                                ap, ap_floor, float(xx), float(yy),
+                                receiver_z if receiver_z is not None else float(floor.elevation) + float(ap.rx_height_m),
+                                xs, ys, terrain_elevation_grid, terrain_model,
+                            )
                             samples.append(RFEngine.propagation_at(
                                 float(xx), float(yy), floor, ap, floors, patterns, radio,
                                 include_inter_floor, heatmap_settings, wall_indexes, opening_indexes,
                                 reflection_indexes, geometry_cache,
+                                receiver_z_override=receiver_z,
+                                extra_path_loss_db=ground_loss,
                             ))
                     combined = RFEngine.combine_ap_samples(samples, heatmap_settings, disconnected)
                     grids[key][iy, ix] = combined.rssi_dbm
@@ -4305,7 +4774,7 @@ class RFEngine:
             f"; quick cutoff {float(getattr(heatmap_settings, 'quick_rssi_cutoff_dbm', -80.0)):g} dBm"
             if bool(getattr(heatmap_settings, "enable_quick_rssi_cutoff", False)) else ""
         )
-        note = fallback_note or ("single-process exact grid; resident geometry and cross-frequency path cache enabled" + quick_note + gpu_prune_note)
+        note = fallback_note or ("single-process exact grid; resident geometry and cross-frequency path cache enabled" + quick_note + gpu_prune_note + terrain_note)
         return {
             key: SimulationResult(
                 xs=xs, ys=ys, rssi=grids[key], delay_spread_ns=delays[key], path_count=counts[key],
@@ -4330,14 +4799,26 @@ class RFEngine:
         calculation_boundary,
         calculation_extent: Optional[Tuple[float, float, float, float]] = None,
         progressive_callback=None,
+        map_overlay: Optional["SatelliteOverlay"] = None,
+        terrain_model: Optional["TerrainModel"] = None,
     ) -> Dict[object, SimulationResult]:
         settings = heatmap_settings
+        if terrain_model is not None and bool(getattr(terrain_model, "enabled", True)):
+            return RFEngine._simulate_groups_uniform(
+                floor, floors, group_aps, resolution_m, patterns, include_inter_floor,
+                settings, progress_callback, calculation_boundary, calculation_extent,
+                progressive_callback=progressive_callback,
+                map_overlay=map_overlay,
+                terrain_model=terrain_model,
+            )
         coarse_resolution = max(float(resolution_m) * 2.0, float(getattr(settings, "adaptive_coarse_resolution_m", 3.0)))
         if not bool(getattr(settings, "enable_adaptive_rf_grid", True)) or coarse_resolution <= float(resolution_m) * 1.15:
             return RFEngine._simulate_groups_uniform(
                 floor, floors, group_aps, resolution_m, patterns, include_inter_floor,
                 settings, progress_callback, calculation_boundary, calculation_extent,
                 progressive_callback=progressive_callback,
+                map_overlay=map_overlay,
+                terrain_model=terrain_model,
             )
 
         def coarse_progress(done, total):
@@ -4346,6 +4827,7 @@ class RFEngine:
         coarse = RFEngine._simulate_groups_uniform(
             floor, floors, group_aps, coarse_resolution, patterns, include_inter_floor,
             settings, coarse_progress, calculation_boundary, calculation_extent,
+            map_overlay=map_overlay, terrain_model=terrain_model,
         )
         if not coarse:
             return {}
@@ -4418,7 +4900,7 @@ class RFEngine:
         exact = RFEngine._simulate_groups_uniform(
             floor, floors, group_aps, resolution_m, patterns, include_inter_floor,
             settings, fine_progress, calculation_boundary, calculation_extent, refine_mask, (fine_xs, fine_ys),
-            progressive_callback=None,
+            progressive_callback=None, map_overlay=map_overlay, terrain_model=terrain_model,
         )
         final = {}
         for key, base in interpolated.items():
@@ -4462,6 +4944,8 @@ class RFEngine:
         calculation_extent: Optional[Tuple[float, float, float, float]] = None,
         progressive_callback=None,
         profile_override: Optional[str] = None,
+        map_overlay: Optional["SatelliteOverlay"] = None,
+        terrain_model: Optional["TerrainModel"] = None,
     ) -> Dict[object, SimulationResult]:
         """Incremental per-AP cache around adaptive/exact RF field evaluation."""
         started = time.perf_counter()
@@ -4469,11 +4953,13 @@ class RFEngine:
         group_aps = {key: list(aps) for key, aps in group_aps.items() if aps}
         if not group_aps:
             return {}
-        use_cache = bool(getattr(settings, "enable_per_ap_heatmap_cache", True))
+        terrain_active = terrain_model is not None and bool(getattr(terrain_model, "enabled", True))
+        use_cache = bool(getattr(settings, "enable_per_ap_heatmap_cache", True)) and not terrain_active
         if not use_cache:
             return RFEngine._simulate_groups_adaptive(
                 floor, floors, group_aps, resolution_m, patterns, include_inter_floor,
                 settings, progress_callback, calculation_boundary, calculation_extent, progressive_callback,
+                map_overlay, terrain_model,
             )
         _RF_AP_FIELD_CACHE.configure(
             int(getattr(settings, "per_ap_heatmap_cache_entries", 192)),
@@ -4484,6 +4970,12 @@ class RFEngine:
         pattern_revision = RFEngine._pattern_revision(patterns)
         boundary_revision = RFEngine._boundary_revision(calculation_boundary)
         extent_revision = tuple(round(float(value), 5) for value in calculation_extent) if calculation_extent is not None else None
+        terrain_revision = None
+        if terrain_model is not None and bool(getattr(terrain_model, "enabled", True)):
+            terrain_revision = stable_digest({
+                "terrain": terrain_model.to_dict() if hasattr(terrain_model, "to_dict") else str(terrain_model),
+                "map": map_overlay.to_dict() if map_overlay is not None and hasattr(map_overlay, "to_dict") else None,
+            })
         cached_by_group: Dict[object, List[SimulationResult]] = {key: [] for key in group_aps}
         missing_groups = {}
         missing_cache_keys = {}
@@ -4492,7 +4984,7 @@ class RFEngine:
             for index, ap in enumerate(aps):
                 cache_key = (
                     floor.name, model_revision, settings_revision, pattern_revision, boundary_revision,
-                    extent_revision, bool(include_inter_floor), round(float(resolution_m), 5), RFEngine._ap_revision(ap),
+                    extent_revision, terrain_revision, bool(include_inter_floor), round(float(resolution_m), 5), RFEngine._ap_revision(ap),
                 )
                 cached = _RF_AP_FIELD_CACHE.get(cache_key)
                 if cached is not None:
@@ -4532,6 +5024,8 @@ class RFEngine:
                 floor, floors, missing_groups, resolution_m, patterns, include_inter_floor,
                 settings, progress_callback, calculation_boundary, calculation_extent,
                 progressive_callback=missing_progress if progressive_callback is not None else None,
+                map_overlay=map_overlay,
+                terrain_model=terrain_model,
             )
             for field_key, result in missing_results.items():
                 group_key, cache_key = missing_cache_keys[field_key]
@@ -4580,6 +5074,8 @@ class RFEngine:
         calculation_extent: Optional[Tuple[float, float, float, float]] = None,
         progressive_callback=None,
         profile_override: Optional[str] = None,
+        map_overlay: Optional["SatelliteOverlay"] = None,
+        terrain_model: Optional["TerrainModel"] = None,
     ) -> Dict[float, SimulationResult]:
         """Calculate all requested frequencies in one shared process-pool pass."""
         requested = (
@@ -4626,6 +5122,8 @@ class RFEngine:
                 calculation_extent,
                 progressive_callback,
                 profile_override,
+                map_overlay,
+                terrain_model,
             ))
         if iot_groups:
             iot_settings = RFEngine._iot_rssi_floor_settings(heatmap_settings)
@@ -4642,6 +5140,8 @@ class RFEngine:
                 calculation_extent,
                 progressive_callback,
                 profile_override,
+                map_overlay,
+                terrain_model,
             ))
         effective_settings = RFEngine._profiled_settings(heatmap_settings, profile_override)
         render_override = str(getattr(effective_settings, "heatmap_render_mode", "") or "")
@@ -4663,6 +5163,8 @@ class RFEngine:
         calculation_extent: Optional[Tuple[float, float, float, float]] = None,
         progressive_callback=None,
         profile_override: Optional[str] = None,
+        map_overlay: Optional["SatelliteOverlay"] = None,
+        terrain_model: Optional["TerrainModel"] = None,
     ) -> Optional[SimulationResult]:
         """Compatibility wrapper preserving the original combined-radio result."""
         results = RFEngine._simulate_groups(
@@ -4678,6 +5180,8 @@ class RFEngine:
             calculation_extent,
             progressive_callback,
             profile_override,
+            map_overlay,
+            terrain_model,
         )
         result = results.get("combined")
         if result is not None:
@@ -4851,13 +5355,137 @@ class SatelliteOverlay:
                 center_lat=max(-85.05112878, min(85.05112878, float(data.get("center_lat", 51.0)))),
                 center_lon=max(-180.0, min(180.0, float(data.get("center_lon", 0.0)))),
                 zoom=max(0, min(22, int(data.get("zoom", 17)))),
-                tile_radius=max(0, min(6, int(data.get("tile_radius", 2)))),
+                tile_radius=max(0, min(12, int(data.get("tile_radius", 2)))),
                 center_scene_x=float(data.get("center_scene_x", data.get("origin_x", 0.0))),
                 center_scene_y=float(data.get("center_scene_y", data.get("origin_y", 0.0))),
                 metres_per_scene_metre=max(0.000001, float(data.get("metres_per_scene_metre", 1.0))),
                 rotation_deg=float(data.get("rotation_deg", 0.0)),
                 opacity=max(0.0, min(1.0, float(data.get("opacity", 0.65)))),
                 visible=bool(data.get("visible", True)),
+            )
+        except Exception:
+            return None
+
+
+@dataclass
+class TerrainModel:
+    enabled: bool = True
+    source_name: str = "AWS Terrain Tiles"
+    tile_url_template: str = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
+    attribution: str = "Terrain Tiles: Mapzen, SRTM and other open data sources"
+    zoom: int = 15
+    receiver_height_m: float = 1.0
+    ground_attenuation_db: float = 80.0
+    ground_surface_type: str = "average_ground"
+    ground_relative_permittivity: float = 15.0
+    ground_conductivity_s_per_m: float = 0.005
+    model_ground_elevation_m: float = 0.0
+    visual_sample_count: int = 128
+    visual_vertical_exaggeration: float = 2.0
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "enabled": bool(self.enabled),
+            "source_name": str(self.source_name),
+            "tile_url_template": str(self.tile_url_template),
+            "attribution": str(self.attribution),
+            "zoom": int(self.zoom),
+            "receiver_height_m": float(self.receiver_height_m),
+            "ground_attenuation_db": float(self.ground_attenuation_db),
+            "ground_surface_type": str(self.ground_surface_type),
+            "ground_relative_permittivity": float(self.ground_relative_permittivity),
+            "ground_conductivity_s_per_m": float(self.ground_conductivity_s_per_m),
+            "model_ground_elevation_m": float(self.model_ground_elevation_m),
+            "visual_sample_count": int(self.visual_sample_count),
+            "visual_vertical_exaggeration": float(self.visual_vertical_exaggeration),
+        }
+
+    @classmethod
+    def from_dict(cls, data: object) -> Optional["TerrainModel"]:
+        if not isinstance(data, dict):
+            return None
+        try:
+            return cls(
+                enabled=bool(data.get("enabled", True)),
+                source_name=str(data.get("source_name", "AWS Terrain Tiles")),
+                tile_url_template=str(data.get("tile_url_template", "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png")),
+                attribution=str(data.get("attribution", "Terrain Tiles: Mapzen, SRTM and other open data sources")),
+                zoom=max(0, min(15, int(data.get("zoom", 15)))),
+                receiver_height_m=max(0.0, float(data.get("receiver_height_m", 1.0))),
+                ground_attenuation_db=max(0.0, float(data.get("ground_attenuation_db", 80.0))),
+                ground_surface_type=str(data.get("ground_surface_type", "average_ground")),
+                ground_relative_permittivity=max(1.0, float(data.get("ground_relative_permittivity", 15.0))),
+                ground_conductivity_s_per_m=max(0.0, float(data.get("ground_conductivity_s_per_m", 0.005))),
+                model_ground_elevation_m=float(data.get("model_ground_elevation_m", 0.0)),
+                visual_sample_count=max(16, min(160, int(data.get("visual_sample_count", 128)))),
+                visual_vertical_exaggeration=max(0.25, min(10.0, float(data.get("visual_vertical_exaggeration", 2.0)))),
+            )
+        except Exception:
+            return None
+
+
+@dataclass
+class EstateBuilding:
+    osm_id: str
+    name: str
+    building_type: str
+    polygon: Polygon
+    storeys: int = 2
+    storey_height_m: float = 3.0
+    attenuation_db: float = 18.0
+    source: str = "OpenStreetMap"
+    tags: Dict[str, str] = field(default_factory=dict)
+
+    @property
+    def height_m(self) -> float:
+        return max(0.1, float(self.storeys) * float(self.storey_height_m))
+
+    @property
+    def attenuation_by_band_db(self) -> Dict[float, float]:
+        attenuation = max(0.0, float(self.attenuation_db))
+        return {2400.0: attenuation, 5000.0: attenuation, 6000.0: attenuation}
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "osm_id": str(self.osm_id),
+            "name": str(self.name),
+            "building_type": str(self.building_type),
+            "polygon": [[float(x), float(y)] for x, y in self.polygon.exterior.coords],
+            "storeys": int(self.storeys),
+            "storey_height_m": float(self.storey_height_m),
+            "attenuation_db": float(self.attenuation_db),
+            "source": str(self.source),
+            "tags": {str(key): str(value) for key, value in dict(self.tags or {}).items()},
+        }
+
+    @classmethod
+    def from_dict(cls, data: object) -> Optional["EstateBuilding"]:
+        if not isinstance(data, dict):
+            return None
+        coords = data.get("polygon", [])
+        if not isinstance(coords, list) or len(coords) < 3:
+            return None
+        try:
+            polygon = Polygon([(float(value[0]), float(value[1])) for value in coords])
+            if not polygon.is_valid:
+                polygon = polygon.buffer(0)
+            if polygon.is_empty:
+                return None
+            if polygon.geom_type != "Polygon":
+                parts = list(getattr(polygon, "geoms", []) or [])
+                if not parts:
+                    return None
+                polygon = max(parts, key=lambda part: float(part.area))
+            return cls(
+                osm_id=str(data.get("osm_id", f"estate-building-{uuid.uuid4().hex}")),
+                name=str(data.get("name", "OSM building")),
+                building_type=str(data.get("building_type", "building")),
+                polygon=polygon,
+                storeys=max(1, int(float(data.get("storeys", 2)))),
+                storey_height_m=max(0.1, float(data.get("storey_height_m", 3.0))),
+                attenuation_db=max(0.0, float(data.get("attenuation_db", 18.0))),
+                source=str(data.get("source", "OpenStreetMap")),
+                tags={str(key): str(value) for key, value in dict(data.get("tags", {}) or {}).items()},
             )
         except Exception:
             return None
@@ -5728,6 +6356,10 @@ def _rf_grid_multi_tile_worker(args):
         xs,
         ys_slice,
         valid_mask_slice,
+        receiver_z_slice,
+        terrain_ys,
+        terrain_elevation_grid,
+        terrain_model,
         start_index,
         disconnected,
         worker_cache_entries,
@@ -5748,6 +6380,9 @@ def _rf_grid_multi_tile_worker(args):
     xs = np.asarray(xs, dtype=float)
     ys_slice = np.asarray(ys_slice, dtype=float)
     valid_mask_slice = None if valid_mask_slice is None else np.asarray(valid_mask_slice, dtype=bool)
+    receiver_z_slice = None if receiver_z_slice is None else np.asarray(receiver_z_slice, dtype=float)
+    terrain_ys = ys_slice if terrain_ys is None else np.asarray(terrain_ys, dtype=float)
+    terrain_elevation_grid = None if terrain_elevation_grid is None else np.asarray(terrain_elevation_grid, dtype=float)
     radio_links_by_group = {
         key: RFEngine._active_radio_links(floor, group_aps.get(key, []), include_inter_floor)
         for key in group_order
@@ -5776,7 +6411,7 @@ def _rf_grid_multi_tile_worker(args):
     # Vectorised unobstructed upper-bound masks remove AP/radio links that cannot
     # contribute even before any Shapely intersection or ray work starts.
     influence_masks: Dict[Tuple[int, int], np.ndarray] = {}
-    if bool(getattr(heatmap_settings, "enable_tile_influence_pruning", True)):
+    if receiver_z_slice is None and bool(getattr(heatmap_settings, "enable_tile_influence_pruning", True)):
         for group_index, key in enumerate(group_order):
             for link_index, (ap, radio) in enumerate(radio_links_by_group.get(key, [])):
                 ap_floor = floors.get(ap.floor)
@@ -5791,7 +6426,7 @@ def _rf_grid_multi_tile_worker(args):
                 upper = best_case_rssi_grid(
                     xs, ys_slice, ap.x, ap.y, dz,
                     RFEngine.free_space_loss_db_at_1m(radio.frequency_mhz),
-                    ap.path_loss_exponent, eirp,
+                    RFEngine.distance_path_loss_exponent(ap.path_loss_exponent, heatmap_settings), eirp,
                     bool(getattr(heatmap_settings, "enable_numba_rf_kernels", True)),
                 )
                 absolute_cutoff = (
@@ -5889,9 +6524,17 @@ def _rf_grid_multi_tile_worker(args):
                         if influence is not None and not bool(influence[iy, ix]):
                             continue
                         if not RFEngine.point_is_inside_radio_cutoff(
-                            xx_value, yy_value, floor, ap, floors, radio, heatmap_settings
+                            xx_value, yy_value, floor, ap, floors, radio, heatmap_settings,
+                            None if receiver_z_slice is None else float(receiver_z_slice[iy, ix]),
                         ):
                             continue
+                        receiver_z = None if receiver_z_slice is None else float(receiver_z_slice[iy, ix])
+                        ap_floor = floors.get(ap.floor)
+                        ground_loss = RFEngine._terrain_obstruction_loss_db(
+                            ap, ap_floor, xx_value, yy_value,
+                            receiver_z if receiver_z is not None else float(floor.elevation) + float(ap.rx_height_m),
+                            xs, terrain_ys, terrain_elevation_grid, terrain_model,
+                        )
                         ap_key = (str(ap.name), round(float(ap.x), 5), round(float(ap.y), 5))
                         local_wall_indexes, local_opening_indexes = local_indexes_by_ap.get(
                             ap_key, (wall_indexes, opening_indexes)
@@ -5902,6 +6545,8 @@ def _rf_grid_multi_tile_worker(args):
                             local_opening_indexes, reflection_indexes, geometry_cache,
                             reflection_subsets.get(ap_key),
                             reflection_sequences_by_ap.get(ap_key),
+                            receiver_z,
+                            ground_loss,
                         ))
                     combined = RFEngine.combine_ap_samples(samples, heatmap_settings, float(disconnected))
                     if shared_specs:
@@ -9005,9 +9650,9 @@ class SatelliteOverlayDialog(QDialog):
         form.addRow("Zoom", self.zoom)
 
         self.tile_radius = QSpinBox()
-        self.tile_radius.setRange(0, 6)
+        self.tile_radius.setRange(0, 12)
         self.tile_radius.setValue(int(overlay.tile_radius))
-        self.tile_radius.setToolTip("0 loads one tile; 2 loads a 5 x 5 tile block. Keep this modest for public tile services.")
+        self.tile_radius.setToolTip("0 loads one tile; 2 loads 5 x 5; 6 loads 13 x 13; 12 loads 25 x 25. Use a licensed or local tile service for large estate surveys.")
         form.addRow("Tile radius", self.tile_radius)
 
         self.center_scene_x = QDoubleSpinBox()
@@ -9093,10 +9738,87 @@ class SatelliteOverlayDialog(QDialog):
         )
 
 
+class EstateBuildingsDialog(QDialog):
+    def __init__(self, parent, buildings: Sequence[EstateBuilding]):
+        super().__init__(parent)
+        self.setWindowTitle("Estate buildings from OpenStreetMap")
+        self.resize(980, 560)
+        self._buildings = [building for building in buildings]
+        layout = QVBoxLayout(self)
+        label = QLabel(
+            "Review the OpenStreetMap building footprints to add around the estate. "
+            "Set the number of storeys and the fixed RF attenuation used for each property."
+        )
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        self.table = QTableWidget(len(self._buildings), 7)
+        self.table.setHorizontalHeaderLabels([
+            "Use", "Name", "Type", "Area m2", "Storeys", "Storey height m", "Attenuation dB"
+        ])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        for row, building in enumerate(self._buildings):
+            use_item = QTableWidgetItem("")
+            use_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            use_item.setCheckState(Qt.Checked)
+            self.table.setItem(row, 0, use_item)
+            for col, value in (
+                (1, building.name or building.osm_id),
+                (2, building.building_type or "building"),
+                (3, f"{float(building.polygon.area):.1f}"),
+            ):
+                item = QTableWidgetItem(str(value))
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                self.table.setItem(row, col, item)
+            storeys = QSpinBox()
+            storeys.setRange(1, 200)
+            storeys.setValue(max(1, int(building.storeys)))
+            self.table.setCellWidget(row, 4, storeys)
+            storey_height = QDoubleSpinBox()
+            storey_height.setRange(0.5, 12.0)
+            storey_height.setDecimals(2)
+            storey_height.setSingleStep(0.25)
+            storey_height.setSuffix(" m")
+            storey_height.setValue(max(0.5, float(building.storey_height_m)))
+            self.table.setCellWidget(row, 5, storey_height)
+            attenuation = QDoubleSpinBox()
+            attenuation.setRange(0.0, 120.0)
+            attenuation.setDecimals(1)
+            attenuation.setSingleStep(1.0)
+            attenuation.setSuffix(" dB")
+            attenuation.setValue(max(0.0, float(building.attenuation_db)))
+            self.table.setCellWidget(row, 6, attenuation)
+        self.table.resizeColumnsToContents()
+        self.table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.table, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_buildings(self) -> List[EstateBuilding]:
+        selected: List[EstateBuilding] = []
+        for row, building in enumerate(self._buildings):
+            item = self.table.item(row, 0)
+            if item is None or item.checkState() != Qt.Checked:
+                continue
+            storeys = self.table.cellWidget(row, 4)
+            storey_height = self.table.cellWidget(row, 5)
+            attenuation = self.table.cellWidget(row, 6)
+            selected.append(replace(
+                building,
+                storeys=int(storeys.value()) if isinstance(storeys, QSpinBox) else int(building.storeys),
+                storey_height_m=float(storey_height.value()) if isinstance(storey_height, QDoubleSpinBox) else float(building.storey_height_m),
+                attenuation_db=float(attenuation.value()) if isinstance(attenuation, QDoubleSpinBox) else float(building.attenuation_db),
+            ))
+        return selected
+
+
 class MapPointRotationAlignmentDialog(QDialog):
     """Choose a real-world map point and rotation before clicking its IFC match."""
 
-    def __init__(self, parent=None, overlay: Optional[SatelliteOverlay] = None):
+    def __init__(self, parent=None, overlay: Optional[SatelliteOverlay] = None, hint_text: str = ""):
         super().__init__(parent)
         self.setWindowTitle("Align map to IFC point")
         self.setModal(True)
@@ -9128,7 +9850,7 @@ class MapPointRotationAlignmentDialog(QDialog):
         self.metres_per_scene_metre.setValue(float(overlay.metres_per_scene_metre))
         form.addRow("Map metres per scene metre", self.metres_per_scene_metre)
 
-        hint = QLabel("After pressing OK, click the matching point on the IFC plan. The selected map latitude/longitude will be pinned to that scene point.")
+        hint = QLabel(hint_text or "After pressing OK, click the matching point on the IFC plan. The selected map latitude/longitude will be pinned to that scene point.")
         hint.setWordWrap(True)
         form.addRow(hint)
 
@@ -9144,6 +9866,56 @@ class MapPointRotationAlignmentDialog(QDialog):
             "rotation_deg": float(self.rotation_deg.value()),
             "metres_per_scene_metre": float(self.metres_per_scene_metre.value()),
         }
+
+
+if QQuick3DGeometry is not None:
+    class TerrainMeshGeometry(QQuick3DGeometry):
+        _mesh_payload: Optional[Dict[str, object]] = None
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            payload = TerrainMeshGeometry._mesh_payload
+            if payload is not None:
+                self._apply_payload(payload)
+
+        @classmethod
+        def set_mesh_payload(cls, payload: Optional[Dict[str, object]]):
+            cls._mesh_payload = payload
+
+        def _apply_payload(self, payload: Dict[str, object]):
+            vertex_data = payload.get("vertex_data", b"")
+            index_data = payload.get("index_data", b"")
+            bounds_min = payload.get("bounds_min", (0.0, 0.0, 0.0))
+            bounds_max = payload.get("bounds_max", (0.0, 0.0, 0.0))
+            if not vertex_data or not index_data:
+                return
+            self.clear()
+            self.setPrimitiveType(QQuick3DGeometry.PrimitiveType.Triangles)
+            self.setStride(24)
+            self.setVertexData(QByteArray(bytes(vertex_data)))
+            self.setIndexData(QByteArray(bytes(index_data)))
+            self.addAttribute(
+                QQuick3DGeometry.Attribute.Semantic.PositionSemantic,
+                0,
+                QQuick3DGeometry.Attribute.ComponentType.F32Type,
+            )
+            self.addAttribute(
+                QQuick3DGeometry.Attribute.Semantic.NormalSemantic,
+                12,
+                QQuick3DGeometry.Attribute.ComponentType.F32Type,
+            )
+            self.addAttribute(
+                QQuick3DGeometry.Attribute.Semantic.IndexSemantic,
+                0,
+                QQuick3DGeometry.Attribute.ComponentType.U32Type,
+            )
+            self.setBounds(
+                QVector3D(float(bounds_min[0]), float(bounds_min[1]), float(bounds_min[2])),
+                QVector3D(float(bounds_max[0]), float(bounds_max[1]), float(bounds_max[2])),
+            )
+            self.update()
+else:
+    TerrainMeshGeometry = None
 
 
 class APSpacePlacementDialog(QDialog):
@@ -9416,18 +10188,27 @@ class Building3DViewDialog(QDialog):
     def __init__(
         self, parent, floors: Dict[str, FloorModel], aps: List[AccessPoint],
         heatmap_settings: Optional[HeatmapSettings] = None,
+        estate_buildings: Optional[Sequence[EstateBuilding]] = None,
+        map_overlay: Optional[SatelliteOverlay] = None,
+        terrain_model: Optional[TerrainModel] = None,
     ):
         super().__init__(parent)
         self.floors = dict(floors or {})
         self.aps = list(aps or [])
         self.heatmap_settings = heatmap_settings
+        self.estate_buildings = list(estate_buildings or [])
+        self.map_overlay = map_overlay
+        self.terrain_model = terrain_model
         self._qml_path: Optional[Path] = None
         self.setWindowTitle("3D building and access point view")
         self.resize(1180, 820)
 
         layout = QVBoxLayout(self)
         summary = QLabel(
-            f"{len(self.floors)} floor(s), {len(self.aps)} wireless access point(s). "
+            f"{len(self.floors)} floor(s), {len(self.aps)} wireless access point(s), "
+            f"{len(self.estate_buildings)} estate building(s). "
+            f"Terrain detail {self._terrain_sample_count()} x {self._terrain_sample_count()}"
+            f"{' at ' + str(float(getattr(self.terrain_model, 'visual_vertical_exaggeration', 1.0))) + 'x relief.' if self.terrain_model is not None else '. '} "
             "Left-drag to orbit, right/middle-drag to pan, wheel to zoom."
         )
         summary.setWordWrap(True)
@@ -9464,6 +10245,9 @@ class Building3DViewDialog(QDialog):
 
     def _all_model_bounds(self) -> Tuple[float, float, float, float]:
         bounds = []
+        map_bounds = self._map_overlay_scene_bounds()
+        if map_bounds is not None:
+            bounds.append(map_bounds)
         for floor in self.floors.values():
             for collection_name in ("spaces", "walls", "elements"):
                 for obj in getattr(floor, collection_name, []):
@@ -9476,6 +10260,11 @@ class Building3DViewDialog(QDialog):
                         continue
         for ap in self.aps:
             bounds.append((float(ap.x), float(ap.y), float(ap.x), float(ap.y)))
+        for building in self.estate_buildings:
+            try:
+                bounds.append(tuple(float(value) for value in building.polygon.bounds))
+            except Exception:
+                pass
         if not bounds:
             return (-10.0, -10.0, 10.0, 10.0)
         minx = min(value[0] for value in bounds)
@@ -9489,6 +10278,52 @@ class Building3DViewDialog(QDialog):
             miny -= 5.0
             maxy += 5.0
         return (minx, miny, maxx, maxy)
+
+    def _map_overlay_scene_bounds(self) -> Optional[Tuple[float, float, float, float]]:
+        overlay = self.map_overlay
+        if overlay is None:
+            return None
+        try:
+            z = max(0, min(22, int(overlay.zoom)))
+            radius = max(0, min(12, int(overlay.tile_radius)))
+            tile_count = radius * 2 + 1
+            tile_px = 256
+            centre_x, centre_y = RFEngine._lonlat_to_xyz_tile(float(overlay.center_lon), float(overlay.center_lat), z)
+            base_x = int(math.floor(centre_x)) - radius
+            base_y = int(math.floor(centre_y)) - radius
+            centre_px_x = (centre_x - float(base_x)) * tile_px
+            centre_px_y = (centre_y - float(base_y)) * tile_px
+            ground_m_per_px = (
+                math.cos(math.radians(float(overlay.center_lat)))
+                * 40075016.68557849
+                / (float(tile_px) * float(2 ** z))
+            )
+            scene_m_per_px = ground_m_per_px / max(0.000001, float(overlay.metres_per_scene_metre))
+            angle = math.radians(float(overlay.rotation_deg))
+            cos_a = math.cos(angle)
+            sin_a = math.sin(angle)
+            corners = []
+            width_px = float(tile_count * tile_px)
+            height_px = float(tile_count * tile_px)
+            for px, py in (
+                (-centre_px_x, -centre_px_y),
+                (width_px - centre_px_x, -centre_px_y),
+                (width_px - centre_px_x, height_px - centre_px_y),
+                (-centre_px_x, height_px - centre_px_y),
+            ):
+                x = px * scene_m_per_px
+                y = -py * scene_m_per_px
+                rx = float(overlay.center_scene_x) + x * cos_a - y * sin_a
+                ry = float(overlay.center_scene_y) + x * sin_a + y * cos_a
+                corners.append((rx, ry))
+            return (
+                min(point[0] for point in corners),
+                min(point[1] for point in corners),
+                max(point[0] for point in corners),
+                max(point[1] for point in corners),
+            )
+        except Exception:
+            return None
 
     def _floor_bounds(self, floor: FloorModel) -> Optional[Tuple[float, float, float, float]]:
         bounds = []
@@ -9553,12 +10388,133 @@ class Building3DViewDialog(QDialog):
             f'materials: [ PrincipledMaterial {{ baseColor: "{self._qml_colour(colour, alpha)}"; roughness: 0.55; opacity: {self._qml_number(max(0.0, min(1.0, alpha / 255.0)))} }} ] }}'
         )
 
+    def _terrain_model_lines(self) -> List[str]:
+        if self.map_overlay is None or self.terrain_model is None or not bool(getattr(self.terrain_model, "enabled", True)):
+            return []
+        minx, miny, maxx, maxy = self.model_bounds
+        samples = self._terrain_sample_count()
+        xs = np.linspace(float(minx), float(maxx), samples)
+        ys = np.linspace(float(miny), float(maxy), samples)
+        terrain_only = replace(self.terrain_model, receiver_height_m=0.0)
+        grid = RFEngine._terrain_receiver_z_grid(xs, ys, self.map_overlay, terrain_only)
+        if grid is None:
+            return []
+        payload = self._terrain_mesh_payload(xs, ys, grid)
+        if payload is not None and TerrainMeshGeometry is not None:
+            TerrainMeshGeometry.set_mesh_payload(payload)
+            return [
+                'Model { geometry: TerrainMeshGeometry {} '
+                'materials: [ PrincipledMaterial { baseColor: "#7BA05B"; roughness: 0.9; opacity: 0.96 } ] }'
+            ]
+        lines: List[str] = []
+        dx = max(0.2, (float(maxx) - float(minx)) / max(1, samples - 1))
+        dy = max(0.2, (float(maxy) - float(miny)) / max(1, samples - 1))
+        min_z = float(np.nanmin(grid)) if np.size(grid) else 0.0
+        max_z = float(np.nanmax(grid)) if np.size(grid) else 0.0
+        span_z = max(0.1, max_z - min_z)
+        base_z = min(0.0, min_z)
+        exaggeration = max(0.25, min(10.0, float(getattr(self.terrain_model, "visual_vertical_exaggeration", 2.0) or 2.0)))
+        for iy, yy in enumerate(ys):
+            for ix, xx in enumerate(xs):
+                z = float(grid[iy, ix])
+                tint = (z - min_z) / span_z
+                colour = "#6B8E23" if tint < 0.33 else ("#8AA05A" if tint < 0.66 else "#A8A29E")
+                display_z = base_z + (z - base_z) * exaggeration
+                column_height = max(0.08, display_z - base_z + 0.08)
+                point = self._model_point(float(xx), float(yy), base_z + column_height * 0.5)
+                lines.append(self._model_qml("#Cube", *point, dx * 0.98, column_height, dy * 0.98, colour, 185))
+        return lines
+
+    def _terrain_mesh_payload(self, xs: np.ndarray, ys: np.ndarray, grid: np.ndarray) -> Optional[Dict[str, object]]:
+        rows, cols = int(len(ys)), int(len(xs))
+        if rows < 2 or cols < 2:
+            return None
+        min_z = float(np.nanmin(grid)) if np.size(grid) else 0.0
+        base_z = min(0.0, min_z)
+        exaggeration = max(0.25, min(10.0, float(getattr(self.terrain_model, "visual_vertical_exaggeration", 2.0) or 2.0)))
+        positions = np.zeros((rows, cols, 3), dtype=np.float32)
+        for iy, yy in enumerate(ys):
+            for ix, xx in enumerate(xs):
+                z = float(grid[iy, ix])
+                display_z = base_z + (z - base_z) * exaggeration
+                positions[iy, ix, :] = np.asarray(self._model_point(float(xx), float(yy), display_z), dtype=np.float32)
+        normals = np.zeros_like(positions, dtype=np.float32)
+        indices: List[int] = []
+
+        def add_face(a: Tuple[int, int], b: Tuple[int, int], c: Tuple[int, int]):
+            ia = a[0] * cols + a[1]
+            ib = b[0] * cols + b[1]
+            ic = c[0] * cols + c[1]
+            pa = positions[a[0], a[1]]
+            pb = positions[b[0], b[1]]
+            pc = positions[c[0], c[1]]
+            normal = np.cross(pb - pa, pc - pa)
+            length = float(np.linalg.norm(normal))
+            if length > 1e-9:
+                normal = normal / length
+                normals[a[0], a[1]] += normal
+                normals[b[0], b[1]] += normal
+                normals[c[0], c[1]] += normal
+            indices.extend((ia, ib, ic))
+
+        for iy in range(rows - 1):
+            for ix in range(cols - 1):
+                add_face((iy, ix), (iy + 1, ix), (iy, ix + 1))
+                add_face((iy, ix + 1), (iy + 1, ix), (iy + 1, ix + 1))
+        flat_normals = normals.reshape((-1, 3))
+        lengths = np.linalg.norm(flat_normals, axis=1)
+        for index, length in enumerate(lengths):
+            if float(length) > 1e-9:
+                flat_normals[index] /= float(length)
+            else:
+                flat_normals[index] = np.asarray((0.0, 1.0, 0.0), dtype=np.float32)
+        vertices = bytearray()
+        for position, normal in zip(positions.reshape((-1, 3)), flat_normals):
+            vertices.extend(struct.pack(
+                "<ffffff",
+                float(position[0]), float(position[1]), float(position[2]),
+                float(normal[0]), float(normal[1]), float(normal[2]),
+            ))
+        index_data = bytearray()
+        for index in indices:
+            index_data.extend(struct.pack("<I", int(index)))
+        bounds_min = tuple(float(value) for value in positions.reshape((-1, 3)).min(axis=0))
+        bounds_max = tuple(float(value) for value in positions.reshape((-1, 3)).max(axis=0))
+        return {
+            "vertex_data": bytes(vertices),
+            "index_data": bytes(index_data),
+            "bounds_min": bounds_min,
+            "bounds_max": bounds_max,
+        }
+
+    def _terrain_sample_count(self) -> int:
+        requested = int(getattr(self.terrain_model, "visual_sample_count", 48) or 48) if self.terrain_model is not None else 0
+        return max(16, min(160, requested))
+
+    def _estate_building_model_lines(self) -> List[str]:
+        lines: List[str] = []
+        for building in self.estate_buildings:
+            try:
+                minx, miny, maxx, maxy = [float(value) for value in building.polygon.bounds]
+            except Exception:
+                continue
+            height = max(0.2, float(building.height_m))
+            centre = self._model_point((minx + maxx) * 0.5, (miny + maxy) * 0.5, height * 0.5)
+            lines.append(self._model_qml(
+                "#Cube", *centre,
+                max(0.3, maxx - minx), height, max(0.3, maxy - miny),
+                "#8B5CF6", 150,
+            ))
+        return lines
+
     def _scene_model_lines(self) -> List[str]:
         self.model_bounds = self._all_model_bounds()
         self.floor_levels = self._display_floor_levels()
         minx, miny, maxx, maxy = self.model_bounds
         self.scene_span = max(maxx - minx, maxy - miny, 1.0)
         lines: List[str] = []
+        lines.extend(self._terrain_model_lines())
+        lines.extend(self._estate_building_model_lines())
         floor_colours = ["#2563EB", "#059669", "#D97706", "#7C3AED", "#0891B2", "#BE123C"]
         ordered_floors = sorted(self.floors.values(), key=lambda floor: (self.floor_levels.get(str(floor.name), 0.0), str(floor.name)))
         for index, floor in enumerate(ordered_floors):
@@ -9625,6 +10581,12 @@ class Building3DViewDialog(QDialog):
         ]
 
     def _write_qml_scene(self) -> Path:
+        terrain_import = ""
+        if qmlRegisterType is not None and TerrainMeshGeometry is not None and not getattr(Building3DViewDialog, "_terrain_mesh_qml_registered", False):
+            qmlRegisterType(TerrainMeshGeometry, "RFTerrain", 1, 0, "TerrainMeshGeometry")
+            Building3DViewDialog._terrain_mesh_qml_registered = True
+        if qmlRegisterType is not None and TerrainMeshGeometry is not None:
+            terrain_import = "import RFTerrain 1.0"
         model_lines = "\n                ".join(self._scene_model_lines())
         max_level = max(self.floor_levels.values(), default=0.0) if hasattr(self, "floor_levels") else 0.0
         distance = max(16.0, float(getattr(self, "scene_span", 20.0)) * 1.25)
@@ -9633,6 +10595,7 @@ class Building3DViewDialog(QDialog):
         qml = f"""
 import QtQuick
 import QtQuick3D
+{terrain_import}
 
 Rectangle {{
     id: root
@@ -10188,6 +11151,26 @@ class PlanView(QGraphicsView):
         pos = self.mapToScene(event.position().toPoint())
         self.main.add_ap(pos.x(), pos.y())
 
+    def contextMenuEvent(self, event):
+        if (
+            getattr(self.main, "alignment_pick_mode", None)
+            or getattr(self.main, "wall_draw_mode", False)
+            or getattr(self.main, "space_draw_mode", False)
+            or getattr(self.main, "boundary_draw_mode", False)
+            or getattr(self.main, "ap_placement_mode", "")
+        ):
+            super().contextMenuEvent(event)
+            return
+        pos = self.mapToScene(event.pos())
+        menu = QMenu(self)
+        inspect_action = menu.addAction("Inspect RSSI loss calculation")
+        chosen = menu.exec(event.globalPos())
+        if chosen == inspect_action:
+            self.main.show_rssi_loss_calculation_at_point(pos)
+            event.accept()
+            return
+        super().contextMenuEvent(event)
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -10289,6 +11272,8 @@ class MainWindow(QMainWindow):
         self.dxf_overlay: Optional[DxfOverlay] = None
         self.dxf_export_alignment: Optional[Dict[str, object]] = None
         self.satellite_overlay: Optional[SatelliteOverlay] = None
+        self.terrain_model: Optional[TerrainModel] = None
+        self.estate_buildings: List[EstateBuilding] = []
         self.rssi_calculation_extents: Dict[str, Tuple[float, float, float, float]] = {}
         self.ifc_alignment = AlignmentTransform()
         self.alignment_pick_mode: Optional[str] = None
@@ -10538,8 +11523,18 @@ class MainWindow(QMainWindow):
         self.edit_satellite_action.triggered.connect(self.show_satellite_overlay_dialog)
         self.align_satellite_action = QAction("Align estate map to IFC point", self)
         self.align_satellite_action.triggered.connect(self.start_satellite_point_rotation_alignment)
+        self.align_satellite_to_ifc_insertion_action = QAction("Align map to IFC insertion", self)
+        self.align_satellite_to_ifc_insertion_action.triggered.connect(self.align_satellite_to_ifc_insertion_point)
         self.use_satellite_extent_action = QAction("Use map as RF area", self)
         self.use_satellite_extent_action.triggered.connect(self.use_satellite_overlay_as_rssi_extent)
+        self.load_terrain_action = QAction("Load land model", self)
+        self.load_terrain_action.triggered.connect(self.load_terrain_model)
+        self.clear_terrain_action = QAction("Clear land model", self)
+        self.clear_terrain_action.triggered.connect(self.clear_terrain_model)
+        self.import_estate_buildings_action = QAction("Import OSM buildings", self)
+        self.import_estate_buildings_action.triggered.connect(self.import_osm_estate_buildings)
+        self.clear_estate_buildings_action = QAction("Clear OSM buildings", self)
+        self.clear_estate_buildings_action.triggered.connect(self.clear_estate_buildings)
         self.clear_rssi_extent_action = QAction("Clear RF area", self)
         self.clear_rssi_extent_action.triggered.connect(self.clear_current_floor_rssi_extent)
         self.clear_satellite_action = QAction("Clear estate map imagery", self)
@@ -10699,9 +11694,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "OpenStreetMap tile use",
-                "OpenStreetMap public tiles are for modest interactive use. The tile radius has been reduced to 2 to avoid bulk fetching.",
+                "OpenStreetMap public tiles are for modest interactive use. Large tile radii can bulk-fetch many tiles; use a licensed/custom or local tile service for estate-wide survey work.",
             )
-            overlay.tile_radius = 2
         self.satellite_overlay = overlay
         self.draw_floor()
         self.statusBar().showMessage(f"Loaded estate map imagery from {overlay.source_name}")
@@ -10719,17 +11713,321 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Click the matching IFC/model point for the selected map latitude/longitude. Right-click or Esc to cancel.")
         self.view.setCursor(Qt.CrossCursor)
 
+    def align_satellite_to_ifc_insertion_point(self):
+        if not self.floors:
+            QMessageBox.information(self, "No IFC loaded", "Load an IFC model before aligning the estate map to the IFC insertion point.")
+            return
+        if self.satellite_overlay is None:
+            self.show_satellite_overlay_dialog()
+            if self.satellite_overlay is None:
+                return
+        try:
+            scene_x, scene_y, source = self._ifc_insertion_point_for_project()
+        except Exception as exc:
+            QMessageBox.warning(self, "IFC insertion point", str(exc))
+            return
+        dialog = MapPointRotationAlignmentDialog(
+            self,
+            self.satellite_overlay,
+            "Press OK to pin the selected map latitude/longitude directly to the IFC insertion/base point. No plan click is required.",
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        self._pending_satellite_alignment = dialog.values()
+        self.apply_satellite_point_rotation_alignment(float(scene_x), float(scene_y))
+        self.statusBar().showMessage(
+            f"Aligned estate map to IFC insertion point ({source}) at X {scene_x:.3f}, Y {scene_y:.3f}."
+        )
+
     def clear_satellite_overlay(self):
         self.satellite_overlay = None
+        self.terrain_model = None
+        self.estate_buildings = []
+        self._invalidate_interactive_preview_requests()
+        self.last_result = None
+        self.rssi_results_by_frequency = {}
         self.draw_floor()
-        self.statusBar().showMessage("Cleared estate map imagery")
+        self.statusBar().showMessage("Cleared estate map imagery, land model and OSM estate buildings")
+
+    def _active_terrain_overlay(self) -> Optional[SatelliteOverlay]:
+        overlay = getattr(self, "satellite_overlay", None)
+        terrain = getattr(self, "terrain_model", None)
+        if overlay is None or terrain is None or not bool(getattr(terrain, "enabled", True)):
+            return None
+        return replace(overlay, pixmap=None, extent_m=(0.0, 0.0))
+
+    def _active_terrain_model(self) -> Optional[TerrainModel]:
+        terrain = getattr(self, "terrain_model", None)
+        overlay = getattr(self, "satellite_overlay", None)
+        if overlay is None or terrain is None or not bool(getattr(terrain, "enabled", True)):
+            return None
+        return replace(terrain)
+
+    @staticmethod
+    def _lonlat_to_scene(lon: float, lat: float, overlay: SatelliteOverlay) -> Tuple[float, float]:
+        radius = 6378137.0
+        lon = max(-180.0, min(180.0, float(lon)))
+        lat = max(-85.05112878, min(85.05112878, float(lat)))
+        center_lon = max(-180.0, min(180.0, float(overlay.center_lon)))
+        center_lat = max(-85.05112878, min(85.05112878, float(overlay.center_lat)))
+        x = radius * math.radians(lon)
+        y = radius * math.log(math.tan(math.pi * 0.25 + math.radians(lat) * 0.5))
+        center_x = radius * math.radians(center_lon)
+        center_y = radius * math.log(math.tan(math.pi * 0.25 + math.radians(center_lat) * 0.5))
+        map_x = (x - center_x) / max(1e-9, float(overlay.metres_per_scene_metre))
+        map_y = (y - center_y) / max(1e-9, float(overlay.metres_per_scene_metre))
+        angle = math.radians(float(overlay.rotation_deg))
+        cos_a = math.cos(angle)
+        sin_a = math.sin(angle)
+        scene_x = float(overlay.center_scene_x) + map_x * cos_a - map_y * sin_a
+        scene_y = float(overlay.center_scene_y) + map_x * sin_a + map_y * cos_a
+        return scene_x, scene_y
+
+    @staticmethod
+    def _tag_float(tags: Dict[str, str], key: str) -> Optional[float]:
+        text = str(tags.get(key, "") or "").strip().lower().replace("metres", "m").replace("meters", "m")
+        if not text:
+            return None
+        match = re.search(r"-?\d+(?:\.\d+)?", text)
+        if not match:
+            return None
+        try:
+            return float(match.group(0))
+        except Exception:
+            return None
+
+    def _estate_ifc_occupied_geometry(self):
+        polygons = []
+        for floor in self.floors.values():
+            for collection_name in ("spaces", "walls", "elements"):
+                for obj in getattr(floor, collection_name, []):
+                    polygon = getattr(obj, "polygon", None)
+                    if polygon is not None and not getattr(polygon, "is_empty", True):
+                        polygons.append(polygon)
+        if not polygons:
+            return None
+        try:
+            return unary_union(polygons).buffer(0.05)
+        except Exception:
+            return None
+
+    def _osm_building_query_bbox(self) -> Optional[Tuple[float, float, float, float]]:
+        overlay = getattr(self, "satellite_overlay", None)
+        if overlay is None:
+            return None
+        extent = self._satellite_overlay_scene_bounds(overlay)
+        if extent is None:
+            return None
+        minx, miny, maxx, maxy = extent
+        corners = [
+            RFEngine._scene_to_lonlat(x, y, overlay)
+            for x, y in ((minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy))
+        ]
+        corners = [corner for corner in corners if corner is not None]
+        if not corners:
+            return None
+        lons = [float(corner[0]) for corner in corners]
+        lats = [float(corner[1]) for corner in corners]
+        return (min(lats), min(lons), max(lats), max(lons))
+
+    def _fetch_osm_buildings(self, bbox: Tuple[float, float, float, float]) -> List[EstateBuilding]:
+        south, west, north, east = bbox
+        query = f"""
+[out:json][timeout:35];
+(
+  way["building"]({south:.8f},{west:.8f},{north:.8f},{east:.8f});
+);
+out tags geom;
+"""
+        request = urllib.request.Request(
+            "https://overpass-api.de/api/interpreter",
+            data=query.encode("utf-8"),
+            headers={
+                "User-Agent": "RF-Attenuation-Simulator/1.0 osm-estate-buildings",
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=45) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        overlay = self.satellite_overlay
+        if overlay is None:
+            return []
+        buildings: List[EstateBuilding] = []
+        occupied = self._estate_ifc_occupied_geometry()
+        seen = set()
+        for element in data.get("elements", []):
+            if not isinstance(element, dict) or element.get("type") != "way":
+                continue
+            osm_id = f"way/{element.get('id', '')}"
+            if osm_id in seen:
+                continue
+            seen.add(osm_id)
+            tags = {str(key): str(value) for key, value in dict(element.get("tags", {}) or {}).items()}
+            geometry = element.get("geometry", [])
+            if not isinstance(geometry, list) or len(geometry) < 3:
+                continue
+            try:
+                points = [
+                    self._lonlat_to_scene(float(point["lon"]), float(point["lat"]), overlay)
+                    for point in geometry
+                    if isinstance(point, dict) and "lat" in point and "lon" in point
+                ]
+                if len(points) < 3:
+                    continue
+                polygon = Polygon(points)
+                if not polygon.is_valid:
+                    polygon = polygon.buffer(0)
+                if polygon.is_empty:
+                    continue
+                if polygon.geom_type != "Polygon":
+                    parts = list(getattr(polygon, "geoms", []) or [])
+                    if not parts:
+                        continue
+                    polygon = max(parts, key=lambda part: float(part.area))
+                if float(polygon.area) < 4.0:
+                    continue
+                if occupied is not None:
+                    overlap = polygon.intersection(occupied).area
+                    if overlap / max(1e-9, polygon.area) > 0.20:
+                        continue
+                levels = self._tag_float(tags, "building:levels")
+                height = self._tag_float(tags, "height")
+                storey_height = 3.0
+                if levels is None and height is not None:
+                    levels = max(1.0, height / storey_height)
+                elif levels is not None and height is not None and levels > 0:
+                    storey_height = max(1.5, height / levels)
+                buildings.append(EstateBuilding(
+                    osm_id=osm_id,
+                    name=str(tags.get("name") or tags.get("addr:housename") or osm_id),
+                    building_type=str(tags.get("building") or "building"),
+                    polygon=polygon,
+                    storeys=max(1, int(round(levels or 2))),
+                    storey_height_m=storey_height,
+                    attenuation_db=18.0,
+                    source="OpenStreetMap",
+                    tags=tags,
+                ))
+            except Exception:
+                continue
+        buildings.sort(key=lambda building: (building.name, building.osm_id))
+        return buildings
+
+    def _estate_building_elements_for_floor(self, floor: FloorModel) -> List[IFCElement2D]:
+        elements: List[IFCElement2D] = []
+        base = min((float(value.elevation) for value in self.floors.values()), default=float(floor.elevation))
+        floor_z = float(floor.elevation)
+        for building in getattr(self, "estate_buildings", []) or []:
+            z_min = base
+            z_max = base + building.height_m
+            if floor_z > z_max + 0.25:
+                continue
+            elements.append(IFCElement2D(
+                guid=f"osm-estate-{building.osm_id}",
+                name=building.name,
+                floor=floor.name,
+                source_file=building.source,
+                type_name=building.building_type,
+                material="external estate building",
+                polygon=building.polygon,
+                z_min=z_min,
+                z_max=z_max,
+                source_storey="Estate",
+                projected_to_floor=True,
+                ifc_class="OSMBuilding",
+                rf_category="estate_building",
+                attenuation_by_band_db=building.attenuation_by_band_db,
+                rf_type_override="Estate building",
+                rf_customised=True,
+            ))
+        return elements
+
+    def _floors_with_estate_buildings(self, floors: Dict[str, FloorModel]) -> Dict[str, FloorModel]:
+        if not getattr(self, "estate_buildings", None):
+            return floors
+        copied: Dict[str, FloorModel] = {}
+        for name, floor in floors.items():
+            floor_copy = replace(floor)
+            floor_copy.walls = list(floor.walls)
+            floor_copy.spaces = list(floor.spaces)
+            floor_copy.elements = list(getattr(floor, "elements", []) or []) + self._estate_building_elements_for_floor(floor)
+            copied[name] = floor_copy
+        return copied
+
+    def import_osm_estate_buildings(self):
+        if getattr(self, "satellite_overlay", None) is None:
+            QMessageBox.information(self, "OSM buildings", "Load and align estate map imagery before importing OpenStreetMap building footprints.")
+            return
+        bbox = self._osm_building_query_bbox()
+        if bbox is None:
+            QMessageBox.warning(self, "OSM buildings", "Could not calculate the estate map geographic extent.")
+            return
+        try:
+            buildings = self._fetch_osm_buildings(bbox)
+        except Exception as exc:
+            QMessageBox.warning(self, "OSM buildings", f"OpenStreetMap building import failed:\n{exc}")
+            return
+        if not buildings:
+            QMessageBox.information(self, "OSM buildings", "No OpenStreetMap building footprints were found outside the IFC footprint in the current estate map area.")
+            return
+        dialog = EstateBuildingsDialog(self, buildings)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        selected = dialog.selected_buildings()
+        if not selected:
+            return
+        existing = {building.osm_id: building for building in getattr(self, "estate_buildings", []) or []}
+        for building in selected:
+            existing[building.osm_id] = building
+        self.estate_buildings = sorted(existing.values(), key=lambda building: (building.name, building.osm_id))
+        self._invalidate_interactive_preview_requests()
+        self.last_result = None
+        self.rssi_results_by_frequency = {}
+        self.draw_floor()
+        self.statusBar().showMessage(f"Imported {len(selected)} OpenStreetMap estate building(s) as RF obstruction boxes.")
+
+    def clear_estate_buildings(self):
+        count = len(getattr(self, "estate_buildings", []) or [])
+        self.estate_buildings = []
+        self._invalidate_interactive_preview_requests()
+        self.last_result = None
+        self.rssi_results_by_frequency = {}
+        self.draw_floor()
+        self.statusBar().showMessage(f"Cleared {count} OpenStreetMap estate building obstruction(s).")
+
+    def load_terrain_model(self):
+        if getattr(self, "satellite_overlay", None) is None:
+            QMessageBox.information(
+                self,
+                "Land model",
+                "Load and align estate map imagery first so terrain tiles can be matched to the IFC coordinates.",
+            )
+            return
+        self.terrain_model = TerrainModel(enabled=True)
+        self._invalidate_interactive_preview_requests()
+        self.last_result = None
+        self.rssi_results_by_frequency = {}
+        self._update_rssi_legend()
+        self.statusBar().showMessage(
+            "Loaded land model from AWS Terrain Tiles; RSSI samples use 1 m receiver height and P.527 average-ground surface properties."
+        )
+
+    def clear_terrain_model(self):
+        self.terrain_model = None
+        self._invalidate_interactive_preview_requests()
+        self.last_result = None
+        self.rssi_results_by_frequency = {}
+        self._update_rssi_legend()
+        self.statusBar().showMessage("Cleared land model; RSSI receiver height is again based on the IFC floor.")
 
     def _satellite_overlay_scene_bounds(self, overlay: Optional[SatelliteOverlay] = None) -> Optional[Tuple[float, float, float, float]]:
         overlay = overlay or getattr(self, "satellite_overlay", None)
         if overlay is None:
             return None
         z = max(0, min(22, int(overlay.zoom)))
-        radius = max(0, min(6, int(overlay.tile_radius)))
+        radius = max(0, min(12, int(overlay.tile_radius)))
         tile_count = radius * 2 + 1
         tile_px = 256
         centre_x, centre_y = self._lonlat_to_xyz_tile(float(overlay.center_lon), float(overlay.center_lat), z)
@@ -11059,9 +12357,29 @@ class MainWindow(QMainWindow):
                 "Align map to IFC", "Pin a chosen map latitude/longitude to a clicked IFC point and apply a manual map rotation.",
                 "SP_DialogApplyButton", ""
             ),
+            "align_satellite_to_ifc_insertion_action": (
+                "Map to IFC insertion", "Pin a chosen map latitude/longitude directly to the IFC insertion/base point.",
+                "SP_DialogYesButton", ""
+            ),
             "use_satellite_extent_action": (
                 "Use map as RF area", "Expand the current floor's RSSI simulation grid to the visible estate map tile area.",
                 "SP_TitleBarMaxButton", ""
+            ),
+            "load_terrain_action": (
+                "Load land model", "Use open Terrain Tiles elevation data with the estate map alignment and sample RSSI at 1 m above ground.",
+                "SP_ArrowDown", ""
+            ),
+            "clear_terrain_action": (
+                "Clear land model", "Stop using terrain elevation in RSSI simulations.",
+                "SP_DialogDiscardButton", ""
+            ),
+            "import_estate_buildings_action": (
+                "Import OSM buildings", "Import nearby OpenStreetMap building footprints as estate RF obstruction boxes.",
+                "SP_FileDialogContentsView", ""
+            ),
+            "clear_estate_buildings_action": (
+                "Clear OSM buildings", "Remove imported OpenStreetMap estate building obstructions.",
+                "SP_DialogCancelButton", ""
             ),
             "clear_rssi_extent_action": (
                 "Clear RF area", "Return the current floor's RSSI simulation grid to the IFC/AP-derived area.",
@@ -11339,7 +12657,7 @@ class MainWindow(QMainWindow):
         ribbon.addTab(self._make_ribbon_page([
             ("IFC information", ["ifc_origin_action", "building_3d_view_action"]),
             ("DXF and alignment", ["open_dxf_action", "align_ifc_action", "two_point_align_action", "clear_dxf_action"]),
-            ("Estate map", ["open_satellite_action", "edit_satellite_action", "align_satellite_action", "use_satellite_extent_action", "clear_rssi_extent_action", "clear_satellite_action"]),
+            ("Estate map", ["open_satellite_action", "edit_satellite_action", "align_satellite_action", "align_satellite_to_ifc_insertion_action", "use_satellite_extent_action", "load_terrain_action", "import_estate_buildings_action", "clear_estate_buildings_action", "clear_terrain_action", "clear_rssi_extent_action", "clear_satellite_action"]),
             ("View orientation", ["rotate_left_action", "rotate_right_action", "reset_rotation_action"]),
         ]), "Model and view")
         ribbon.addTab(self._make_ribbon_page([
@@ -12205,6 +13523,9 @@ class MainWindow(QMainWindow):
         settings_snapshot = copy.deepcopy(self.heatmap_settings)
         setattr(settings_snapshot, "_cancel_event", None)
         patterns_snapshot = copy.deepcopy(self.antenna_patterns)
+        terrain_model_snapshot = self._active_terrain_model()
+        map_overlay_snapshot = self._active_terrain_overlay()
+        floors_snapshot = self._floors_with_estate_buildings(self.floors)
         resolution = max(
             float(self.resolution.value()),
             float(getattr(settings_snapshot, "interactive_preview_resolution_m", 3.0)),
@@ -12250,7 +13571,7 @@ class MainWindow(QMainWindow):
             try:
                 result = RFEngine.simulate_frequencies(
                     floor=floor,
-                    floors=self.floors,
+                    floors=floors_snapshot,
                     aps=aps_snapshot,
                     frequencies_mhz=active_freqs,
                     resolution_m=resolution,
@@ -12260,6 +13581,8 @@ class MainWindow(QMainWindow):
                     calculation_boundary=calculation_boundary,
                     calculation_extent=calculation_extent,
                     profile_override=profile_override,
+                    map_overlay=map_overlay_snapshot,
+                    terrain_model=terrain_model_snapshot,
                 )
             except BaseException as exc:
                 future.set_exception(exc)
@@ -12434,7 +13757,15 @@ class MainWindow(QMainWindow):
         if not self.floors:
             QMessageBox.information(self, "No model loaded", "Load an IFC model before opening the 3D building view.")
             return
-        dialog = Building3DViewDialog(self, self.floors, self.aps, self.heatmap_settings)
+        dialog = Building3DViewDialog(
+            self,
+            self.floors,
+            self.aps,
+            self.heatmap_settings,
+            getattr(self, "estate_buildings", []) or [],
+            self._active_terrain_overlay(),
+            self._active_terrain_model(),
+        )
         dialog.exec()
 
     # ----------------------------- RF wall creation/editing -----------------------------
@@ -13278,7 +14609,7 @@ class MainWindow(QMainWindow):
             if add_polygon(getattr(wall, "polygon", None), f"wall:{wall.source_file}:{wall.guid}"):
                 wall_count += 1
 
-        for element in getattr(self.floor, "elements", []):
+        for element in list(getattr(self.floor, "elements", []) or []) + self._estate_building_elements_for_floor(self.floor):
             if not self._ifc_element_blocks_space_inference(element):
                 continue
             if add_polygon(getattr(element, "polygon", None), f"element:{element.source_file}:{element.guid}"):
@@ -14946,7 +16277,12 @@ class MainWindow(QMainWindow):
         radius = RFEngine.cutoff_radius_m_for_radio(radio, self.heatmap_settings)
         if radius > 0.0 and distance > radius:
             return float(self.heatmap_settings.disconnected_rssi_dbm)
-        path_loss = RFEngine.free_space_loss_db_at_1m(radio.frequency_mhz) + 10.0 * float(ap.path_loss_exponent) * math.log10(distance)
+        path_loss = RFEngine.distance_path_loss_db(
+            radio.frequency_mhz,
+            distance,
+            ap.path_loss_exponent,
+            self.heatmap_settings,
+        )
         bearing = math.degrees(math.atan2(dy, dx))
         az_rel = bearing - float(ap.azimuth_deg)
         horizontal_distance = max(1e-9, math.hypot(dx, dy))
@@ -16250,6 +17586,10 @@ class MainWindow(QMainWindow):
             "ifc_alignment": {"dx": self.ifc_alignment.dx, "dy": self.ifc_alignment.dy, "rotation_deg": self.ifc_alignment.rotation_deg, "scale": self.ifc_alignment.scale},
             "dxf_alignment": dxf_export_alignment,
             "satellite_overlay": self.satellite_overlay.to_dict() if self.satellite_overlay is not None else None,
+            "terrain_model": self.terrain_model.to_dict() if self.terrain_model is not None else None,
+            "estate_buildings": [
+                building.to_dict() for building in getattr(self, "estate_buildings", []) or []
+            ],
             "rssi_calculation_extents": {
                 str(floor): [float(value) for value in extent]
                 for floor, extent in sorted(getattr(self, "rssi_calculation_extents", {}).items())
@@ -16305,6 +17645,22 @@ class MainWindow(QMainWindow):
                 str(floor): tuple(round(float(value), 5) for value in extent)
                 for floor, extent in sorted(getattr(self, "rssi_calculation_extents", {}).items())
             },
+            "terrain_model": (
+                self.terrain_model.to_dict()
+                if getattr(self, "terrain_model", None) is not None
+                and bool(getattr(self.terrain_model, "enabled", True))
+                else None
+            ),
+            "terrain_map": (
+                self.satellite_overlay.to_dict()
+                if getattr(self, "terrain_model", None) is not None
+                and bool(getattr(self.terrain_model, "enabled", True))
+                and getattr(self, "satellite_overlay", None) is not None
+                else None
+            ),
+            "estate_buildings": [
+                building.to_dict() for building in getattr(self, "estate_buildings", []) or []
+            ],
         }
 
     def _simulation_signature(
@@ -16327,6 +17683,7 @@ class MainWindow(QMainWindow):
             if radios:
                 relevant_aps.append(RFEngine._ap_revision(replace(ap, radios=radios)))
         geometry_models = self.floors if include_inter_floor else {str(floor.name): floor}
+        geometry_models = self._floors_with_estate_buildings(geometry_models)
         return stable_digest({
             "context": signature_context,
             "floor": str(floor.name),
@@ -16588,6 +17945,14 @@ class MainWindow(QMainWindow):
         self.dxf_overlay = None
         self.dxf_export_alignment = self._validated_dxf_export_alignment(data.get("dxf_alignment"))
         self.satellite_overlay = SatelliteOverlay.from_dict(data.get("satellite_overlay"))
+        self.terrain_model = TerrainModel.from_dict(data.get("terrain_model"))
+        if self.satellite_overlay is None:
+            self.terrain_model = None
+        self.estate_buildings = []
+        for item in data.get("estate_buildings", []):
+            building = EstateBuilding.from_dict(item)
+            if building is not None:
+                self.estate_buildings.append(building)
         self.rssi_calculation_extents = {}
         raw_extents = data.get("rssi_calculation_extents", {})
         if isinstance(raw_extents, dict):
@@ -17074,6 +18439,224 @@ class MainWindow(QMainWindow):
                 details.append(f"Contributing paths: {max(0, int(round(count)))}")
         details.append(f"X {scene_pos.x():.2f} m   Y {scene_pos.y():.2f} m")
         self.view.show_rssi_hover("\n".join(details), viewport_pos)
+
+    def _terrain_inspection_grid(
+        self,
+        x: float,
+        y: float,
+        floors: Dict[str, FloorModel],
+        aps: Sequence[AccessPoint],
+    ) -> Tuple[Optional[float], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[TerrainModel], str]:
+        terrain_model = self._active_terrain_model()
+        map_overlay = self._active_terrain_overlay()
+        if terrain_model is None or map_overlay is None:
+            return None, None, None, None, None, ""
+        xs_values = [float(x)]
+        ys_values = [float(y)]
+        for ap in aps:
+            xs_values.append(float(ap.x))
+            ys_values.append(float(ap.y))
+        min_x, max_x = min(xs_values), max(xs_values)
+        min_y, max_y = min(ys_values), max(ys_values)
+        if abs(max_x - min_x) < 1.0:
+            min_x -= 1.0; max_x += 1.0
+        if abs(max_y - min_y) < 1.0:
+            min_y -= 1.0; max_y += 1.0
+        xs = np.linspace(min_x, max_x, 33, dtype=float)
+        ys = np.linspace(min_y, max_y, 33, dtype=float)
+        try:
+            receiver_grid = RFEngine._terrain_receiver_z_grid(xs, ys, map_overlay, terrain_model)
+        except Exception as exc:
+            return None, None, None, None, terrain_model, f"Terrain model unavailable for this inspection: {exc}"
+        if receiver_grid is None:
+            return None, None, None, None, terrain_model, "Terrain model unavailable for this inspection point."
+        receiver_z = RFEngine._sample_regular_grid_value(xs, ys, receiver_grid, float(x), float(y))
+        if receiver_z is None:
+            return None, None, None, None, terrain_model, "Terrain receiver height could not be sampled at this point."
+        terrain_elevation = receiver_grid - max(0.0, float(getattr(terrain_model, "receiver_height_m", 1.0)))
+        return float(receiver_z), xs, ys, terrain_elevation, terrain_model, ""
+
+    @staticmethod
+    def _rf_object_loss_label(obj) -> str:
+        name = str(getattr(obj, "name", "") or getattr(obj, "type_name", "") or obj.__class__.__name__).strip()
+        category = str(getattr(obj, "rf_category", "") or "").strip()
+        material = str(getattr(obj, "rf_type_override", "") or getattr(obj, "material", "") or getattr(obj, "type_name", "") or "").strip()
+        source = str(getattr(obj, "source_file", "") or "").strip()
+        bits = [name]
+        if category and category.lower() not in name.lower():
+            bits.append(category)
+        if material and material.lower() not in " ".join(bits).lower():
+            bits.append(material)
+        if source and source.lower() not in " ".join(bits).lower():
+            bits.append(source)
+        return " | ".join(bit for bit in bits if bit) or obj.__class__.__name__
+
+    @staticmethod
+    def _format_frequency_label(frequency_mhz: float) -> str:
+        return f"{frequency_mhz / 1000.0:g} GHz" if float(frequency_mhz) >= 1000.0 else f"{float(frequency_mhz):g} MHz"
+
+    def _format_link_budget_report(self, x: float, y: float, breakdowns: List[Dict[str, object]], terrain_note: str) -> str:
+        lines: List[str] = []
+        floor_name = self.floor.name if self.floor is not None else "No floor"
+        lines.append(f"RSSI loss calculation at X {x:.3f} m, Y {y:.3f} m on {floor_name}")
+        lines.append("=" * 78)
+        if terrain_note:
+            lines.append(terrain_note)
+            lines.append("")
+        for index, item in enumerate(breakdowns, start=1):
+            ap = item.get("ap")
+            radio = item.get("radio")
+            ap_name = str(getattr(ap, "name", "AP"))
+            radio_name = str(getattr(radio, "name", "radio"))
+            frequency = float(getattr(radio, "frequency_mhz", 0.0) or 0.0)
+            rssi = float(item.get("rssi_dbm", float("nan")))
+            lines.append(f"{index}. {ap_name} / {radio_name} ({self._format_frequency_label(frequency)}) -> {rssi:.2f} dBm")
+            if not bool(item.get("available", False)):
+                lines.append(f"   Not evaluated: {item.get('reason', 'unavailable')}")
+                lines.append("")
+                continue
+            geometry = item.get("geometry", {}) or {}
+            lines.append(
+                "   Path: "
+                f"AP ({float(getattr(ap, 'x', 0.0)):.2f}, {float(getattr(ap, 'y', 0.0)):.2f}, "
+                f"{float(geometry.get('ap_z', 0.0)):.2f} m) -> antenna '{item.get('antenna_pattern', '')}' -> "
+                f"receiver ({x:.2f}, {y:.2f}, {float(geometry.get('rx_z', 0.0)):.2f} m)"
+            )
+            lines.append(
+                "   Geometry: "
+                f"horizontal {float(geometry.get('horizontal_d', 0.0)):.2f} m, "
+                f"3D {float(geometry.get('distance_3d', 0.0)):.2f} m, "
+                f"bearing {float(geometry.get('bearing', 0.0)):.1f} deg, "
+                f"elevation {float(geometry.get('elevation', 0.0)):.1f} deg"
+            )
+            lines.append("   Link budget:")
+            lines.append(f"      TX power                                      +{float(item.get('tx_power_dbm', 0.0)):8.2f} dBm")
+            lines.append(
+                f"      Antenna pattern gain                         +{float(item.get('pattern_gain_dbi', 0.0)):8.2f} dB "
+                f"(az rel {float(item.get('azimuth_relative_deg', 0.0)):.1f} deg, "
+                f"el rel {float(item.get('elevation_relative_deg', 0.0)):.1f} deg)"
+            )
+            lines.append(f"      Additional radio antenna gain                +{float(item.get('radio_antenna_gain_dbi', 0.0)):8.2f} dB")
+            lines.append(f"      {str(item.get('path_loss_model', 'Path loss')):<49} -{float(item.get('path_loss_db', 0.0)):8.2f} dB")
+            walls = list(item.get("walls", []) or [])
+            elements = list(item.get("elements", []) or [])
+            slabs = list(item.get("slabs", []) or [])
+            if walls:
+                for wall, loss in walls:
+                    lines.append(f"      Wall: {self._rf_object_loss_label(wall):<43} -{float(loss):8.2f} dB")
+            else:
+                lines.append("      Walls crossed                                  -    0.00 dB")
+            if elements:
+                for element, loss in elements:
+                    lines.append(f"      Element/opening: {self._rf_object_loss_label(element):<34} -{float(loss):8.2f} dB")
+            else:
+                lines.append("      IFC/OSM elements crossed                       -    0.00 dB")
+            floor_loss = float(item.get("floor_loss_db", 0.0))
+            if floor_loss > 1.0e-9:
+                slab_names = ", ".join(self._rf_object_loss_label(slab) for slab in slabs) if slabs else "configured inter-floor loss"
+                lines.append(f"      Floor/slab penetration: {slab_names:<31} -{floor_loss:8.2f} dB")
+            else:
+                lines.append("      Floor/slab penetration                         -    0.00 dB")
+            extra_loss = float(item.get("extra_path_loss_db", 0.0))
+            if extra_loss > 1.0e-9:
+                lines.append(f"      {str(item.get('extra_path_loss_label', 'Extra path loss')):<49} -{extra_loss:8.2f} dB")
+            lines.append(f"      Final RSSI                                      {rssi:8.2f} dBm")
+            lines.append("")
+        return "\n".join(lines).rstrip()
+
+    def show_rssi_loss_calculation_at_point(self, scene_pos: QPointF):
+        if self.floor is None:
+            QMessageBox.information(self, "RSSI loss calculation", "Select a floor before inspecting RSSI loss.")
+            return
+        if not self.aps:
+            QMessageBox.information(self, "RSSI loss calculation", "Place at least one access point before inspecting RSSI loss.")
+            return
+        x = float(scene_pos.x())
+        y = float(scene_pos.y())
+        floors = self._floors_with_estate_buildings(self.floors)
+        receiver_floor = floors.get(self.floor.name, self.floor)
+        selected_frequency = self._selected_rssi_view_frequency()
+        links: List[Tuple[AccessPoint, APRadio]] = []
+        for ap in self.aps:
+            for radio in ap.active_radios():
+                if selected_frequency is not None and abs(float(radio.frequency_mhz) - float(selected_frequency)) > 1.0e-6:
+                    continue
+                links.append((ap, radio))
+        if not links and selected_frequency is not None:
+            for ap in self.aps:
+                links.extend((ap, radio) for radio in ap.active_radios())
+        if not links:
+            QMessageBox.information(self, "RSSI loss calculation", "No enabled AP radios are available for inspection.")
+            return
+
+        aps = [ap for ap, _ in links]
+        receiver_z_override, terrain_xs, terrain_ys, terrain_elevation, terrain_model, terrain_note = self._terrain_inspection_grid(
+            x, y, floors, aps
+        )
+        if terrain_model is not None and not terrain_note:
+            terrain_note = (
+                f"Terrain receiver height: {float(getattr(terrain_model, 'receiver_height_m', 1.0)):g} m above ground; "
+                f"P.527 surface {getattr(terrain_model, 'ground_surface_type', 'average_ground')} "
+                f"epsr={float(getattr(terrain_model, 'ground_relative_permittivity', 15.0)):g}, "
+                f"sigma={float(getattr(terrain_model, 'ground_conductivity_s_per_m', 0.005)):g} S/m"
+            )
+        wall_indexes = RFEngine._build_wall_indexes(floors)
+        opening_indexes = RFEngine._build_opening_indexes(floors)
+        geometry_cache: Dict[object, object] = {}
+        breakdowns: List[Dict[str, object]] = []
+        include_inter_floor = bool(self.include_inter_floor.isChecked()) if hasattr(self, "include_inter_floor") else True
+        for ap, radio in links:
+            ground_loss = 0.0
+            if (
+                terrain_model is not None
+                and receiver_z_override is not None
+                and terrain_xs is not None
+                and terrain_ys is not None
+                and terrain_elevation is not None
+            ):
+                ground_loss = RFEngine._terrain_obstruction_loss_db(
+                    ap,
+                    floors.get(ap.floor),
+                    x,
+                    y,
+                    float(receiver_z_override),
+                    terrain_xs,
+                    terrain_ys,
+                    terrain_elevation,
+                    terrain_model,
+                )
+            breakdowns.append(RFEngine.link_budget_breakdown(
+                x,
+                y,
+                receiver_floor,
+                ap,
+                floors,
+                self.antenna_patterns,
+                radio,
+                include_inter_floor,
+                self.heatmap_settings,
+                wall_indexes,
+                opening_indexes,
+                geometry_cache,
+                receiver_z_override,
+                ground_loss,
+                "Terrain/ground obstruction",
+            ))
+        breakdowns.sort(key=lambda item: float(item.get("rssi_dbm", -999.0)), reverse=True)
+        report = self._format_link_budget_report(x, y, breakdowns, terrain_note)
+        dialog = QDialog(self)
+        dialog.setWindowTitle("RSSI loss calculation")
+        dialog.resize(980, 720)
+        layout = QVBoxLayout(dialog)
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setFont(QFont("Consolas", 9))
+        text.setPlainText(report)
+        layout.addWidget(text, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.exec()
 
     def _detect_dark_theme(self) -> bool:
         """Return True when the active Qt/OS palette appears to be dark."""
@@ -17748,7 +19331,7 @@ class MainWindow(QMainWindow):
 
     def _build_satellite_pixmap(self, overlay: SatelliteOverlay) -> Optional[Tuple[QPixmap, float, float, float]]:
         z = max(0, min(22, int(overlay.zoom)))
-        radius = max(0, min(6, int(overlay.tile_radius)))
+        radius = max(0, min(12, int(overlay.tile_radius)))
         centre_x, centre_y = self._lonlat_to_xyz_tile(float(overlay.center_lon), float(overlay.center_lat), z)
         base_x = int(math.floor(centre_x)) - radius
         base_y = int(math.floor(centre_y)) - radius
@@ -18351,7 +19934,9 @@ class MainWindow(QMainWindow):
             "draw_boundary_action", "draw_polygon_boundary_action", "suggest_external_boundary_action",
             "create_spaces_action", "clear_inferred_spaces_action", "clear_boundaries_action", "ifc_origin_action", "building_3d_view_action",
             "open_satellite_action", "edit_satellite_action", "align_satellite_action",
-            "use_satellite_extent_action", "clear_rssi_extent_action", "clear_satellite_action",
+            "align_satellite_to_ifc_insertion_action",
+            "use_satellite_extent_action", "load_terrain_action", "import_estate_buildings_action", "clear_estate_buildings_action",
+            "clear_terrain_action", "clear_rssi_extent_action", "clear_satellite_action",
             "rotate_left_action", "rotate_right_action", "reset_rotation_action", "save_plan_action", "load_plan_action",
         ):
             action = getattr(self, action_name, None)
@@ -19557,7 +21142,7 @@ class MainWindow(QMainWindow):
         floor geometry is intentionally shared read-only rather than deep-copied.
         """
         context = simulation_context or {}
-        floors = context.get("floors", self.floors)
+        floors = context.get("floors", self._floors_with_estate_buildings(self.floors))
         aps = context.get("aps", self.aps)
         resolution_m = float(context.get("resolution_m", self.resolution.value()))
         patterns = context.get("patterns", self.antenna_patterns)
@@ -19579,6 +21164,8 @@ class MainWindow(QMainWindow):
             calculation_extent = context.get("calculation_extent")
         else:
             calculation_extent = self._rssi_extent_for_floor(floor)
+        terrain_model = context.get("terrain_model", self._active_terrain_model())
+        map_overlay = context.get("map_overlay", self._active_terrain_overlay())
         return RFEngine.simulate_frequencies(
             floor,
             floors,
@@ -19592,6 +21179,8 @@ class MainWindow(QMainWindow):
             calculation_boundary=calculation_boundary,
             calculation_extent=calculation_extent,
             progressive_callback=progressive_callback,
+            map_overlay=map_overlay,
+            terrain_model=terrain_model,
         )
 
     @staticmethod
@@ -19605,6 +21194,9 @@ class MainWindow(QMainWindow):
         settings: HeatmapSettings,
         calculation_boundary,
         calculation_extent: Optional[Tuple[float, float, float, float]] = None,
+        map_overlay: Optional[SatelliteOverlay] = None,
+        terrain_model: Optional[TerrainModel] = None,
+        estate_buildings: Optional[Sequence[EstateBuilding]] = None,
     ) -> str:
         """Return a compact identity used to reject stale background output."""
         return stable_digest({
@@ -19617,6 +21209,21 @@ class MainWindow(QMainWindow):
             "settings": RFEngine._settings_revision(settings),
             "boundary": RFEngine._boundary_revision(calculation_boundary),
             "extent": None if calculation_extent is None else tuple(round(float(value), 5) for value in calculation_extent),
+            "terrain_model": (
+                terrain_model.to_dict()
+                if terrain_model is not None and bool(getattr(terrain_model, "enabled", True))
+                else None
+            ),
+            "terrain_map": (
+                map_overlay.to_dict()
+                if terrain_model is not None
+                and bool(getattr(terrain_model, "enabled", True))
+                and map_overlay is not None
+                else None
+            ),
+            "estate_buildings": [
+                building.to_dict() for building in (estate_buildings or [])
+            ],
         })
 
     def _current_rssi_request_token(
@@ -19627,6 +21234,8 @@ class MainWindow(QMainWindow):
             self.antenna_patterns, bool(self.include_inter_floor.isChecked()),
             self.heatmap_settings, self._rssi_calculation_boundary(floor),
             self._rssi_extent_for_floor(floor),
+            self._active_terrain_overlay(), self._active_terrain_model(),
+            getattr(self, "estate_buildings", []) or [],
         )
 
     def _set_rssi_calculation_ui(self, running: bool):
@@ -19645,7 +21254,9 @@ class MainWindow(QMainWindow):
                 "suggest_external_boundary_action", "create_spaces_action",
                 "clear_inferred_spaces_action", "clear_boundaries_action", "building_3d_view_action",
                 "open_satellite_action", "edit_satellite_action", "align_satellite_action",
+                "align_satellite_to_ifc_insertion_action",
                 "use_satellite_extent_action", "clear_rssi_extent_action", "clear_satellite_action",
+                "load_terrain_action", "clear_terrain_action", "import_estate_buildings_action", "clear_estate_buildings_action",
                 "rotate_left_action", "rotate_right_action", "reset_rotation_action",
                 "load_plan_action",
             )
@@ -20074,6 +21685,9 @@ class MainWindow(QMainWindow):
         patterns_snapshot = copy.deepcopy(self.antenna_patterns)
         resolution_m = float(self.resolution.value())
         include_inter_floor = bool(self.include_inter_floor.isChecked())
+        terrain_model_snapshot = self._active_terrain_model()
+        map_overlay_snapshot = self._active_terrain_overlay()
+        floors_snapshot = self._floors_with_estate_buildings(self.floors)
         calculation_boundaries_by_floor = {
             str(floor.name): self._rssi_calculation_boundary(floor)
             for _, floor in floor_items
@@ -20083,7 +21697,7 @@ class MainWindow(QMainWindow):
             for _, floor in floor_items
         }
         simulation_context: Dict[str, object] = {
-            "floors": self.floors,
+            "floors": floors_snapshot,
             "aps": aps_snapshot,
             "resolution_m": resolution_m,
             "patterns": patterns_snapshot,
@@ -20091,6 +21705,8 @@ class MainWindow(QMainWindow):
             "heatmap_settings": settings_snapshot,
             "calculation_boundaries_by_floor": calculation_boundaries_by_floor,
             "calculation_extents_by_floor": calculation_extents_by_floor,
+            "terrain_model": terrain_model_snapshot,
+            "map_overlay": map_overlay_snapshot,
             "plan_path": (
                 Path(self.current_rf_plan_path)
                 if self.current_rf_plan_path is not None else None
@@ -20102,6 +21718,9 @@ class MainWindow(QMainWindow):
                 patterns_snapshot, include_inter_floor, settings_snapshot,
                 calculation_boundaries_by_floor.get(str(floor.name)),
                 calculation_extents_by_floor.get(str(floor.name)),
+                map_overlay_snapshot,
+                terrain_model_snapshot,
+                getattr(self, "estate_buildings", []) or [],
             )
             for _, floor in floor_items
         }
@@ -20117,6 +21736,11 @@ class MainWindow(QMainWindow):
                 for name, extent in calculation_extents_by_floor.items()
                 if extent is not None
             },
+            "terrain_model": terrain_model_snapshot.to_dict() if terrain_model_snapshot is not None else None,
+            "terrain_map": map_overlay_snapshot.to_dict() if terrain_model_snapshot is not None and map_overlay_snapshot is not None else None,
+            "estate_buildings": [
+                building.to_dict() for building in getattr(self, "estate_buildings", []) or []
+            ],
         }
 
         progress = QProgressDialog(
