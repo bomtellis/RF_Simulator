@@ -26,36 +26,50 @@
       "name": "Excellent",
       "min_dbm": -55,
       "max_dbm": 0,
-      "colour": "#00AA50",
-      "alpha": 220
+      "colour": "#008A4E",
+      "alpha": 150
+    },
+    {
+      "name": "Very good",
+      "min_dbm": -62,
+      "max_dbm": -55,
+      "colour": "#35A853",
+      "alpha": 155
     },
     {
       "name": "Good",
       "min_dbm": -67,
-      "max_dbm": -55,
-      "colour": "#A0C800",
-      "alpha": 220
+      "max_dbm": -62,
+      "colour": "#B7D900",
+      "alpha": 165
+    },
+    {
+      "name": "Usable",
+      "min_dbm": -72,
+      "max_dbm": -67,
+      "colour": "#FFD43B",
+      "alpha": 180
     },
     {
       "name": "Marginal",
-      "min_dbm": -75,
-      "max_dbm": -67,
-      "colour": "#FFAA00",
-      "alpha": 220
+      "min_dbm": -77,
+      "max_dbm": -72,
+      "colour": "#FF922B",
+      "alpha": 205
     },
     {
       "name": "Poor",
       "min_dbm": -82,
-      "max_dbm": -75,
-      "colour": "#DC0000",
-      "alpha": 220
+      "max_dbm": -77,
+      "colour": "#E03131",
+      "alpha": 230
     },
     {
       "name": "Disconnect",
       "min_dbm": -200,
       "max_dbm": -82,
-      "colour": "#555555",
-      "alpha": 185
+      "colour": "#7A1F1F",
+      "alpha": 230
     }
   ],
   "contour_interpolation_factor": 4,

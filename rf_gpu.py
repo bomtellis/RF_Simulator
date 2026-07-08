@@ -296,6 +296,120 @@ if cuda is not None:
             output[gid, 2] = colours[selected, 2]
             output[gid, 3] = colours[selected, 3]
 
+    @cuda.jit(cache=True, fastmath=True)
+    def _cuda_planner_candidate_scores(candidates, sample_xy, weights, strongest, second,
+                                       coverage_deficit, handover_deficit, overall, handover,
+                                       req_data, min_distances, vertical_distances, output,
+                                       coverage_mode_all, coverage_needed, handover_needed,
+                                       capacity_needed, ple, dz, disconnected, vertical_avoidance):
+        start = cuda.grid(1)
+        stride = cuda.gridsize(1)
+        candidate_count = candidates.shape[0]
+        sample_count = sample_xy.shape[0]
+        radio_count = req_data.shape[0]
+        for candidate_index in range(start, candidate_count, stride):
+            cx = candidates[candidate_index, 0]
+            cy = candidates[candidate_index, 1]
+            min_distance = min_distances[candidate_index]
+            vertical_distance = vertical_distances[candidate_index]
+            coverage_gain = 0.0
+            handover_gain = 0.0
+            newly_covered_weight = 0.0
+            newly_handover_weight = 0.0
+            for sample_index in range(sample_count):
+                sx = sample_xy[sample_index, 0]
+                sy = sample_xy[sample_index, 1]
+                dx = sx - cx
+                dy = sy - cy
+                distance2 = dx * dx + dy * dy + dz * dz
+                if distance2 < 1.0:
+                    distance2 = 1.0
+                distance = math.sqrt(distance2)
+                if coverage_mode_all != 0:
+                    proposed_coverage_deficit = 0.0
+                    proposed_handover_deficit = 0.0
+                    proposed_overall = 1
+                    proposed_handover = 1
+                else:
+                    proposed_coverage_deficit = 3.4028235e38
+                    proposed_handover_deficit = 3.4028235e38
+                    proposed_overall = 0
+                    proposed_handover = 0
+                for radio_index in range(radio_count):
+                    cutoff = req_data[radio_index, 2]
+                    if cutoff > 0.0 and distance > cutoff:
+                        candidate_rssi = disconnected
+                    else:
+                        path_loss = req_data[radio_index, 0] + 10.0 * ple * math.log10(distance)
+                        candidate_rssi = req_data[radio_index, 1] - path_loss
+                    before_strongest = strongest[radio_index, sample_index]
+                    before_second = second[radio_index, sample_index]
+                    if candidate_rssi >= before_strongest:
+                        after_strongest = candidate_rssi
+                        after_second = before_strongest
+                    else:
+                        after_strongest = before_strongest
+                        after_second = before_second if before_second >= candidate_rssi else candidate_rssi
+                    threshold = req_data[radio_index, 3]
+                    handover_threshold = req_data[radio_index, 4]
+                    coverage_shortfall = threshold - after_strongest
+                    if coverage_shortfall < 0.0:
+                        coverage_shortfall = 0.0
+                    handover_shortfall = handover_threshold - after_second
+                    if handover_shortfall < 0.0:
+                        handover_shortfall = 0.0
+                    coverage_ok = 1 if after_strongest >= threshold else 0
+                    handover_ok = 1 if after_second >= handover_threshold else 0
+                    if coverage_mode_all != 0:
+                        proposed_coverage_deficit += coverage_shortfall
+                        proposed_handover_deficit += handover_shortfall
+                        if coverage_ok == 0:
+                            proposed_overall = 0
+                        if handover_ok == 0:
+                            proposed_handover = 0
+                    else:
+                        if coverage_shortfall < proposed_coverage_deficit:
+                            proposed_coverage_deficit = coverage_shortfall
+                        if handover_shortfall < proposed_handover_deficit:
+                            proposed_handover_deficit = handover_shortfall
+                        if coverage_ok != 0:
+                            proposed_overall = 1
+                        if handover_ok != 0:
+                            proposed_handover = 1
+                sample_weight = weights[sample_index]
+                delta = coverage_deficit[sample_index] - proposed_coverage_deficit
+                if delta > 0.0:
+                    coverage_gain += delta * sample_weight
+                delta = handover_deficit[sample_index] - proposed_handover_deficit
+                if delta > 0.0:
+                    handover_gain += delta * sample_weight
+                if proposed_overall != 0 and overall[sample_index] == 0:
+                    newly_covered_weight += sample_weight
+                if proposed_handover != 0 and handover[sample_index] == 0:
+                    newly_handover_weight += sample_weight
+            if (coverage_needed != 0 or handover_needed != 0) and coverage_gain <= 1.0e-6 and handover_gain <= 1.0e-6:
+                output[candidate_index] = -3.4028235e38
+                continue
+            score = 0.0
+            if coverage_needed != 0:
+                score += coverage_gain * 12.0 + newly_covered_weight * 220.0
+            else:
+                score += coverage_gain * 1.5
+            if handover_needed != 0:
+                score += handover_gain * 7.5 + newly_handover_weight * 120.0
+            else:
+                score += handover_gain * 0.6
+            if capacity_needed != 0 and coverage_needed == 0 and handover_needed == 0:
+                score += min_distance * 10.0
+            else:
+                score += min_distance * 0.01
+            if math.isfinite(vertical_distance) and vertical_distance < vertical_avoidance:
+                penalty_distance = vertical_distance
+                if penalty_distance < 0.0:
+                    penalty_distance = 0.0
+                score -= (vertical_avoidance - penalty_distance) * 80.0
+            output[candidate_index] = score
+
     @cuda.jit(device=True, inline=True)
     def _cuda_line_box_z_hit(ax, ay, az, dx, dy, z_delta, min_x, max_x, min_y, max_y, z_min, z_max):
         t0 = 0.0
@@ -347,6 +461,25 @@ if cuda is not None:
         zhi = zb if zb > za else za
         return 1 if (zhi >= z_min and zlo <= z_max) else 0
 
+    @cuda.jit(device=True, inline=True)
+    def _cuda_omni_ceiling_pattern_gain(elevation_rel_deg):
+        angle = elevation_rel_deg
+        if angle < -90.0:
+            angle = -90.0
+        elif angle > 90.0:
+            angle = 90.0
+        if angle <= -60.0:
+            return -8.0 + (angle + 90.0) * (5.0 / 30.0)
+        if angle <= -30.0:
+            return -3.0 + (angle + 60.0) * (4.0 / 30.0)
+        if angle <= 0.0:
+            return 1.0 + (angle + 30.0) * (2.0 / 30.0)
+        if angle <= 30.0:
+            return 3.0 - angle * (2.0 / 30.0)
+        if angle <= 60.0:
+            return 1.0 - (angle - 30.0) * (4.0 / 30.0)
+        return -3.0 - (angle - 60.0) * (5.0 / 30.0)
+
     @cuda.jit(cache=True, fastmath=True)
     def _cuda_direct_rssi_paths(xs, ys, valid, ap_data, segments, segment_indices, segment_offsets,
                                 receiver_z, terrain_z, terrain_enabled, ground_loss_db, terrain_clearance,
@@ -381,6 +514,8 @@ if cuda is not None:
             path_loss_factor = ap_data[ai, 5]
             cutoff2 = ap_data[ai, 6]
             dz2 = ap_data[ai, 7]
+            pattern_mode = ap_data[ai, 8]
+            downtilt_deg = ap_data[ai, 9]
             if terrain_enabled != 0:
                 rz = receiver_z[gid]
                 z_delta = rz - az
@@ -458,7 +593,14 @@ if cuda is not None:
                     if terrain_z[ty * cols + tx] >= los_z - terrain_clearance:
                         wall_loss += ground_loss_db
                         break
-            rssi = base_dbm - path_loss_factor * math.log10(d3) - wall_loss
+            pattern_gain = 0.0
+            if pattern_mode >= 0.5 and pattern_mode < 1.5:
+                horizontal = math.sqrt(d2xy)
+                if horizontal < 0.1:
+                    horizontal = 0.1
+                elevation = math.atan2(z_delta, horizontal) * 57.29577951308232
+                pattern_gain = _cuda_omni_ceiling_pattern_gain(elevation + downtilt_deg)
+            rssi = base_dbm + pattern_gain - path_loss_factor * math.log10(d3) - wall_loss
             if rssi < disconnected:
                 rssi = disconnected
             path_rssi[path_index] = rssi
@@ -509,6 +651,8 @@ if cuda is not None:
                 path_loss_factor = ap_data[ai, 5]
                 cutoff2 = ap_data[ai, 6]
                 dz2 = ap_data[ai, 7]
+                pattern_mode = ap_data[ai, 8]
+                downtilt_deg = ap_data[ai, 9]
                 if terrain_enabled != 0:
                     rz = receiver_z[gid]
                     z_delta = rz - az
@@ -596,7 +740,14 @@ if cuda is not None:
                     d3 = math.sqrt(d2xy + dz2)
                     if d3 < 1.0:
                         d3 = 1.0
-                    rssi = base_dbm - path_loss_factor * math.log10(d3) - shared_loss[0]
+                    pattern_gain = 0.0
+                    if pattern_mode >= 0.5 and pattern_mode < 1.5:
+                        horizontal = math.sqrt(d2xy)
+                        if horizontal < 0.1:
+                            horizontal = 0.1
+                        elevation = math.atan2(z_delta, horizontal) * 57.29577951308232
+                        pattern_gain = _cuda_omni_ceiling_pattern_gain(elevation + downtilt_deg)
+                    rssi = base_dbm + pattern_gain - path_loss_factor * math.log10(d3) - shared_loss[0]
                     if rssi < disconnected:
                         rssi = disconnected
                     path_rssi[path_index] = rssi
@@ -647,6 +798,8 @@ if cuda is not None:
             path_loss_factor = ap_data[ai, 5]
             cutoff2 = ap_data[ai, 6]
             dz2 = ap_data[ai, 7]
+            pattern_mode = ap_data[ai, 8]
+            downtilt_deg = ap_data[ai, 9]
             dx = x - ax
             dy = y - ay
             d2xy = dx * dx + dy * dy
@@ -692,7 +845,14 @@ if cuda is not None:
                     zhit = az + z_delta * t
                     if zhit >= segments[si, 4] and zhit <= segments[si, 5]:
                         wall_loss += segments[si, 6]
-            rssi = base_dbm - path_loss_factor * math.log10(d3) - wall_loss
+            pattern_gain = 0.0
+            if pattern_mode >= 0.5 and pattern_mode < 1.5:
+                horizontal = math.sqrt(d2xy)
+                if horizontal < 0.1:
+                    horizontal = 0.1
+                elevation = math.atan2(z_delta, horizontal) * 57.29577951308232
+                pattern_gain = _cuda_omni_ceiling_pattern_gain(elevation + downtilt_deg)
+            rssi = base_dbm + pattern_gain - path_loss_factor * math.log10(d3) - wall_loss
             if rssi < disconnected:
                 rssi = disconnected
             output[ai, 0] = rssi
@@ -753,11 +913,25 @@ class NumbaCUDARFAccelerator:
         self._direct_model_cache_limit = 512 * 1024 * 1024
         self.last_direct_stats = {}
 
+    def _minimum_grid_stride_blocks(self) -> int:
+        """Minimum useful grid size for grid-stride kernels.
+
+        Grid-stride kernels tolerate over-launching: extra blocks simply find no
+        work after the first stride.  Using an SM-scaled floor avoids Numba's
+        low-occupancy launch warning on small planner/export grids and keeps
+        short kernels from running with only a handful of resident blocks.
+        """
+        return min(
+            self._maximum_blocks,
+            max(self._minimum_blocks, self._sm_count * min(8, max(1, self._blocks_per_sm))),
+        )
+
     def _launch_shape(self, count: int, threads: Optional[int] = None) -> Tuple[int, int]:
         count = max(1, int(count))
         threads = max(32, int(threads or self.threads_per_block))
         natural_blocks = max(1, (count + threads - 1) // threads)
-        return min(natural_blocks, self._maximum_blocks), threads
+        blocks = max(natural_blocks, self._minimum_grid_stride_blocks())
+        return min(blocks, self._maximum_blocks), threads
 
     def _block_launch_shape(self, path_count: int, threads: int) -> Tuple[int, int]:
         threads = 32 if threads <= 32 else (64 if threads <= 64 else 128)
@@ -773,6 +947,66 @@ class NumbaCUDARFAccelerator:
             self._direct_path_buffer = cuda.device_array(path_items, dtype=np.float32, stream=stream)
             self._direct_path_capacity = path_items
         return self._direct_rssi_buffer, self._direct_count_buffer, self._direct_path_buffer
+
+    def planner_candidate_scores(
+        self,
+        candidates: np.ndarray,
+        sample_xy: np.ndarray,
+        weights: np.ndarray,
+        strongest: np.ndarray,
+        second: np.ndarray,
+        coverage_deficit: np.ndarray,
+        handover_deficit: np.ndarray,
+        overall: np.ndarray,
+        handover: np.ndarray,
+        req_data: np.ndarray,
+        min_distances: np.ndarray,
+        vertical_distances: np.ndarray,
+        coverage_mode_all: bool,
+        coverage_needed: bool,
+        handover_needed: bool,
+        capacity_needed: bool,
+        ple: float,
+        dz: float,
+        disconnected: float,
+        vertical_avoidance: float,
+    ) -> np.ndarray:
+        candidate_array = np.ascontiguousarray(candidates, dtype=np.float32)
+        if candidate_array.ndim != 2 or candidate_array.shape[0] == 0:
+            return np.empty(0, dtype=np.float32)
+        sample_array = np.ascontiguousarray(sample_xy, dtype=np.float32)
+        req_array = np.ascontiguousarray(req_data, dtype=np.float32)
+        if sample_array.ndim != 2 or sample_array.shape[0] == 0 or req_array.ndim != 2 or req_array.shape[0] == 0:
+            return np.full(candidate_array.shape[0], -np.inf, dtype=np.float32)
+        with self._lock:
+            stream = cuda.stream()
+            d_candidates = cuda.to_device(candidate_array[:, :2], stream=stream)
+            d_sample_xy = cuda.to_device(sample_array[:, :2], stream=stream)
+            d_weights = cuda.to_device(np.ascontiguousarray(weights, dtype=np.float32), stream=stream)
+            d_strongest = cuda.to_device(np.ascontiguousarray(strongest, dtype=np.float32), stream=stream)
+            d_second = cuda.to_device(np.ascontiguousarray(second, dtype=np.float32), stream=stream)
+            d_coverage_deficit = cuda.to_device(np.ascontiguousarray(coverage_deficit, dtype=np.float32), stream=stream)
+            d_handover_deficit = cuda.to_device(np.ascontiguousarray(handover_deficit, dtype=np.float32), stream=stream)
+            d_overall = cuda.to_device(np.ascontiguousarray(overall, dtype=np.uint8), stream=stream)
+            d_handover = cuda.to_device(np.ascontiguousarray(handover, dtype=np.uint8), stream=stream)
+            d_req_data = cuda.to_device(req_array, stream=stream)
+            d_min_distances = cuda.to_device(np.ascontiguousarray(min_distances, dtype=np.float32), stream=stream)
+            d_vertical_distances = cuda.to_device(np.ascontiguousarray(vertical_distances, dtype=np.float32), stream=stream)
+            d_output = cuda.device_array(candidate_array.shape[0], dtype=np.float32, stream=stream)
+            blocks, threads = self._launch_shape(candidate_array.shape[0])
+            _cuda_planner_candidate_scores[blocks, threads, stream](
+                d_candidates, d_sample_xy, d_weights, d_strongest, d_second,
+                d_coverage_deficit, d_handover_deficit, d_overall, d_handover,
+                d_req_data, d_min_distances, d_vertical_distances, d_output,
+                1 if coverage_mode_all else 0,
+                1 if coverage_needed else 0,
+                1 if handover_needed else 0,
+                1 if capacity_needed else 0,
+                float(ple), float(dz), float(disconnected), float(vertical_avoidance),
+            )
+            scores = d_output.copy_to_host(stream=stream)
+            stream.synchronize()
+            return np.asarray(scores, dtype=np.float32)
 
     def _model_buffers(self, compact_aps, prepared_segments, segment_indices, segment_offsets, stream):
         key = (id(compact_aps), id(prepared_segments), id(segment_indices), id(segment_offsets))
@@ -944,7 +1178,11 @@ class NumbaCUDARFAccelerator:
         blocks_per_sm = max(4, min(64, int(_setting(settings, "cuda_blocks_per_sm", 24) or 24)))
         packed_segment_count = int(segment_offsets[-1]) if len(segment_offsets) else 0
         average_segments = (packed_segment_count / ap_count) if ap_count else 0.0
-        use_block_kernel = bool(average_segments >= block_threshold)
+        total_path_items = int(total * ap_count)
+        use_block_kernel = bool(
+            average_segments >= block_threshold
+            and total_path_items >= self._minimum_grid_stride_blocks()
+        )
         cooperative_threads = 32 if average_segments < 64 else (64 if average_segments < 128 else 128)
 
         with self._lock, cuda.gpus[self.device_index]:
@@ -1091,6 +1329,8 @@ class NumbaCUDARFAccelerator:
                 "kernel": "block-per-path" if use_block_kernel else "thread-per-path",
                 "average_segments_per_ap": float(average_segments),
                 "cooperative_threads": int(cooperative_threads if use_block_kernel else 1),
+                "minimum_grid_stride_blocks": int(self._minimum_grid_stride_blocks()),
+                "blocks_per_sm": int(self._blocks_per_sm),
                 "chunk_points": int(chunk_points),
                 "chunks": int(chunk_count),
                 "chunk_memory_budget_points": int(max_points_by_temp_stream),
@@ -1186,6 +1426,15 @@ inline int line_box_z_hit(const float ax,const float ay,const float az,const flo
  const float za=az+z_delta*t0,zb=az+z_delta*t1;const float zlo=fmin(za,zb),zhi=fmax(za,zb);
  return (zhi>=z_min&&zlo<=z_max)?1:0;
 }
+inline float omni_ceiling_pattern_gain(float elevation_rel_deg){
+ float angle=clamp(elevation_rel_deg,-90.0f,90.0f);
+ if(angle<=-60.0f)return -8.0f+(angle+90.0f)*(5.0f/30.0f);
+ if(angle<=-30.0f)return -3.0f+(angle+60.0f)*(4.0f/30.0f);
+ if(angle<=0.0f)return 1.0f+(angle+30.0f)*(2.0f/30.0f);
+ if(angle<=30.0f)return 3.0f-angle*(2.0f/30.0f);
+ if(angle<=60.0f)return 1.0f-(angle-30.0f)*(4.0f/30.0f);
+ return -3.0f-(angle-60.0f)*(5.0f/30.0f);
+}
 __kernel void direct_rssi_paths(__global const float *xs,__global const float *ys,
  __global const uchar *valid,__global const float *aps,__global const float *segments,
  __global const int *segment_indices,__global const int *offsets,__global const float *receiver_z,
@@ -1196,11 +1445,11 @@ __kernel void direct_rssi_paths(__global const float *xs,__global const float *y
  for(int path_index=get_global_id(0);path_index<path_total;path_index+=get_global_size(0)){
   const int ai=path_index/work_count;const int local_gid=path_index-ai*work_count;
   const int gid=start_gid+local_gid;if(gid>=total||valid[gid]==0){path_rssi[path_index]=NAN;continue;}
-  const int ix=gid%cols,iy=gid/cols;const float x=xs[ix],y=ys[iy];const int ab=ai*8;
+  const int ix=gid%cols,iy=gid/cols;const float x=xs[ix],y=ys[iy];const int ab=ai*10;
   const float ax=aps[ab],ay=aps[ab+1],az=aps[ab+2];
   float z_delta=aps[ab+3];
   const float base_dbm=aps[ab+4],path_loss_factor=aps[ab+5],cutoff2=aps[ab+6];
-  float dz2=aps[ab+7];
+  float dz2=aps[ab+7];const float pattern_mode=aps[ab+8],downtilt_deg=aps[ab+9];
   if(terrain_enabled!=0){z_delta=receiver_z[gid]-az;dz2=z_delta*z_delta;}
   const float dx=x-ax,dy=y-ay;const float d2xy=dx*dx+dy*dy;
   if(cutoff2>0.0f&&d2xy>cutoff2){path_rssi[path_index]=NAN;continue;}
@@ -1228,7 +1477,12 @@ __kernel void direct_rssi_paths(__global const float *xs,__global const float *y
     const float los_z=az+z_delta*tline;if(terrain_z[ty*cols+tx]>=los_z-terrain_clearance){wall_loss+=ground_loss_db;break;}
    }
   }
-  float rssi=base_dbm-path_loss_factor*log10(d3)-wall_loss;path_rssi[path_index]=fmax(rssi,disconnected);
+  float pattern_gain=0.0f;
+  if(pattern_mode>=0.5f&&pattern_mode<1.5f){
+   float horizontal=sqrt(d2xy);if(horizontal<0.1f)horizontal=0.1f;
+   pattern_gain=omni_ceiling_pattern_gain(atan2(z_delta,horizontal)*57.29577951308232f+downtilt_deg);
+  }
+  float rssi=base_dbm+pattern_gain-path_loss_factor*log10(d3)-wall_loss;path_rssi[path_index]=fmax(rssi,disconnected);
  }
 }
 
@@ -1248,8 +1502,9 @@ __kernel void inspect_direct_paths(__global const float *aps,__global const floa
  __global const int *segment_indices,__global const int *offsets,const int ap_count,
  const float x,const float y,const float disconnected,__global float *out){
  for(int ai=get_global_id(0);ai<ap_count;ai+=get_global_size(0)){
-  const int ab=ai*8;const float ax=aps[ab],ay=aps[ab+1],az=aps[ab+2],z_delta=aps[ab+3];
+  const int ab=ai*10;const float ax=aps[ab],ay=aps[ab+1],az=aps[ab+2],z_delta=aps[ab+3];
   const float base_dbm=aps[ab+4],path_loss_factor=aps[ab+5],cutoff2=aps[ab+6],dz2=aps[ab+7];
+  const float pattern_mode=aps[ab+8],downtilt_deg=aps[ab+9];
   const float dx=x-ax,dy=y-ay;const float d2xy=dx*dx+dy*dy;const int ob=ai*4;
   if(cutoff2>0.0f&&d2xy>cutoff2){out[ob]=disconnected;out[ob+1]=sqrt(fmax(d2xy+dz2,1.0f));out[ob+2]=0.0f;out[ob+3]=0.0f;continue;}
   const float d3=fmax(sqrt(d2xy+dz2),1.0f);float wall_loss=0.0f;
@@ -1263,7 +1518,12 @@ __kernel void inspect_direct_paths(__global const float *aps,__global const floa
    const float u=((x1-ax)*dy-(y1-ay)*dx)/den;
    if(t>=0.0f&&t<=1.0f&&u>=0.0f&&u<=1.0f){const float zhit=az+z_delta*t;
     if(zhit>=segments[sb+4]&&zhit<=segments[sb+5])wall_loss+=segments[sb+6];}}
-  float rssi=base_dbm-path_loss_factor*log10(d3)-wall_loss;
+  float pattern_gain=0.0f;
+  if(pattern_mode>=0.5f&&pattern_mode<1.5f){
+   float horizontal=sqrt(d2xy);if(horizontal<0.1f)horizontal=0.1f;
+   pattern_gain=omni_ceiling_pattern_gain(atan2(z_delta,horizontal)*57.29577951308232f+downtilt_deg);
+  }
+  float rssi=base_dbm+pattern_gain-path_loss_factor*log10(d3)-wall_loss;
   if(rssi<disconnected)rssi=disconnected;
   out[ob]=rssi;out[ob+1]=d3;out[ob+2]=wall_loss;out[ob+3]=1.0f;
  }
@@ -1582,16 +1842,18 @@ def _prepare_direct_inputs(ap_data: np.ndarray, segments: np.ndarray, dtype=np.f
         min_x = max_x = min_y = max_y = np.zeros(0, dtype=np.float64)
         nonzero_loss = np.zeros(0, dtype=bool)
 
-    compact = np.empty((aps.shape[0], 8), dtype=dtype)
+    compact = np.empty((aps.shape[0], 10), dtype=dtype)
     offsets = np.zeros(aps.shape[0] + 1, dtype=np.int32)
     packed_parts = []
     packed_total = 0
     for ai in range(aps.shape[0]):
         ax, ay, az, rz, tx, gain, freq_mhz, ple, cutoff2, floor_loss = aps[ai, :10]
+        pattern_mode = float(aps[ai, 10]) if aps.shape[1] > 10 else 0.0
+        downtilt_deg = float(aps[ai, 11]) if aps.shape[1] > 11 else 0.0
         fspl_1m = 20.0 * math.log10(max(freq_mhz, 1.0e-12)) + P525_ONE_METRE_MHZ_CONSTANT_DB
         compact[ai] = (
             ax, ay, az, rz - az, tx + gain - fspl_1m - floor_loss, 10.0 * ple, cutoff2,
-            (rz - az) * (rz - az),
+            (rz - az) * (rz - az), pattern_mode, downtilt_deg,
         )
         if segment_count:
             zlo = min(az, rz)
@@ -1652,6 +1914,7 @@ if njit is not None:
             for ai in range(ap_data.shape[0]):
                 ax = ap_data[ai, 0]; ay = ap_data[ai, 1]; az = ap_data[ai, 2]; z_delta = ap_data[ai, 3]
                 base_dbm = ap_data[ai, 4]; path_loss_factor = ap_data[ai, 5]; cutoff2 = ap_data[ai, 6]; dz2 = ap_data[ai, 7]
+                pattern_mode = ap_data[ai, 8]; downtilt_deg = ap_data[ai, 9]
                 dx = x - ax; dy = y - ay
                 d2xy = dx * dx + dy * dy
                 if cutoff2 > 0.0 and d2xy > cutoff2:
@@ -1729,7 +1992,29 @@ if njit is not None:
                         zhit = az + z_delta * t
                         if zhit >= segments[si, 4] and zhit <= segments[si, 5]:
                             wall_loss += segments[si, 6]
-                rssi = base_dbm - path_loss_factor * math.log10(d3) - wall_loss
+                pattern_gain = 0.0
+                if pattern_mode >= 0.5 and pattern_mode < 1.5:
+                    horizontal = math.sqrt(d2xy)
+                    if horizontal < 0.1:
+                        horizontal = 0.1
+                    elevation = math.atan2(z_delta, horizontal) * 57.29577951308232 + downtilt_deg
+                    if elevation < -90.0:
+                        elevation = -90.0
+                    elif elevation > 90.0:
+                        elevation = 90.0
+                    if elevation <= -60.0:
+                        pattern_gain = -8.0 + (elevation + 90.0) * (5.0 / 30.0)
+                    elif elevation <= -30.0:
+                        pattern_gain = -3.0 + (elevation + 60.0) * (4.0 / 30.0)
+                    elif elevation <= 0.0:
+                        pattern_gain = 1.0 + (elevation + 30.0) * (2.0 / 30.0)
+                    elif elevation <= 30.0:
+                        pattern_gain = 3.0 - elevation * (2.0 / 30.0)
+                    elif elevation <= 60.0:
+                        pattern_gain = 1.0 - (elevation - 30.0) * (4.0 / 30.0)
+                    else:
+                        pattern_gain = -3.0 - (elevation - 60.0) * (5.0 / 30.0)
+                rssi = base_dbm + pattern_gain - path_loss_factor * math.log10(d3) - wall_loss
                 if rssi < disconnected:
                     rssi = disconnected
                 pc += 1
@@ -2104,6 +2389,66 @@ def gpu_strongest_indices(stack: np.ndarray, settings: Any) -> Optional[Tuple[np
         return None
     (indices, valid), label, backend_name = result
     return indices, valid, f"{backend_name}: {label}"
+
+
+def gpu_planner_candidate_scores(
+    candidates: np.ndarray,
+    sample_xy: np.ndarray,
+    weights: np.ndarray,
+    strongest: np.ndarray,
+    second: np.ndarray,
+    coverage_deficit: np.ndarray,
+    handover_deficit: np.ndarray,
+    overall: np.ndarray,
+    handover: np.ndarray,
+    req_data: np.ndarray,
+    min_distances: np.ndarray,
+    vertical_distances: np.ndarray,
+    coverage_mode_all: bool,
+    coverage_needed: bool,
+    handover_needed: bool,
+    capacity_needed: bool,
+    ple: float,
+    dz: float,
+    disconnected: float,
+    vertical_avoidance: float,
+    settings: Any,
+) -> Optional[Tuple[np.ndarray, str]]:
+    """Score predictive-planner candidates in a dense CUDA batch.
+
+    This is an approximate geometry-free ranker.  The planner still validates
+    final shortlist candidates through its exact wall/inter-floor RF path.
+    """
+    if not _force(settings) and not bool(_setting(settings, "opencl_accelerate_planner", True)):
+        return None
+    candidate_array = np.asarray(candidates)
+    sample_array = np.asarray(sample_xy)
+    req_array = np.asarray(req_data)
+    if candidate_array.ndim != 2 or sample_array.ndim != 2 or req_array.ndim != 2:
+        return None
+    work_items = int(candidate_array.shape[0]) * max(1, int(sample_array.shape[0])) * max(1, int(req_array.shape[0]))
+    if candidate_array.shape[0] == 0 or sample_array.shape[0] == 0 or req_array.shape[0] == 0:
+        return None
+    if not _large_enough(settings, work_items):
+        return None
+
+    def _run_planner(backend):
+        if not hasattr(backend, "planner_candidate_scores"):
+            return None
+        scores = backend.planner_candidate_scores(
+            candidate_array, sample_array, weights, strongest, second,
+            coverage_deficit, handover_deficit, overall, handover, req_data,
+            min_distances, vertical_distances, coverage_mode_all,
+            coverage_needed, handover_needed, capacity_needed, ple, dz,
+            disconnected, vertical_avoidance,
+        )
+        return scores, backend.info.label, backend.backend_name
+
+    result = _execute_gpu(settings, "predictive-planner candidate ranking", _run_planner)
+    if result is None:
+        return None
+    scores, label, backend_name = result
+    return np.asarray(scores, dtype=np.float32), f"{backend_name}: {label}"
 
 
 def gpu_resample_regular_grid(source_xs: np.ndarray, source_ys: np.ndarray, source_values: np.ndarray,

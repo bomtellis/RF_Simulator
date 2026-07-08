@@ -70,6 +70,7 @@ from rf_gpu import (
     gpu_colourise,
     gpu_influence_mask,
     gpu_inspect_direct_paths,
+    gpu_planner_candidate_scores,
     gpu_resample_regular_grid,
     gpu_strongest_indices,
     gpu_direct_rssi_grid,
@@ -131,6 +132,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSlider,
     QSpinBox,
     QSplitter,
     QStyle,
@@ -1276,7 +1278,7 @@ class HeatmapSettings:
     # geometry extraction into GlobalId chunks processed by multiple processes.
     enable_chunked_ifc_geometry_extraction: bool = True
     chunk_ifc_files_over_mb: float = 100.0
-    ifc_geometry_chunk_size: int = 250
+    ifc_geometry_chunk_size: int = 1000
     # Large IFC safety guard. Chunking by GlobalId can improve smaller/medium
     # models, but for 500-1000 MB IFCs it is unsafe because every worker process
     # reopens the entire model. That multiplies RAM and can crash ifcopenshell/OCC.
@@ -1314,6 +1316,12 @@ class HeatmapSettings:
     multipath_relative_power_cutoff_db: float = 30.0
     enable_numba_rf_kernels: bool = True
     use_shared_memory_rf_results: bool = True
+    enable_rssi_runtime_budget: bool = True
+    target_rssi_runtime_seconds: int = 300
+    rssi_budget_effective_items_per_second: int = 120_000_000
+    rssi_budget_max_grid_points: int = 2_500_000
+    rssi_budget_max_resolution_m: float = 5.0
+    per_ap_cache_max_batched_links: int = 96
     # Optional GPU acceleration. NVIDIA adapters use Numba CUDA JIT kernels;
     # Intel/AMD adapters may use OpenCL. IFC/Shapely model extraction remains
     # on the CPU, while direct RSSI/barrier paths and all dense grid operations
@@ -1345,6 +1353,8 @@ class HeatmapSettings:
     progressive_heatmap_updates: bool = True
     progressive_update_percent: int = 20
     heatmap_render_mode: str = "raster_contours"  # raster, raster_contours, contours
+    heatmap_opacity_percent: int = 70
+    ifc_element_opacity_percent: int = 55
     interactive_preview_enabled: bool = True
     interactive_preview_delay_ms: int = 350
     interactive_preview_resolution_m: float = 3.0
@@ -1484,11 +1494,13 @@ class HeatmapSettings:
     sample_stride_x: int = 8
     sample_stride_y: int = 6
     zones: List[RSSIZone] = field(default_factory=lambda: [
-        RSSIZone("Excellent", -55.0, 0.0, "#00AA50", 135),
-        RSSIZone("Good", -67.0, -55.0, "#A0C800", 135),
-        RSSIZone("Marginal", -75.0, -67.0, "#FFAA00", 135),
-        RSSIZone("Poor", -82.0, -75.0, "#DC0000", 135),
-        RSSIZone("Disconnect", -200.0, -82.0, "#555555", 95),
+        RSSIZone("Excellent", -55.0, 0.0, "#008A4E", 150),
+        RSSIZone("Very good", -62.0, -55.0, "#35A853", 155),
+        RSSIZone("Good", -67.0, -62.0, "#B7D900", 165),
+        RSSIZone("Usable", -72.0, -67.0, "#FFD43B", 180),
+        RSSIZone("Marginal", -77.0, -72.0, "#FF922B", 205),
+        RSSIZone("Poor", -82.0, -77.0, "#E03131", 230),
+        RSSIZone("Disconnect", -200.0, -82.0, "#7A1F1F", 230),
     ])
 
     @classmethod
@@ -1696,6 +1708,15 @@ class HeatmapSettings:
         settings.multipath_relative_power_cutoff_db = max(0.0, min(80.0, float(performance.get("multipath_relative_power_cutoff_db", settings.multipath_relative_power_cutoff_db))))
         settings.enable_numba_rf_kernels = bool(performance.get("enable_numba_kernels", settings.enable_numba_rf_kernels))
         settings.use_shared_memory_rf_results = bool(performance.get("use_shared_memory_results", settings.use_shared_memory_rf_results))
+        settings.enable_rssi_runtime_budget = bool(performance.get("enable_rssi_runtime_budget", settings.enable_rssi_runtime_budget))
+        settings.target_rssi_runtime_seconds = max(30, int(performance.get("target_rssi_runtime_seconds", settings.target_rssi_runtime_seconds)))
+        settings.rssi_budget_effective_items_per_second = max(
+            1_000_000,
+            int(performance.get("rssi_budget_effective_items_per_second", settings.rssi_budget_effective_items_per_second)),
+        )
+        settings.rssi_budget_max_grid_points = max(10_000, int(performance.get("rssi_budget_max_grid_points", settings.rssi_budget_max_grid_points)))
+        settings.rssi_budget_max_resolution_m = max(0.25, float(performance.get("rssi_budget_max_resolution_m", settings.rssi_budget_max_resolution_m)))
+        settings.per_ap_cache_max_batched_links = max(1, int(performance.get("per_ap_cache_max_batched_links", settings.per_ap_cache_max_batched_links)))
         settings.enable_opencl_gpu = bool(performance.get("enable_opencl_gpu", settings.enable_opencl_gpu))
         settings.force_gpu_when_available = bool(performance.get("force_gpu_when_available", settings.force_gpu_when_available))
         settings.gpu_primary_rssi_simulation = bool(performance.get("gpu_primary_rssi_simulation", settings.gpu_primary_rssi_simulation))
@@ -1723,6 +1744,8 @@ class HeatmapSettings:
         settings.progressive_update_percent = max(5, min(100, int(performance.get("progressive_update_percent", settings.progressive_update_percent))))
         render_mode = str(performance.get("heatmap_render_mode", settings.heatmap_render_mode)).strip().lower()
         settings.heatmap_render_mode = render_mode if render_mode in {"raster", "raster_contours", "contours"} else "raster_contours"
+        settings.heatmap_opacity_percent = max(0, min(100, int(performance.get("heatmap_opacity_percent", data.get("heatmap_opacity_percent", settings.heatmap_opacity_percent)))))
+        settings.ifc_element_opacity_percent = max(0, min(100, int(performance.get("ifc_element_opacity_percent", data.get("ifc_element_opacity_percent", settings.ifc_element_opacity_percent)))))
         settings.interactive_preview_enabled = bool(performance.get("interactive_preview_enabled", settings.interactive_preview_enabled))
         settings.interactive_preview_delay_ms = max(50, int(performance.get("interactive_preview_delay_ms", settings.interactive_preview_delay_ms)))
         settings.interactive_preview_resolution_m = max(0.25, float(performance.get("interactive_preview_resolution_m", settings.interactive_preview_resolution_m)))
@@ -1857,6 +1880,12 @@ class HeatmapSettings:
             "multipath_relative_power_cutoff_db": float(self.multipath_relative_power_cutoff_db),
             "enable_numba_kernels": bool(self.enable_numba_rf_kernels),
             "use_shared_memory_results": bool(self.use_shared_memory_rf_results),
+            "enable_rssi_runtime_budget": bool(self.enable_rssi_runtime_budget),
+            "target_rssi_runtime_seconds": int(self.target_rssi_runtime_seconds),
+            "rssi_budget_effective_items_per_second": int(self.rssi_budget_effective_items_per_second),
+            "rssi_budget_max_grid_points": int(self.rssi_budget_max_grid_points),
+            "rssi_budget_max_resolution_m": float(self.rssi_budget_max_resolution_m),
+            "per_ap_cache_max_batched_links": int(self.per_ap_cache_max_batched_links),
             "enable_opencl_gpu": bool(self.enable_opencl_gpu),
             "force_gpu_when_available": bool(self.force_gpu_when_available),
             "gpu_primary_rssi_simulation": bool(self.gpu_primary_rssi_simulation),
@@ -1880,6 +1909,8 @@ class HeatmapSettings:
             "progressive_heatmap_updates": bool(self.progressive_heatmap_updates),
             "progressive_update_percent": int(self.progressive_update_percent),
             "heatmap_render_mode": str(self.heatmap_render_mode),
+            "heatmap_opacity_percent": int(self.heatmap_opacity_percent),
+            "ifc_element_opacity_percent": int(self.ifc_element_opacity_percent),
             "interactive_preview_enabled": bool(self.interactive_preview_enabled),
             "interactive_preview_delay_ms": int(self.interactive_preview_delay_ms),
             "interactive_preview_resolution_m": float(self.interactive_preview_resolution_m),
@@ -1956,6 +1987,15 @@ class HeatmapSettings:
         self.multipath_relative_power_cutoff_db = max(0.0, min(80.0, float(data.get("multipath_relative_power_cutoff_db", self.multipath_relative_power_cutoff_db))))
         self.enable_numba_rf_kernels = bool(data.get("enable_numba_kernels", self.enable_numba_rf_kernels))
         self.use_shared_memory_rf_results = bool(data.get("use_shared_memory_results", self.use_shared_memory_rf_results))
+        self.enable_rssi_runtime_budget = bool(data.get("enable_rssi_runtime_budget", self.enable_rssi_runtime_budget))
+        self.target_rssi_runtime_seconds = max(30, int(data.get("target_rssi_runtime_seconds", self.target_rssi_runtime_seconds)))
+        self.rssi_budget_effective_items_per_second = max(
+            1_000_000,
+            int(data.get("rssi_budget_effective_items_per_second", self.rssi_budget_effective_items_per_second)),
+        )
+        self.rssi_budget_max_grid_points = max(10_000, int(data.get("rssi_budget_max_grid_points", self.rssi_budget_max_grid_points)))
+        self.rssi_budget_max_resolution_m = max(0.25, float(data.get("rssi_budget_max_resolution_m", self.rssi_budget_max_resolution_m)))
+        self.per_ap_cache_max_batched_links = max(1, int(data.get("per_ap_cache_max_batched_links", self.per_ap_cache_max_batched_links)))
         self.enable_opencl_gpu = bool(data.get("enable_opencl_gpu", self.enable_opencl_gpu))
         self.force_gpu_when_available = bool(data.get("force_gpu_when_available", self.force_gpu_when_available))
         self.gpu_primary_rssi_simulation = bool(data.get("gpu_primary_rssi_simulation", self.gpu_primary_rssi_simulation))
@@ -1983,6 +2023,8 @@ class HeatmapSettings:
         self.progressive_update_percent = max(5, min(100, int(data.get("progressive_update_percent", self.progressive_update_percent))))
         render_mode = str(data.get("heatmap_render_mode", self.heatmap_render_mode)).strip().lower()
         self.heatmap_render_mode = render_mode if render_mode in {"raster", "raster_contours", "contours"} else "raster_contours"
+        self.heatmap_opacity_percent = max(0, min(100, int(data.get("heatmap_opacity_percent", self.heatmap_opacity_percent))))
+        self.ifc_element_opacity_percent = max(0, min(100, int(data.get("ifc_element_opacity_percent", self.ifc_element_opacity_percent))))
         self.interactive_preview_enabled = bool(data.get("interactive_preview_enabled", self.interactive_preview_enabled))
         self.interactive_preview_delay_ms = max(50, int(data.get("interactive_preview_delay_ms", self.interactive_preview_delay_ms)))
         self.interactive_preview_resolution_m = max(0.25, float(data.get("interactive_preview_resolution_m", self.interactive_preview_resolution_m)))
@@ -2177,15 +2219,20 @@ class IFCModelLoader:
         filter_elements = bool(element_guids is not None)
 
         seen_wall_guids = set()
-        wall_entities = []
-        for wall in list(self.ifc.by_type("IfcWall")) + list(self.ifc.by_type("IfcWallStandardCase")):
-            guid = getattr(wall, "GlobalId", "") or ""
-            if guid in seen_wall_guids:
-                continue
-            seen_wall_guids.add(guid)
-            if filter_walls and guid not in wanted_walls:
-                continue
-            wall_entities.append(wall)
+        if filter_walls:
+            wall_entities = self._entities_by_guid(
+                wanted_walls,
+                allowed_types=("IfcWall", "IfcWallStandardCase"),
+            )
+            seen_wall_guids = {str(getattr(wall, "GlobalId", "") or "") for wall in wall_entities}
+        else:
+            wall_entities = []
+            for wall in list(self.ifc.by_type("IfcWall")) + list(self.ifc.by_type("IfcWallStandardCase")):
+                guid = getattr(wall, "GlobalId", "") or ""
+                if guid in seen_wall_guids:
+                    continue
+                seen_wall_guids.add(guid)
+                wall_entities.append(wall)
 
         wall_geometry = self._plan_polygons_from_geometry_iterator(
             wall_entities,
@@ -2230,7 +2277,40 @@ class IFCModelLoader:
                 )
 
         handled_wall_guids = set(seen_wall_guids)
-        for element in self.ifc.by_type("IfcElement"):
+        if filter_elements:
+            element_entities = self._entities_by_guid(
+                wanted_elements,
+                rejected_types=("IfcWall", "IfcWallStandardCase", "IfcOpeningElement"),
+            )
+        else:
+            element_entities = [
+                element for element in self.ifc.by_type("IfcElement")
+                if not (
+                    element.is_a("IfcWall")
+                    or element.is_a("IfcWallStandardCase")
+                    or element.is_a("IfcOpeningElement")
+                )
+            ]
+        fast_element_geometry: Dict[str, Tuple[Polygon, float, float]] = {}
+        slow_element_entities = []
+        for element in element_entities:
+            if element.is_a("IfcWall") or element.is_a("IfcWallStandardCase") or element.is_a("IfcOpeningElement"):
+                continue
+            guid = getattr(element, "GlobalId", "") or ""
+            if not guid or guid in handled_wall_guids:
+                continue
+            if filter_elements and guid not in wanted_elements:
+                continue
+            fast_geom = self._fast_panel_footprint(element)
+            if fast_geom is not None:
+                fast_element_geometry[guid] = fast_geom
+            else:
+                slow_element_entities.append(element)
+        element_geometry = self._plan_polygons_from_geometry_iterator(
+            slow_element_entities,
+            max_threads=(1 if filter_elements else min(8, os.cpu_count() or 1)),
+        )
+        for element in element_entities:
             if element.is_a("IfcWall") or element.is_a("IfcWallStandardCase") or element.is_a("IfcOpeningElement"):
                 continue
             guid = getattr(element, "GlobalId", "") or ""
@@ -2239,7 +2319,9 @@ class IFCModelLoader:
             if filter_elements and guid not in wanted_elements:
                 continue
             source_floor = self._container_storey_name(element)
-            geom = self._plan_polygon_from_element(element)
+            geom = fast_element_geometry.get(guid) or element_geometry.get(guid)
+            if geom is None:
+                geom = self._plan_polygon_from_geometry(element)
             if geom is None:
                 continue
             poly, z_min, z_max = geom
@@ -2281,12 +2363,25 @@ class IFCModelLoader:
                     )
                 )
 
-        for space in self.ifc.by_type("IfcSpace"):
+        if filter_spaces:
+            space_entities = self._entities_by_guid(
+                wanted_spaces,
+                allowed_types=("IfcSpace",),
+            )
+        else:
+            space_entities = list(self.ifc.by_type("IfcSpace"))
+        space_geometry = self._plan_polygons_from_geometry_iterator(
+            space_entities,
+            max_threads=(1 if filter_spaces else min(8, os.cpu_count() or 1)),
+        )
+        for space in space_entities:
             guid = getattr(space, "GlobalId", "") or ""
             if filter_spaces and guid not in wanted_spaces:
                 continue
             source_floor = self._container_storey_name(space)
-            geom = self._plan_polygon_from_geometry(space)
+            geom = space_geometry.get(guid)
+            if geom is None:
+                geom = self._plan_polygon_from_geometry(space)
             if geom is None:
                 continue
             poly, z_min, z_max = geom
@@ -2308,6 +2403,36 @@ class IFCModelLoader:
                     )
                 )
         return floors
+
+    def _entities_by_guid(
+        self,
+        guids: Iterable[str],
+        allowed_types: Optional[Sequence[str]] = None,
+        rejected_types: Optional[Sequence[str]] = None,
+    ) -> List[object]:
+        """Resolve a chunk's GlobalIds directly without scanning the whole IFC."""
+        entities: List[object] = []
+        seen: set = set()
+        for raw_guid in guids or []:
+            guid = str(raw_guid or "")
+            if not guid or guid in seen:
+                continue
+            seen.add(guid)
+            try:
+                entity = self.ifc.by_guid(guid)
+            except Exception:
+                entity = None
+            if entity is None:
+                continue
+            try:
+                if allowed_types and not any(entity.is_a(type_name) for type_name in allowed_types):
+                    continue
+                if rejected_types and any(entity.is_a(type_name) for type_name in rejected_types):
+                    continue
+            except Exception:
+                continue
+            entities.append(entity)
+        return entities
 
     def _storeys(self) -> Dict[str, float]:
         out = {}
@@ -3694,6 +3819,44 @@ class RFEngine:
         return az_max + el_max - float(pattern.peak_gain_dbi)
 
     @staticmethod
+    def _direct_pattern_mode(
+        patterns: Optional[Dict[str, AntennaPattern]],
+        pattern_name: str,
+    ) -> int:
+        if not patterns:
+            return 0
+        pattern = patterns.get(str(pattern_name or ""))
+        if pattern is None:
+            return 0
+        # The built-in ceiling omni is azimuth-flat, with point-varying gain
+        # only in elevation. The direct kernels can apply that in one batched
+        # launch; directional/custom patterns still use the exact split path.
+        if str(getattr(pattern, "name", "") or "") == "Omni ceiling AP":
+            azimuth = list(getattr(pattern, "azimuth_points", []) or [])
+            elevation = list(getattr(pattern, "elevation_points", []) or [])
+            az_flat = bool(azimuth) and all(abs(float(g) - float(pattern.peak_gain_dbi)) <= 1.0e-6 for _a, g in azimuth)
+            expected_elevation = [(-90.0, -8.0), (-60.0, -3.0), (-30.0, 1.0), (0.0, 3.0), (30.0, 1.0), (60.0, -3.0), (90.0, -8.0)]
+            el_match = len(elevation) == len(expected_elevation) and all(
+                abs(float(a) - ea) <= 1.0e-6 and abs(float(g) - eg) <= 1.0e-6
+                for (a, g), (ea, eg) in zip(elevation, expected_elevation)
+            )
+            if az_flat and el_match and abs(float(pattern.peak_gain_dbi) - 3.0) <= 1.0e-6:
+                return 1
+        return -1
+
+    @staticmethod
+    def _links_need_split_pattern_gain(
+        links: Sequence[Tuple[AccessPoint, APRadio]],
+        patterns: Optional[Dict[str, AntennaPattern]],
+    ) -> bool:
+        if not patterns:
+            return False
+        for _ap, radio in links or []:
+            if RFEngine._direct_pattern_mode(patterns, getattr(radio, "antenna_pattern", "")) < 0:
+                return True
+        return False
+
+    @staticmethod
     def _pattern_interp_array(points: List[Tuple[float, float]], angles, default: float):
         if not points:
             return np.full_like(np.asarray(angles, dtype=float), float(default), dtype=float)
@@ -4365,6 +4528,12 @@ class RFEngine:
         if profile not in {"fast", "balanced", "detailed"}:
             profile = "balanced"
         profiled.rf_calculation_profile = profile
+        if bool(getattr(profiled, "enable_rssi_runtime_budget", True)) and profile != "detailed":
+            profiled.enable_opencl_gpu = True
+            profiled.force_gpu_when_available = True
+            profiled.gpu_primary_rssi_simulation = True
+            profiled.enable_approximate_direct_rssi_acceleration = True
+            profiled.calculate_delay_spread = False
         if profile == "fast":
             profiled.enable_adaptive_rf_grid = True
             profiled.max_reflection_order = min(1, int(profiled.max_reflection_order))
@@ -4430,6 +4599,79 @@ class RFEngine:
         return xs, ys, boundary
 
     @staticmethod
+    def _active_radio_link_count(group_aps: Dict[object, List[AccessPoint]]) -> int:
+        count = 0
+        for aps in group_aps.values():
+            for ap in aps:
+                count += max(1, len(ap.active_radios()))
+        return max(1, count)
+
+    @staticmethod
+    def _budgeted_resolution_for_groups(
+        floor: FloorModel,
+        floors: Dict[str, FloorModel],
+        group_aps: Dict[object, List[AccessPoint]],
+        requested_resolution_m: float,
+        settings: Optional[HeatmapSettings],
+        calculation_boundary=None,
+        calculation_extent: Optional[Tuple[float, float, float, float]] = None,
+        include_inter_floor: bool = True,
+    ) -> Tuple[float, str]:
+        if settings is None or not bool(getattr(settings, "enable_rssi_runtime_budget", True)):
+            return float(requested_resolution_m), ""
+        requested = max(0.05, float(requested_resolution_m))
+        all_aps = [ap for aps in group_aps.values() for ap in aps]
+        try:
+            xs, ys, _boundary = RFEngine._grid_for_floor(
+                floor, all_aps, requested, calculation_boundary, floors, calculation_extent
+            )
+            grid_points = max(1, int(len(xs) * len(ys)))
+        except Exception:
+            return requested, ""
+        link_count = RFEngine._active_radio_link_count(group_aps)
+        geometry_floors = floors if include_inter_floor else {str(floor.name): floor}
+        barrier_count = 0
+        for model in geometry_floors.values():
+            barrier_count += len(getattr(model, "walls", []) or [])
+            barrier_count += sum(
+                1 for element in (getattr(model, "elements", []) or [])
+                if getattr(element, "is_rf_barrier", False)
+            )
+        barrier_factor = max(1.0, min(64.0, 1.0 + float(barrier_count) / 16.0))
+        effective_items = float(grid_points) * float(link_count) * barrier_factor
+        target_seconds = max(30.0, float(getattr(settings, "target_rssi_runtime_seconds", 300) or 300))
+        throughput = max(1_000_000.0, float(getattr(
+            settings, "rssi_budget_effective_items_per_second", 120_000_000
+        ) or 120_000_000))
+        target_items = target_seconds * throughput
+        max_points = max(10_000, int(getattr(settings, "rssi_budget_max_grid_points", 2_500_000) or 2_500_000))
+        scale = 1.0
+        if effective_items > target_items:
+            scale = max(scale, math.sqrt(effective_items / target_items))
+        if grid_points > max_points:
+            scale = max(scale, math.sqrt(float(grid_points) / float(max_points)))
+        if scale <= 1.02:
+            return requested, ""
+        max_resolution = max(requested, float(getattr(settings, "rssi_budget_max_resolution_m", 5.0) or 5.0))
+        adjusted = min(max_resolution, requested * scale)
+        if adjusted <= requested * 1.02:
+            return requested, ""
+        note = (
+            f"runtime budget adjusted grid resolution from {requested:g} m to {adjusted:g} m "
+            f"for {grid_points:,} point(s), {link_count:,} radio link(s), {barrier_count:,} barrier object(s), "
+            f"target {target_seconds:.0f} s"
+        )
+        return float(adjusted), note
+
+    @staticmethod
+    def _append_performance_note(results: Dict[object, SimulationResult], note: str):
+        if not note:
+            return
+        for result in results.values():
+            existing = str(getattr(result, "performance_note", "") or "")
+            result.performance_note = (existing + "; " + note).strip("; ")
+
+    @staticmethod
     def _geometry_revision(floors: Dict[str, FloorModel]) -> str:
         records = []
         for floor_name, model in sorted(floors.items()):
@@ -4463,8 +4705,18 @@ class RFEngine:
         if settings is None:
             return "none"
         return stable_digest({
-            "methodology": "exact-inspect-compatible-rssi-v7-oriented-footprint-gpu",
+            "methodology": "exact-inspect-compatible-rssi-v8-budgeted-batched-gpu",
             "profile": getattr(settings, "rf_calculation_profile", "balanced"),
+            "runtime_budget": [
+                getattr(settings, "enable_rssi_runtime_budget", True),
+                getattr(settings, "target_rssi_runtime_seconds", 300),
+                getattr(settings, "rssi_budget_effective_items_per_second", 120_000_000),
+                getattr(settings, "rssi_budget_max_grid_points", 2_500_000),
+                getattr(settings, "rssi_budget_max_resolution_m", 5.0),
+                getattr(settings, "per_ap_cache_max_batched_links", 96),
+                getattr(settings, "gpu_primary_rssi_simulation", True),
+                getattr(settings, "enable_approximate_direct_rssi_acceleration", True),
+            ],
             "cutoff": [
                 getattr(settings, "enable_ap_cutoff_zones", True),
                 getattr(settings, "default_ap_cutoff_radius_m", 0.0),
@@ -4826,7 +5078,7 @@ class RFEngine:
         receiver_z_override: Optional[float] = None,
         patterns: Optional[Dict[str, AntennaPattern]] = None,
     ) -> np.ndarray:
-        rows: List[Tuple[float, float, float, float, float, float, float, float, float, float]] = []
+        rows: List[Tuple[float, float, float, float, float, float, float, float, float, float, float, float]] = []
         for ap, radio in links:
             ap_floor = floors.get(ap.floor)
             if ap_floor is None:
@@ -4840,13 +5092,15 @@ class RFEngine:
             if ap_floor.name != floor.name:
                 floor_loss = RFEngine.floor_penetration_loss_db(floor, ap_floor, floors, frequency, [], heatmap_settings)
             effective_ple = RFEngine.distance_path_loss_exponent(ap.path_loss_exponent, heatmap_settings)
+            pattern_mode = RFEngine._direct_pattern_mode(patterns, getattr(radio, "antenna_pattern", "")) if patterns else 0
             rows.append((
                 float(ap.x), float(ap.y), ap_z, rx_z,
                 float(radio.tx_power_dbm), float(getattr(radio, "antenna_gain_dbi", 0.0) or 0.0),
                 frequency, float(effective_ple), cutoff2, float(floor_loss),
+                float(max(0, pattern_mode)), float(getattr(ap, "downtilt_deg", 0.0) or 0.0),
             ))
         if not rows:
-            return np.zeros((0, 10), dtype=np.float32)
+            return np.zeros((0, 12), dtype=np.float32)
         return np.asarray(rows, dtype=np.float32)
 
     @staticmethod
@@ -4967,11 +5221,12 @@ class RFEngine:
             link_rssi_fields: List[np.ndarray] = []
             link_count_fields: List[np.ndarray] = []
             mode = "gpu-direct-rssi"
-            use_point_pattern = bool(patterns)
+            use_point_pattern = RFEngine._links_need_split_pattern_gain(links, patterns)
             process_links = links if use_point_pattern else [None]
             for link_item in process_links:
                 link_batch = links if link_item is None else [link_item]
-                ap_rows = RFEngine._direct_accelerator_ap_rows(floor, floors, link_batch, heatmap_settings, patterns=None)
+                row_patterns = patterns if link_item is None else None
+                ap_rows = RFEngine._direct_accelerator_ap_rows(floor, floors, link_batch, heatmap_settings, patterns=row_patterns)
                 if ap_rows.size == 0:
                     continue
                 frequency = float(ap_rows[0, 6])
@@ -5073,8 +5328,10 @@ class RFEngine:
             note += "; attenuation uses GPU/Numba oriented-footprint edge crossings against path-floor IFC/user RF barriers"
             if receiver_z_grid is not None and terrain_elevation_grid is not None:
                 note += "; terrain receiver heights and ground obstruction loss included in the direct-grid batch"
-            if patterns:
+            if use_point_pattern:
                 note += "; point-specific antenna pattern gain applied to match RSSI loss inspection"
+            elif patterns and any(RFEngine._direct_pattern_mode(patterns, getattr(radio, "antenna_pattern", "")) > 0 for ap, radio in links):
+                note += "; batched omni elevation antenna gain applied in the direct RSSI kernel"
             results[key] = SimulationResult(
                 xs=xs, ys=ys, rssi=rssi, delay_spread_ns=delays, path_count=counts,
                 valid_mask=None if boundary_mask is None else boundary_mask.copy(),
@@ -5836,14 +6093,37 @@ class RFEngine:
         group_aps = {key: list(aps) for key, aps in group_aps.items() if aps}
         if not group_aps:
             return {}
+        effective_resolution_m, budget_note = RFEngine._budgeted_resolution_for_groups(
+            floor, floors, group_aps, resolution_m, settings, calculation_boundary,
+            calculation_extent, include_inter_floor,
+        )
         terrain_active = terrain_model is not None and bool(getattr(terrain_model, "enabled", True))
-        use_cache = bool(getattr(settings, "enable_per_ap_heatmap_cache", True)) and not terrain_active
+        total_batched_links = RFEngine._active_radio_link_count(group_aps)
+        cache_batch_limit = max(1, int(getattr(settings, "per_ap_cache_max_batched_links", 96) or 96))
+        gpu_batch_primary = (
+            bool(getattr(settings, "enable_opencl_gpu", True))
+            and bool(getattr(settings, "gpu_primary_rssi_simulation", True))
+            and bool(getattr(settings, "enable_approximate_direct_rssi_acceleration", True))
+            and total_batched_links > cache_batch_limit
+        )
+        cache_bypass_note = (
+            f"per-AP cache bypassed so {total_batched_links:,} radio link(s) stay batched for GPU/direct RSSI"
+            if gpu_batch_primary else ""
+        )
+        use_cache = (
+            bool(getattr(settings, "enable_per_ap_heatmap_cache", True))
+            and not terrain_active
+            and not gpu_batch_primary
+        )
         if not use_cache:
-            return RFEngine._simulate_groups_adaptive(
-                floor, floors, group_aps, resolution_m, patterns, include_inter_floor,
+            results = RFEngine._simulate_groups_adaptive(
+                floor, floors, group_aps, effective_resolution_m, patterns, include_inter_floor,
                 settings, progress_callback, calculation_boundary, calculation_extent, progressive_callback,
                 map_overlay, terrain_model,
             )
+            RFEngine._append_performance_note(results, budget_note)
+            RFEngine._append_performance_note(results, cache_bypass_note)
+            return results
         _RF_AP_FIELD_CACHE.configure(
             int(getattr(settings, "per_ap_heatmap_cache_entries", 192)),
             int(getattr(settings, "per_ap_heatmap_cache_mb", 768)) * 1024 * 1024,
@@ -5867,7 +6147,7 @@ class RFEngine:
             for index, ap in enumerate(aps):
                 cache_key = (
                     floor.name, model_revision, settings_revision, pattern_revision, boundary_revision,
-                    extent_revision, terrain_revision, bool(include_inter_floor), round(float(resolution_m), 5), RFEngine._ap_revision(ap),
+                    extent_revision, terrain_revision, bool(include_inter_floor), round(float(effective_resolution_m), 5), RFEngine._ap_revision(ap),
                 )
                 cached = _RF_AP_FIELD_CACHE.get(cache_key)
                 if cached is not None:
@@ -5904,7 +6184,7 @@ class RFEngine:
                     progressive_callback(preview_combined, float(fraction))
 
             missing_results = RFEngine._simulate_groups_adaptive(
-                floor, floors, missing_groups, resolution_m, patterns, include_inter_floor,
+                floor, floors, missing_groups, effective_resolution_m, patterns, include_inter_floor,
                 settings, progress_callback, calculation_boundary, calculation_extent,
                 progressive_callback=missing_progress if progressive_callback is not None else None,
                 map_overlay=map_overlay,
@@ -5923,6 +6203,7 @@ class RFEngine:
             result = RFEngine._combine_ap_field_results(fields, settings, disconnected, elapsed, hits, misses)
             if result is not None:
                 combined[group_key] = result
+        RFEngine._append_performance_note(combined, budget_note)
         if progressive_callback and combined:
             progressive_callback(combined, 1.0)
         return combined
@@ -8755,6 +9036,24 @@ class RFPerformanceSettingsDialog(QDialog):
         self.progressive_percent.setValue(int(settings.progressive_update_percent))
         self.progressive_percent.setSuffix(" %")
         form.addRow("Progressive update interval", self.progressive_percent)
+        self.heatmap_opacity = QSlider(Qt.Horizontal)
+        self.heatmap_opacity.setRange(0, 100)
+        self.heatmap_opacity.setValue(int(getattr(settings, "heatmap_opacity_percent", 70)))
+        self.heatmap_opacity.setToolTip("Controls the RSSI colour overlay transparency in the plan view and PDF export. The RSSI key remains opaque.")
+        self.heatmap_opacity_label = QLabel(f"{self.heatmap_opacity.value()} %")
+        heatmap_opacity_row = QHBoxLayout()
+        heatmap_opacity_row.addWidget(self.heatmap_opacity, 1)
+        heatmap_opacity_row.addWidget(self.heatmap_opacity_label)
+        form.addRow("Heatmap opacity", heatmap_opacity_row)
+        self.ifc_element_opacity = QSlider(Qt.Horizontal)
+        self.ifc_element_opacity.setRange(0, 100)
+        self.ifc_element_opacity.setValue(int(getattr(settings, "ifc_element_opacity_percent", 55)))
+        self.ifc_element_opacity.setToolTip("Controls IFC wall and element fill opacity in the plan view and PDF export while keeping linework visible.")
+        self.ifc_element_opacity_label = QLabel(f"{self.ifc_element_opacity.value()} %")
+        ifc_opacity_row = QHBoxLayout()
+        ifc_opacity_row.addWidget(self.ifc_element_opacity, 1)
+        ifc_opacity_row.addWidget(self.ifc_element_opacity_label)
+        form.addRow("IFC element opacity", ifc_opacity_row)
         self.interactive_preview = QCheckBox("Calculate a background preview after AP movement")
         self.interactive_preview.setChecked(bool(settings.interactive_preview_enabled))
         form.addRow(self.interactive_preview)
@@ -8947,6 +9246,8 @@ class RFPerformanceSettingsDialog(QDialog):
         self.per_ap_cache.toggled.connect(self._update_enabled_state)
         self.tile_influence.toggled.connect(self._update_enabled_state)
         self.progressive_updates.toggled.connect(self._update_enabled_state)
+        self.heatmap_opacity.valueChanged.connect(lambda value: self.heatmap_opacity_label.setText(f"{int(value)} %"))
+        self.ifc_element_opacity.valueChanged.connect(lambda value: self.ifc_element_opacity_label.setText(f"{int(value)} %"))
         self.interactive_preview.toggled.connect(self._update_enabled_state)
         self.reflections.toggled.connect(self._update_enabled_state)
         self.diffraction.toggled.connect(self._update_enabled_state)
@@ -9002,6 +9303,8 @@ class RFPerformanceSettingsDialog(QDialog):
         self.render_mode.setCurrentIndex(max(0, self.render_mode.findData("raster")))
         self.contour_interpolation.setValue(2)
         self.progressive_updates.setChecked(False)
+        self.heatmap_opacity.setValue(78)
+        self.ifc_element_opacity.setValue(45)
         self.interactive_preview.setChecked(True)
         self.preview_resolution.setValue(4.0)
         self.reflections.setChecked(True)
@@ -9046,6 +9349,8 @@ class RFPerformanceSettingsDialog(QDialog):
         self.render_mode.setCurrentIndex(max(0, self.render_mode.findData("raster_contours")))
         self.contour_interpolation.setValue(4)
         self.progressive_updates.setChecked(True)
+        self.heatmap_opacity.setValue(defaults.heatmap_opacity_percent)
+        self.ifc_element_opacity.setValue(defaults.ifc_element_opacity_percent)
         self.reflections.setChecked(True)
         self.reflection_order.setValue(1)
         self.reflection_surfaces.setValue(6)
@@ -9149,6 +9454,8 @@ class RFPerformanceSettingsDialog(QDialog):
         settings.contour_interpolation_factor = int(self.contour_interpolation.value())
         settings.progressive_heatmap_updates = self.progressive_updates.isChecked()
         settings.progressive_update_percent = int(self.progressive_percent.value())
+        settings.heatmap_opacity_percent = int(self.heatmap_opacity.value())
+        settings.ifc_element_opacity_percent = int(self.ifc_element_opacity.value())
         settings.interactive_preview_enabled = self.interactive_preview.isChecked()
         settings.interactive_preview_delay_ms = int(self.preview_delay.value())
         settings.interactive_preview_resolution_m = float(self.preview_resolution.value())
@@ -12080,6 +12387,7 @@ class AccessPointGraphicsItem(QGraphicsPathItem):
         menu = QMenu()
         focus_action = menu.addAction("Edit in access point table")
         duplicate_action = menu.addAction("Duplicate access point")
+        measure_action = menu.addAction("Measure distance from this AP")
         polar_action = menu.addAction("Visualise polar pattern")
         copy_action = menu.addAction("Copy selected access point(s)    Ctrl+C")
         paste_action = menu.addAction("Paste access point(s)    Ctrl+V")
@@ -12095,6 +12403,8 @@ class AccessPointGraphicsItem(QGraphicsPathItem):
             self.main.focus_ap_in_table(self.ap)
         elif chosen == duplicate_action:
             self.main.duplicate_access_point(self.ap)
+        elif chosen == measure_action:
+            self.main.start_access_point_distance_measurement(self.ap)
         elif chosen == polar_action:
             self.main.show_access_point_polar_pattern(self.ap)
         elif chosen == copy_action:
@@ -12276,6 +12586,17 @@ class PlanView(QGraphicsView):
             self.setCursor(Qt.ClosedHandCursor)
             event.accept()
             return
+
+        if getattr(self.main, "_ap_measurement_anchor", None) is not None:
+            if event.button() == Qt.RightButton:
+                self.main.cancel_access_point_distance_measurement()
+                event.accept()
+                return
+            if event.button() == Qt.LeftButton:
+                pos = self.mapToScene(event.position().toPoint())
+                self.main.finish_access_point_distance_measurement(pos)
+                event.accept()
+                return
 
         if getattr(self.main, "alignment_pick_mode", None) in {"ifc_1", "ifc_2", "map_ifc_anchor"}:
             if event.button() == Qt.RightButton:
@@ -12465,6 +12786,8 @@ class MainWindow(QMainWindow):
         self.ap_ruler_enabled: bool = False
         self._ap_ruler_items: List[QGraphicsItem] = []
         self._updating_ap_rulers: bool = False
+        self._ap_measurement_anchor: Optional[AccessPoint] = None
+        self._ap_measurement_items: List[QGraphicsItem] = []
         self._drawing_floor: bool = False
         self._ap_clipboard_signature: str = ""
         self._ap_paste_generation: int = 0
@@ -13560,252 +13883,443 @@ out tags geom;
     # ----------------------------- Ribbon interface -----------------------------
 
     def _standard_icon(self, standard_name: str) -> QIcon:
+        bootstrap = self._bootstrap_icon(standard_name)
+        if not bootstrap.isNull():
+            return bootstrap
         standard = getattr(QStyle.StandardPixmap, standard_name, None)
         if standard is None:
             return QIcon()
         return self.style().standardIcon(standard)
 
+    def _bootstrap_icon(self, name: str, *, size: int = 28) -> QIcon:
+        """Draw a compact Bootstrap Icons style glyph as a Qt icon.
+
+        The project stays self-contained while using the same visual language:
+        monoline, rounded terminals, simple geometry, and restrained filled
+        accents for destructive or primary actions.
+        """
+        if not name or str(name).startswith("SP_"):
+            return QIcon()
+        key = str(name).strip().lower().replace("_", "-")
+        dark = bool(getattr(self, "dark_theme", False))
+        accent = QColor("#0D6EFD")
+        danger = QColor("#DC3545")
+        success = QColor("#198754")
+        warning = QColor("#F59F00" if not dark else "#FFC107")
+        ink = QColor("#E9ECEF" if dark else "#212529")
+        muted = QColor("#ADB5BD" if dark else "#6C757D")
+        colour = danger if key in {"trash", "x-circle"} else success if key in {"play-fill", "check2-circle"} else ink
+        if key in {"map", "crosshair", "bullseye", "broadcast", "wifi", "rulers", "speedometer2", "magic", "gear", "sliders", "cpu", "filetype-pdf"}:
+            colour = accent
+        if key in {"tree", "bounding-box", "polygon"}:
+            colour = success
+        if key in {"exclamation-triangle", "radioactive"}:
+            colour = warning
+
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        scale = size / 28.0
+
+        def sx(value: float) -> float:
+            return float(value) * scale
+
+        def rect(x: float, y: float, w: float, h: float) -> QRectF:
+            return QRectF(sx(x), sx(y), sx(w), sx(h))
+
+        pen = QPen(colour, sx(2.0))
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+
+        def line(x1, y1, x2, y2):
+            painter.drawLine(QPointF(sx(x1), sx(y1)), QPointF(sx(x2), sx(y2)))
+
+        def poly(points, closed=False):
+            if not points:
+                return
+            path = QPainterPath(QPointF(sx(points[0][0]), sx(points[0][1])))
+            for x, y in points[1:]:
+                path.lineTo(sx(x), sx(y))
+            if closed:
+                path.closeSubpath()
+            painter.drawPath(path)
+
+        def circle(cx, cy, radius, fill=None):
+            painter.setBrush(QBrush(fill) if fill is not None else Qt.NoBrush)
+            painter.drawEllipse(QPointF(sx(cx), sx(cy)), sx(radius), sx(radius))
+            painter.setBrush(Qt.NoBrush)
+
+        if key in {"folder2-open", "folder-plus"}:
+            painter.drawRoundedRect(rect(3, 8, 22, 15), sx(2), sx(2))
+            poly([(3, 10), (8, 10), (10, 7), (15, 7), (17, 10), (25, 10)])
+            if key == "folder-plus":
+                line(14, 13, 14, 19); line(11, 16, 17, 16)
+        elif key in {"file-earmark-plus", "file-earmark-arrow-down", "file-earmark-spreadsheet", "filetype-pdf", "save", "file-earmark-text"}:
+            painter.drawRoundedRect(rect(6, 4, 16, 20), sx(1.5), sx(1.5))
+            poly([(17, 4), (22, 9), (17, 9)])
+            if key == "file-earmark-plus":
+                line(14, 12, 14, 19); line(10.5, 15.5, 17.5, 15.5)
+            elif key == "file-earmark-arrow-down":
+                line(14, 11, 14, 19); poly([(10.5, 15.5), (14, 19), (17.5, 15.5)])
+            elif key == "file-earmark-spreadsheet":
+                for y in (12, 16, 20): line(8, y, 20, y)
+                for x in (12, 16): line(x, 10, x, 22)
+            elif key == "filetype-pdf":
+                painter.setFont(QFont("Arial", max(7, int(sx(7))), QFont.Bold))
+                painter.setPen(colour)
+                painter.drawText(rect(6, 14, 16, 8), Qt.AlignCenter, "PDF")
+            elif key == "save":
+                painter.drawRect(rect(9, 15, 10, 7)); line(10, 8, 18, 8)
+            else:
+                line(9, 13, 19, 13); line(9, 17, 19, 17); line(9, 21, 16, 21)
+        elif key in {"map", "geo-alt"}:
+            poly([(4, 8), (10, 5), (18, 8), (24, 5), (24, 21), (18, 24), (10, 21), (4, 24)], True)
+            line(10, 5, 10, 21); line(18, 8, 18, 24)
+            if key == "geo-alt":
+                circle(14, 13, 3); poly([(14, 23), (9, 15), (14, 7), (19, 15), (14, 23)])
+        elif key in {"pencil-square", "pencil"}:
+            painter.drawRoundedRect(rect(5, 6, 17, 17), sx(1.5), sx(1.5))
+            poly([(10, 18), (11, 14), (19, 6), (22, 9), (14, 17), (10, 18)])
+        elif key in {"crosshair", "bullseye"}:
+            circle(14, 14, 8); circle(14, 14, 3)
+            line(14, 3, 14, 8); line(14, 20, 14, 25); line(3, 14, 8, 14); line(20, 14, 25, 14)
+        elif key == "play-fill":
+            painter.setPen(Qt.NoPen); painter.setBrush(QBrush(colour))
+            poly([(9, 6), (22, 14), (9, 22)], True)
+        elif key == "trash":
+            line(8, 9, 20, 9); line(11, 6, 17, 6)
+            painter.drawRoundedRect(rect(9, 10, 10, 13), sx(1), sx(1))
+            line(12, 13, 12, 20); line(16, 13, 16, 20)
+        elif key == "cursor":
+            poly([(7, 4), (21, 16), (15, 17), (18, 24), (14, 25), (11, 18), (7, 22)], True)
+        elif key == "rulers":
+            painter.drawRoundedRect(rect(5, 7, 18, 14), sx(2), sx(2))
+            for x in (9, 13, 17, 21): line(x, 7, x, 10)
+            for y in (13, 17): line(5, y, 8, y)
+        elif key in {"plus-circle", "check2-circle", "x-circle"}:
+            circle(14, 14, 10)
+            if key == "plus-circle":
+                line(14, 9, 14, 19); line(9, 14, 19, 14)
+            elif key == "check2-circle":
+                poly([(8.5, 14), (12.5, 18), (20, 10)])
+            else:
+                line(10, 10, 18, 18); line(18, 10, 10, 18)
+        elif key in {"grid-3x3-gap", "bounding-box"}:
+            for x in (6, 13, 20):
+                for y in (6, 13, 20):
+                    painter.drawRoundedRect(rect(x - 2, y - 2, 4, 4), sx(0.8), sx(0.8))
+            if key == "bounding-box":
+                painter.drawRect(rect(4, 4, 20, 20))
+        elif key == "clipboard":
+            painter.drawRoundedRect(rect(7, 6, 14, 18), sx(2), sx(2))
+            painter.drawRoundedRect(rect(10, 4, 8, 5), sx(1.5), sx(1.5))
+        elif key == "broadcast":
+            circle(14, 14, 2, colour); circle(14, 14, 7); circle(14, 14, 11)
+        elif key == "wifi":
+            poly([(5, 11), (9, 8), (14, 7), (19, 8), (23, 11)])
+            poly([(9, 15), (12, 13), (14, 13), (16, 13), (19, 15)])
+            circle(14, 20, 1.4, colour)
+        elif key in {"sliders", "gear"}:
+            line(6, 8, 22, 8); line(6, 14, 22, 14); line(6, 20, 22, 20)
+            circle(11, 8, 2, QColor("#FFFFFF") if not dark else QColor("#212529"))
+            circle(17, 14, 2, QColor("#FFFFFF") if not dark else QColor("#212529"))
+            circle(13, 20, 2, QColor("#FFFFFF") if not dark else QColor("#212529"))
+        elif key == "speedometer2":
+            painter.drawArc(rect(5, 7, 18, 18), 25 * 16, 130 * 16)
+            line(14, 18, 20, 11); circle(14, 18, 1.5, colour)
+        elif key == "magic":
+            line(8, 22, 21, 9); line(18, 6, 24, 12); line(18, 12, 24, 6)
+            line(7, 7, 7, 11); line(5, 9, 9, 9)
+        elif key == "bricks":
+            for y in (7, 13, 19): line(5, y, 23, y)
+            line(9, 7, 9, 13); line(17, 7, 17, 13); line(13, 13, 13, 19); line(21, 13, 21, 19)
+            painter.drawRect(rect(5, 7, 18, 12))
+        elif key == "tree":
+            poly([(14, 4), (7, 15), (11, 15), (6, 22), (22, 22), (17, 15), (21, 15)], True)
+            line(14, 17, 14, 24)
+        elif key == "exclamation-triangle":
+            poly([(14, 5), (24, 23), (4, 23)], True)
+            line(14, 11, 14, 17); circle(14, 20, 0.8, colour)
+        elif key == "polygon":
+            poly([(6, 19), (10, 7), (21, 9), (24, 19), (15, 24), (6, 19)], True)
+            for x, y in ((6, 19), (10, 7), (21, 9), (24, 19), (15, 24)):
+                circle(x, y, 1.4, QColor("#FFFFFF") if not dark else QColor("#212529"))
+        elif key == "building":
+            painter.drawRect(rect(7, 5, 14, 19))
+            for x in (11, 17):
+                for y in (9, 14, 19):
+                    painter.drawRect(rect(x - 1, y - 1, 2, 2))
+        elif key == "badge-3d":
+            painter.drawRoundedRect(rect(4, 7, 20, 14), sx(3), sx(3))
+            painter.setFont(QFont("Arial", max(7, int(sx(8))), QFont.Bold))
+            painter.drawText(rect(4, 8, 20, 12), Qt.AlignCenter, "3D")
+        elif key in {"arrow-counterclockwise", "arrow-clockwise", "arrow-left", "arrow-right"}:
+            if key == "arrow-left":
+                line(8, 14, 22, 14); poly([(12, 9), (7, 14), (12, 19)])
+            elif key == "arrow-right":
+                line(6, 14, 20, 14); poly([(16, 9), (21, 14), (16, 19)])
+            else:
+                painter.drawArc(rect(6, 6, 16, 16), (40 if key == "arrow-counterclockwise" else -220) * 16, 280 * 16)
+                poly([(8, 8), (7, 14), (13, 12)] if key == "arrow-counterclockwise" else [(20, 8), (21, 14), (15, 12)])
+        elif key == "cpu":
+            painter.drawRoundedRect(rect(8, 8, 12, 12), sx(2), sx(2))
+            for v in (6, 22):
+                line(v, 10, v, 18); line(10, v, 18, v)
+        elif key == "layers":
+            poly([(14, 5), (24, 10), (14, 15), (4, 10)], True)
+            poly([(4, 15), (14, 20), (24, 15)])
+            poly([(4, 19), (14, 24), (24, 19)])
+        else:
+            painter.end()
+            return QIcon()
+
+        painter.end()
+        return QIcon(pixmap)
+
     def _configure_ribbon_actions(self):
         metadata = {
             "open_action": (
                 "Open IFC models", "Replace the current project with one or more IFC models.",
-                "SP_DialogOpenButton", "Ctrl+O"
+                "folder2-open", "Ctrl+O"
             ),
             "add_action": (
                 "Add IFC models", "Append one or more IFC models to the current project.",
-                "SP_FileDialogNewFolder", "Ctrl+Shift+O"
+                "file-earmark-plus", "Ctrl+Shift+O"
             ),
             "open_dxf_action": (
                 "Open DXF overlay", "Load a DXF drawing as a visual alignment reference.",
-                "SP_DirOpenIcon", ""
+                "layers", ""
             ),
             "open_satellite_action": (
                 "Open estate map", "Load online XYZ map or imagery tiles as an estate-wide survey background. OpenStreetMap is available as a basemap; use Custom XYZ for licensed satellite imagery.",
-                "SP_DriveNetIcon", ""
+                "map", ""
             ),
             "edit_satellite_action": (
                 "Edit estate map", "Adjust estate map centre, zoom, source URL, scene alignment, rotation, scale and opacity.",
-                "SP_FileDialogDetailedView", ""
+                "pencil-square", ""
             ),
             "align_satellite_action": (
                 "Align map to IFC", "Pin a chosen map latitude/longitude to a clicked IFC point and apply a manual map rotation.",
-                "SP_DialogApplyButton", ""
+                "crosshair", ""
             ),
             "align_satellite_to_ifc_insertion_action": (
                 "Map to IFC insertion", "Pin a chosen map latitude/longitude directly to the IFC insertion/base point.",
-                "SP_DialogYesButton", ""
+                "geo-alt", ""
             ),
             "use_satellite_extent_action": (
                 "Use map as RF area", "Expand the current floor's RSSI simulation grid to the visible estate map tile area.",
-                "SP_TitleBarMaxButton", ""
+                "bounding-box", ""
             ),
             "load_terrain_action": (
                 "Load land model", "Use open Terrain Tiles elevation data with the estate map alignment and sample RSSI at 1 m above ground.",
-                "SP_ArrowDown", ""
+                "map", ""
             ),
             "clear_terrain_action": (
                 "Clear land model", "Stop using terrain elevation in RSSI simulations.",
-                "SP_DialogDiscardButton", ""
+                "x-circle", ""
             ),
             "import_estate_buildings_action": (
                 "Import OSM buildings", "Import nearby OpenStreetMap building footprints as estate RF obstruction boxes.",
-                "SP_FileDialogContentsView", ""
+                "building", ""
             ),
             "clear_estate_buildings_action": (
                 "Clear OSM buildings", "Remove imported OpenStreetMap estate building obstructions.",
-                "SP_DialogCancelButton", ""
+                "trash", ""
             ),
             "clear_rssi_extent_action": (
                 "Clear RF area", "Return the current floor's RSSI simulation grid to the IFC/AP-derived area.",
-                "SP_DialogResetButton", ""
+                "arrow-counterclockwise", ""
             ),
             "clear_satellite_action": (
                 "Clear estate map", "Remove the estate map imagery layer from the current project.",
-                "SP_DialogDiscardButton", ""
+                "trash", ""
             ),
             "align_ifc_action": (
                 "Align DXF base point", "Move the DXF base point onto the IFC insertion/base point without modifying IFC geometry.",
-                "SP_BrowserReload", ""
+                "crosshair", ""
             ),
             "two_point_align_action": (
                 "Two-point alignment", "Align IFC and DXF using two corresponding snapped points.",
-                "SP_DialogApplyButton", ""
+                "crosshair", ""
             ),
             "clear_dxf_action": (
                 "Clear DXF", "Remove the current DXF overlay without changing the IFC model.",
-                "SP_DialogDiscardButton", ""
+                "trash", ""
             ),
             "sim_action": (
                 "Simulate RSSI", "Choose floors and active radio frequencies, calculate each selected RSSI grid, and retain the results for floor switching and export.",
-                "SP_MediaPlay", "F5"
+                "play-fill", "F5"
             ),
             "export_action": (
                 "Export CSV", "Export the calculated RF sample results to CSV.",
-                "SP_DialogSaveButton", "Ctrl+E"
+                "file-earmark-spreadsheet", "Ctrl+E"
             ),
             "export_ap_positions_action": (
                 "Export AP positions", "Export access point radio profiles, floors and insertion-point-relative positions to CSV.",
-                "SP_DialogSaveButton", "Ctrl+Shift+A"
+                "file-earmark-arrow-down", "Ctrl+Shift+A"
             ),
             "export_pdf_action": (
                 "Export floor PDF", "Choose floors and active frequencies, then calculate and export one scaled RSSI heatmap page for each selected floor/frequency combination using the same simulation pipeline as Simulate RSSI.",
-                "SP_FileDialogContentsView", "Ctrl+Shift+E"
+                "filetype-pdf", "Ctrl+Shift+E"
             ),
             "clear_ap_action": (
                 "Clear access points", "Remove every access point from the current floor.",
-                "SP_TrashIcon", ""
+                "trash", ""
             ),
             "ap_interaction_action": (
                 "AP interaction", "Make access points the only selectable/movable plan objects. Window-select or Shift/Ctrl-select several APs, then drag any selected AP to move the group; hold Shift to constrain movement.",
-                "SP_ArrowCursor", "Ctrl+Alt+A"
+                "cursor", "Ctrl+Alt+A"
             ),
             "inferred_space_interaction_action": (
                 "Inferred space interaction", "Make inferred spaces the only selectable plan objects. Click or window-select one or more inferred spaces, press Delete to remove them, or right-click for AP-planning and deletion actions.",
-                "SP_ArrowCursor", "Ctrl+Alt+I"
+                "cursor", "Ctrl+Alt+I"
             ),
             "ap_ruler_action": (
                 "AP ruler", "Toggle horizontal and vertical dimension rulers between access points. Selected APs are prioritised; with no selection a minimal connected ruler set is shown for the current floor.",
-                "SP_FileDialogDetailedView", "Ctrl+Alt+R"
+                "rulers", "Ctrl+Alt+R"
             ),
             "place_ap_action": (
                 "Single placement", "Enter continuous single-click access point placement mode. Right-click or press the cancel tool to finish.",
-                "SP_FileDialogNewFolder", "Ctrl+Alt+P"
+                "plus-circle", "Ctrl+Alt+P"
             ),
             "array_ap_action": (
                 "Array placement", "Place a configurable AP array using independent axial and transverse distances.",
-                "SP_FileDialogListView", ""
+                "grid-3x3-gap", ""
             ),
             "space_ap_action": (
                 "Place from spaces", "Automatically place one or more APs inside IFC, inferred or manually drawn spaces while remaining in the manual workflow.",
-                "SP_DialogApplyButton", ""
+                "check2-circle", ""
             ),
             "bulk_ap_action": (
                 "Bulk AP parameters", "Apply selected physical and radio parameters to selected APs, the current floor, or the complete project.",
-                "SP_FileDialogDetailedView", "Ctrl+Alt+B"
+                "sliders", "Ctrl+Alt+B"
             ),
             "cancel_ap_tool_action": (
                 "Cancel AP tool", "Exit the active access point placement tool without deleting placed APs.",
-                "SP_DialogCancelButton", "Escape"
+                "x-circle", "Escape"
             ),
             "copy_ap_action": (
                 "Copy APs", "Copy every selected access point, including its type, radios, channels and relative position.",
-                "SP_FileIcon", "Ctrl+C"
+                "clipboard", "Ctrl+C"
             ),
             "paste_ap_action": (
                 "Paste APs", "Paste copied access points onto the current floor with a small cascade offset while preserving their layout.",
-                "SP_DialogApplyButton", "Ctrl+V"
+                "clipboard", "Ctrl+V"
             ),
             "load_pattern_action": (
                 "Load antenna pattern", "Import a directional antenna pattern from a CSV file.",
-                "SP_FileIcon", ""
+                "broadcast", ""
             ),
             "manage_radio_profiles_action": (
                 "Manage radio profiles", "Add, duplicate, delete and edit AP radio profiles used by manual and predictive AP placement.",
-                "SP_FileDialogDetailedView", ""
+                "sliders", ""
             ),
             "edit_rf_presets_action": (
                 "RF preset editor", "Edit default RF attenuation presets for walls, doors, windows, IFC elements and floor/slab loss, or add custom presets.",
-                "SP_FileDialogDetailedView", ""
+                "sliders", ""
             ),
             "load_heatmap_settings_action": (
                 "Load display settings", "Load RF heatmap, colour, IFC and rendering settings from JSON.",
-                "SP_ComputerIcon", ""
+                "file-earmark-text", ""
             ),
             "propagation_settings_action": (
                 "Propagation model", "Configure coherent reflections, higher-order rays, corner diffraction, small-scale fading, delay spread and multiple-AP power combination.",
-                "SP_FileDialogDetailedView", "Ctrl+Alt+M"
+                "wifi", "Ctrl+Alt+M"
             ),
             "performance_settings_action": (
                 "Performance settings", "Configure RF and IFC workers, adaptive sampling, AP-field caches, quick RSSI cutoffs, saved floor/frequency simulations, raster rendering, previews and propagation-cost limits. Includes an i7-1255U/laptop preset.",
-                "SP_ComputerIcon", "Ctrl+Alt+Shift+P"
+                "speedometer2", "Ctrl+Alt+Shift+P"
             ),
             "boundary_result_filter_action": (
                 "Limit RSSI to boundaries", "Skip and hide RSSI samples outside the accepted planner boundaries for each floor. The filter also applies to hover values, CSV statistics and floor PDF exports.",
-                "SP_DialogApplyButton", "Ctrl+Alt+L"
+                "bounding-box", "Ctrl+Alt+L"
             ),
             "planner_settings_action": (
                 "Planner settings", "Configure coverage targets, radios, client capacity, channels and spectrum occupancy.",
-                "SP_FileDialogDetailedView", ""
+                "sliders", ""
             ),
             "predict_aps_action": (
                 "Predict AP locations", "Choose multiple floors and planner radios, then place and configure multi-radio access points within each permitted planning area.",
-                "SP_DialogApplyButton", "Ctrl+P"
+                "magic", "Ctrl+P"
             ),
             "draw_wall_action": (
                 "Draw RF wall", "Draw a connected RF-blocking wall where the IFC model has missing geometry. Hold Shift to constrain it horizontal or vertical.",
-                "SP_FileDialogContentsView", ""
+                "bricks", ""
             ),
             "draw_vegetation_action": (
                 "Add vegetation", "Create a circular RF vegetation/tree obstruction: first click the centre, second click the canopy/hedge radius. Exact RSSI paths use ITU-R P.833-style path-depth vegetation loss; presets remain editable in the attenuation table.",
-                "SP_DirIcon", ""
+                "tree", ""
             ),
             "bulk_attenuation_action": (
                 "Bulk IFC attenuation", "Edit attenuation once per unique IFC wall/element type and apply it to every matching instance.",
-                "SP_FileDialogDetailedView", "Ctrl+Alt+T"
+                "sliders", "Ctrl+Alt+T"
             ),
             "attenuation_review_action": (
                 "IFC attenuation wizard", "Review IFC attenuation values, flag suspicious type rows and apply corrected per-band RF loss values.",
-                "SP_MessageBoxWarning", "Ctrl+Alt+Shift+T"
+                "exclamation-triangle", "Ctrl+Alt+Shift+T"
             ),
             "draw_boundary_action": (
                 "Rectangle boundary", "Draw a rectangular hard boundary shared by all IFC floors.",
-                "SP_TitleBarMaxButton", ""
+                "bounding-box", ""
             ),
             "draw_polygon_boundary_action": (
                 "Polygon boundary", "Draw a polygon hard boundary shared by all IFC floors; hold Shift for horizontal/vertical segments and right-click to finish.",
-                "SP_DriveNetIcon", ""
+                "polygon", ""
             ),
             "suggest_external_boundary_action": (
                 "Suggest outer boundary", "Trace the outermost combined IFC and manually placed RF wall chain, preview it on the plan and accept it as a planner boundary on the current floor.",
-                "SP_FileDialogListView", ""
+                "magic", ""
             ),
             "create_spaces_action": (
                 "Create spaces from walls", "Infer room spaces from wall boundaries. Missing facade walls are closed using the accepted planner boundary or a suggested outer baseline.",
-                "SP_FileDialogDetailedView", ""
+                "grid-3x3-gap", ""
             ),
             "draw_space_action": (
                 "Draw space", "Create a simulator space on the selected floor by clicking polygon vertices; hold Shift for horizontal or vertical segments and right-click to finish.",
-                "SP_FileDialogNewFolder", ""
+                "plus-circle", ""
             ),
             "select_ap_spaces_action": (
                 "AP spaces", "Choose the spaces where predictive AP placement is allowed. Selected spaces are highlighted on the plan.",
-                "SP_DialogApplyButton", ""
+                "check2-circle", ""
             ),
             "clear_inferred_spaces_action": (
                 "Clear inferred spaces", "Remove inferred wall-derived spaces from the selected floor without changing IFC or manually drawn spaces.",
-                "SP_TrashIcon", ""
+                "trash", ""
             ),
             "clear_boundaries_action": (
                 "Clear boundaries", "Remove every rectangular and polygon planner boundary.",
-                "SP_TrashIcon", ""
+                "trash", ""
             ),
             "ifc_origin_action": (
                 "IFC origin and orientation", "Inspect insertion points, site coordinates, CRS, map conversion and True North.",
-                "SP_MessageBoxInformation", ""
+                "geo-alt", ""
             ),
             "building_3d_view_action": (
                 "3D building view", "Open a separate 3D view showing all floors and wireless access point locations.",
-                "SP_ComputerIcon", "Ctrl+Alt+3"
+                "badge-3d", "Ctrl+Alt+3"
             ),
             "rotate_left_action": (
                 "Rotate view left", "Rotate the display 15 degrees counter-clockwise without changing model coordinates.",
-                "SP_ArrowBack", "Alt+Left"
+                "arrow-left", "Alt+Left"
             ),
             "rotate_right_action": (
                 "Rotate view right", "Rotate the display 15 degrees clockwise without changing model coordinates.",
-                "SP_ArrowForward", "Alt+Right"
+                "arrow-right", "Alt+Right"
             ),
             "reset_rotation_action": (
                 "Reset view rotation", "Return the display to the unrotated IFC model orientation.",
-                "SP_BrowserReload", "Alt+Home"
+                "arrow-counterclockwise", "Alt+Home"
             ),
             "save_plan_action": (
                 "Save RF plan", "Save access points, channels, wall overrides, boundaries and alignment settings.",
-                "SP_DialogSaveButton", "Ctrl+S"
+                "save", "Ctrl+S"
             ),
             "load_plan_action": (
                 "Load RF plan", "Load a previously saved RF plan and restore its project settings.",
-                "SP_DialogOpenButton", "Ctrl+L"
+                "folder2-open", "Ctrl+L"
             ),
         }
         for attribute, (label, tooltip, icon_name, shortcut) in metadata.items():
@@ -13821,10 +14335,10 @@ out tags geom;
         button = QToolButton()
         button.setDefaultAction(action)
         button.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
-        button.setIconSize(QSize(28, 28))
+        button.setIconSize(QSize(24, 24))
         button.setAutoRaise(False)
-        button.setMinimumSize(92, 68)
-        button.setMaximumHeight(72)
+        button.setMinimumSize(96, 66)
+        button.setMaximumHeight(70)
         button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         button.setFocusPolicy(Qt.NoFocus)
         return button
@@ -13833,16 +14347,16 @@ out tags geom;
         group = QWidget()
         group.setObjectName("RibbonGroup")
         group_layout = QVBoxLayout(group)
-        group_layout.setContentsMargins(3, 3, 3, 2)
-        group_layout.setSpacing(1)
+        group_layout.setContentsMargins(3, 4, 3, 3)
+        group_layout.setSpacing(3)
 
         box = QFrame()
         box.setObjectName("RibbonGroupBox")
         box.setFrameShape(QFrame.StyledPanel)
         button_layout = QGridLayout(box)
-        button_layout.setContentsMargins(4, 4, 4, 4)
-        button_layout.setHorizontalSpacing(3)
-        button_layout.setVerticalSpacing(0)
+        button_layout.setContentsMargins(5, 5, 5, 5)
+        button_layout.setHorizontalSpacing(4)
+        button_layout.setVerticalSpacing(2)
         for column, action_name in enumerate(action_names):
             action = getattr(self, action_name)
             button_layout.addWidget(self._make_ribbon_button(action), 0, column)
@@ -13852,9 +14366,9 @@ out tags geom;
         caption = QLabel(title)
         caption.setObjectName("RibbonGroupCaption")
         caption.setAlignment(Qt.AlignCenter)
-        caption.setMinimumHeight(18)
+        caption.setMinimumHeight(16)
         group_layout.addWidget(caption, 0)
-        group.setMinimumWidth(max(112, len(action_names) * 96 + 8))
+        group.setMinimumWidth(max(116, len(action_names) * 100 + 10))
         group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         return group
 
@@ -13946,6 +14460,74 @@ out tags geom;
             except RuntimeError:
                 # scene.clear() may already have deleted the wrapped C++ item.
                 pass
+
+    def _clear_ap_measurement_items(self, scene: Optional[QGraphicsScene] = None):
+        scene = scene or (self.view.scene() if getattr(self, "view", None) else None)
+        items = list(getattr(self, "_ap_measurement_items", []))
+        self._ap_measurement_items = []
+        if scene is None:
+            return
+        for item in items:
+            try:
+                if item.scene() is scene:
+                    scene.removeItem(item)
+            except RuntimeError:
+                pass
+
+    def start_access_point_distance_measurement(self, ap: AccessPoint):
+        self._ap_measurement_anchor = ap
+        self._clear_ap_measurement_items()
+        self.statusBar().showMessage(
+            f"Measure from {ap.name}: left-click the target point, or right-click to cancel."
+        )
+
+    def cancel_access_point_distance_measurement(self):
+        self._ap_measurement_anchor = None
+        self._clear_ap_measurement_items()
+        self.statusBar().showMessage("AP distance measurement cancelled")
+
+    def finish_access_point_distance_measurement(self, target: QPointF):
+        ap = getattr(self, "_ap_measurement_anchor", None)
+        if ap is None:
+            return
+        self._ap_measurement_anchor = None
+        scene = self.view.scene()
+        self._clear_ap_measurement_items(scene)
+        start = QPointF(float(ap.x), float(ap.y))
+        end = QPointF(float(target.x()), float(target.y()))
+        dx = float(end.x() - start.x())
+        dy = float(end.y() - start.y())
+        distance = math.hypot(dx, dy)
+        path = QPainterPath(start)
+        path.lineTo(end)
+        item = QGraphicsPathItem(path)
+        pen = QPen(QColor("#EF4444"), 1.6)
+        pen.setCosmetic(True)
+        item.setPen(pen)
+        item.setBrush(QBrush(Qt.NoBrush))
+        item.setZValue(Z_AP_RULER + 3)
+        item.setAcceptedMouseButtons(Qt.NoButton)
+        tooltip = f"{ap.name} to selected point: {distance:.2f} m"
+        item.setToolTip(tooltip)
+        scene.addItem(item)
+        self._ap_measurement_items.append(item)
+        label = self._add_upright_text(
+            scene,
+            f"{distance:.2f} m",
+            (start.x() + end.x()) * 0.5,
+            (start.y() + end.y()) * 0.5,
+            QColor("#B91C1C"),
+            max(8, int(getattr(self.heatmap_settings, "space_label_font_size", 9))),
+            Z_AP_RULER_LABEL + 3,
+            bold=True,
+        )
+        if label is not None:
+            label.setToolTip(tooltip)
+            label.setAcceptedMouseButtons(Qt.NoButton)
+            self._ap_measurement_items.append(label)
+        self.statusBar().showMessage(
+            f"{ap.name} to selected point: {distance:.2f} m (dx {dx:.2f} m, dy {dy:.2f} m)"
+        )
 
     def _minimum_spanning_ap_pairs(
         self, aps: List[AccessPoint], positions: Dict[int, QPointF]
@@ -17943,6 +18525,9 @@ out tags geom;
         self, new_aps: List[AccessPoint], requirements: List[PlannerRadioRequirement],
         samples: Optional[List[Tuple[float, float]]] = None, wall_tree=None,
         walls: Optional[List[Wall2D]] = None,
+        precomputed_rssi_by_ap: Optional[Dict[int, List[np.ndarray]]] = None,
+        sample_indices: Optional[np.ndarray] = None,
+        progress_callback=None,
     ):
         """Assign channels, strongly avoiding co-channel reuse in handover overlap.
 
@@ -17953,6 +18538,17 @@ out tags geom;
         if not new_aps:
             return
         walls = walls or []
+        if samples and sample_indices is not None:
+            sample_indices = np.asarray(sample_indices, dtype=np.int64)
+            if sample_indices.size:
+                channel_samples = [samples[int(index)] for index in sample_indices]
+            else:
+                sample_indices = None
+                channel_samples = samples
+        else:
+            sample_indices = None
+            channel_samples = samples
+        precomputed_rssi_by_ap = precomputed_rssi_by_ap or {}
         new_ids = {id(ap) for ap in new_aps}
         target_floor = new_aps[0].floor
         assigned = [
@@ -17969,16 +18565,30 @@ out tags geom;
             if cached is not None:
                 return cached
             requirement = requirements[req_index]
-            values = self._planner_ap_rssi_values(
-                ap, [requirement], samples, wall_tree, walls
-            )[0]
+            precomputed = precomputed_rssi_by_ap.get(id(ap))
+            if precomputed is not None and req_index < len(precomputed):
+                values = np.asarray(precomputed[req_index], dtype=np.float32)
+                if sample_indices is not None:
+                    values = values[sample_indices]
+            else:
+                values = self._planner_ap_rssi_values(
+                    ap, [requirement], channel_samples, wall_tree, walls
+                )[0]
             threshold = float(requirement.minimum_rssi_dbm) - float(self.auto_planner_settings.handover_margin_db)
             cached = values >= threshold
             overlap_mask_cache[key] = cached
             return cached
 
-        for ap in new_aps:
+        total_work = max(1, len(new_aps) * max(1, len(requirements)))
+        completed_work = 0
+        for ap_index, ap in enumerate(new_aps, start=1):
             for req_index, (req, radio) in enumerate(zip(requirements, ap.radios)):
+                if progress_callback is not None:
+                    progress_callback(
+                        completed_work,
+                        total_work,
+                        f"Assigning channels for planned AP {ap_index}/{len(new_aps)}..."
+                    )
                 channels = list(req.channels) or [""]
                 best_channel = channels[0]
                 best_cost = float("inf")
@@ -18022,7 +18632,10 @@ out tags geom;
                         best_channel = channel
                 radio.channel = str(best_channel)
                 overlap_mask_cache.pop((id(ap), req_index), None)
+                completed_work += 1
             assigned.append(ap)
+        if progress_callback is not None:
+            progress_callback(total_work, total_work, "Channel assignment complete.")
 
     def run_auto_planner(self):
         if not self.floor or not self.floors:
@@ -18491,43 +19104,129 @@ out tags geom;
                     chosen = np.argsort(distances)
                 return [int(remaining_indices[int(i)]) for i in chosen]
 
-            def candidate_subset_rssi(index: int, subset_indices: Sequence[int]) -> Tuple[AccessPoint, List[np.ndarray]]:
-                x, y, azimuth = candidate_specs[index]
-                temp_ap = make_candidate_ap(float(x), float(y), float(azimuth))
-                subset_samples = [samples[int(i)] for i in subset_indices]
-                values = [
-                    candidate_values.astype(np.float32, copy=False)
-                    for candidate_values in self._planner_ap_rssi_values(
-                        temp_ap, requirements, subset_samples, wall_tree, walls,
-                        include_inter_floor=include_inter_floor_rf,
-                        wall_indexes=wall_indexes, opening_indexes=opening_indexes,
-                    )
-                ]
-                return temp_ap, values
+            def planner_sample_weights(
+                coverage_needed: bool, handover_needed: bool, capacity_needed: bool,
+            ) -> np.ndarray:
+                weights = np.full(len(samples), 0.05, dtype=np.float32)
+                if coverage_needed:
+                    weights += np.asarray(coverage_deficit, dtype=np.float32) * 0.18
+                    weights += np.where(overall, 0.0, 8.0).astype(np.float32)
+                if handover_needed:
+                    weights += np.asarray(handover_deficit, dtype=np.float32) * 0.10
+                    weights += np.where(handover_overall, 0.0, 3.5).astype(np.float32)
+                if capacity_needed:
+                    distances = nearest_position_distance(sample_points)
+                    finite = distances[np.isfinite(distances)]
+                    if finite.size:
+                        scale = max(1.0, float(np.percentile(finite, 90)))
+                        weights += np.clip(distances / scale, 0.0, 2.0).astype(np.float32)
+                return weights
 
-            def score_candidate_subset(
-                candidate_ap: AccessPoint,
-                candidate_rssi: List[np.ndarray],
-                subset_indices: Sequence[int],
-                min_distance: float,
-                vertical_distance: float,
+            quick_effective_ple = RFEngine.distance_path_loss_exponent(
+                float(self.ple.value()), self.heatmap_settings
+            )
+            quick_vertical_delta = float(self.mount_height.value()) - float(self.rx_height.value())
+            quick_reference_loss_1m = [
+                RFEngine.free_space_loss_db_at_1m(float(req.frequency_mhz))
+                for req in requirements
+            ]
+            quick_cutoff_radius = [
+                RFEngine.cutoff_radius_m_for_radio(
+                    APRadio(
+                        name=req.name,
+                        frequency_mhz=req.frequency_mhz,
+                        tx_power_dbm=req.tx_power_dbm,
+                        antenna_pattern=req.antenna_pattern,
+                        cutoff_radius_m=req.cutoff_radius_m,
+                        antenna_gain_dbi=req.antenna_gain_dbi,
+                    ),
+                    self.heatmap_settings,
+                )
+                for req in requirements
+            ]
+            quick_patterns = [self.antenna_patterns.get(req.antenna_pattern) for req in requirements]
+            quick_directional = [
+                pattern is not None and not str(req.antenna_pattern).lower().startswith("omni")
+                for req, pattern in zip(requirements, quick_patterns)
+            ]
+            quick_req_data = np.asarray([
+                [
+                    float(ref_loss_1m),
+                    float(req.tx_power_dbm) + float(getattr(req, "antenna_gain_dbi", 0.0) or 0.0),
+                    float(cutoff_radius),
+                    float(req.minimum_rssi_dbm),
+                    float(req.minimum_rssi_dbm) - float(settings.handover_margin_db),
+                ]
+                for req, ref_loss_1m, cutoff_radius in zip(requirements, quick_reference_loss_1m, quick_cutoff_radius)
+            ], dtype=np.float32)
+
+            def candidate_spacing_arrays(indices: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                if indices.size == 0:
+                    empty_bool = np.zeros(0, dtype=bool)
+                    empty_float = np.zeros(0, dtype=np.float32)
+                    return empty_bool, empty_float, empty_float
+                points = candidate_spec_array[indices, :2].astype(np.float32, copy=False)
+                if positions:
+                    min_distances = np.full(len(points), np.inf, dtype=np.float32)
+                    for px, py in positions:
+                        dx = points[:, 0] - float(px)
+                        dy = points[:, 1] - float(py)
+                        min_distances = np.minimum(min_distances, np.sqrt(dx * dx + dy * dy))
+                else:
+                    min_distances = np.full(len(points), float(settings.minimum_ap_spacing_m), dtype=np.float32)
+                if other_floor_positions:
+                    vertical_distances = np.full(len(points), np.inf, dtype=np.float32)
+                    for px, py in other_floor_positions:
+                        dx = points[:, 0] - float(px)
+                        dy = points[:, 1] - float(py)
+                        vertical_distances = np.minimum(vertical_distances, np.sqrt(dx * dx + dy * dy))
+                else:
+                    vertical_distances = np.full(len(points), np.inf, dtype=np.float32)
+                spacing_ok = (
+                    (vertical_distances >= float(vertical_hard_overlap_m))
+                    & (min_distances + 1e-9 >= float(settings.minimum_ap_spacing_m))
+                )
+                return spacing_ok, min_distances, vertical_distances
+
+            def numpy_quick_candidate_scores(
+                candidate_xy: np.ndarray,
+                focus_subset: np.ndarray,
+                min_distances: np.ndarray,
+                vertical_distances: np.ndarray,
                 coverage_needed: bool,
                 handover_needed: bool,
                 capacity_needed: bool,
-            ) -> float:
-                if not subset_indices:
-                    return -float("inf")
-                subset = np.asarray([int(i) for i in subset_indices], dtype=np.int64)
-                coverage_gain = 0.0
-                handover_gain = 0.0
-                newly_covered_masks: List[np.ndarray] = []
-                newly_handover_masks: List[np.ndarray] = []
-                for req, current_strongest, current_second, values in zip(
-                    requirements, strongest_by_radio, second_by_radio, candidate_rssi
-                ):
-                    before_strongest = np.asarray(current_strongest[subset], dtype=np.float32)
-                    before_second = np.asarray(current_second[subset], dtype=np.float32)
-                    candidate_values = np.asarray(values, dtype=np.float32)
+                weights: np.ndarray,
+            ) -> np.ndarray:
+                if candidate_xy.size == 0 or focus_subset.size == 0:
+                    return np.full(len(candidate_xy), -np.inf, dtype=np.float32)
+                focus_xy = sample_points[focus_subset, :2].astype(np.float32, copy=False)
+                subset_weights = np.asarray(weights[focus_subset], dtype=np.float32)
+                dx = focus_xy[None, :, 0] - candidate_xy[:, None, 0]
+                dy = focus_xy[None, :, 1] - candidate_xy[:, None, 1]
+                distance = np.maximum(
+                    1.0,
+                    np.sqrt(dx * dx + dy * dy + float(quick_vertical_delta) * float(quick_vertical_delta)),
+                ).astype(np.float32, copy=False)
+                proposed_strongest: List[np.ndarray] = []
+                proposed_second: List[np.ndarray] = []
+                coverage_masks: List[np.ndarray] = []
+                handover_masks: List[np.ndarray] = []
+                for req_index, req in enumerate(requirements):
+                    path_loss = (
+                        float(quick_req_data[req_index, 0])
+                        + 10.0 * float(quick_effective_ple) * np.log10(distance)
+                    ).astype(np.float32, copy=False)
+                    candidate_values = (float(quick_req_data[req_index, 1]) - path_loss).astype(np.float32, copy=False)
+                    cutoff_radius = float(quick_req_data[req_index, 2])
+                    if cutoff_radius > 0.0:
+                        candidate_values = np.where(
+                            distance <= cutoff_radius,
+                            candidate_values,
+                            float(self.heatmap_settings.disconnected_rssi_dbm),
+                        ).astype(np.float32, copy=False)
+                    before_strongest = np.asarray(strongest_by_radio[req_index][focus_subset], dtype=np.float32)[None, :]
+                    before_second = np.asarray(second_by_radio[req_index][focus_subset], dtype=np.float32)[None, :]
                     after_strongest = np.maximum(before_strongest, candidate_values)
                     after_second = np.where(
                         candidate_values >= before_strongest,
@@ -18536,32 +19235,281 @@ out tags geom;
                     )
                     threshold = float(req.minimum_rssi_dbm)
                     handover_threshold = threshold - float(settings.handover_margin_db)
-                    before_deficit = np.maximum(0.0, threshold - before_strongest)
-                    after_deficit = np.maximum(0.0, threshold - after_strongest)
-                    before_handover = np.maximum(0.0, handover_threshold - before_second)
-                    after_handover = np.maximum(0.0, handover_threshold - after_second)
-                    coverage_gain += float(np.sum(before_deficit - after_deficit))
-                    handover_gain += float(np.sum(before_handover - after_handover))
-                    newly_covered_masks.append((after_strongest >= threshold) & (before_strongest < threshold))
-                    newly_handover_masks.append((after_second >= handover_threshold) & (before_second < handover_threshold))
-
+                    proposed_strongest.append(after_strongest)
+                    proposed_second.append(after_second)
+                    coverage_masks.append(after_strongest >= threshold)
+                    handover_masks.append(after_second >= handover_threshold)
+                coverage_shortfalls = [
+                    np.maximum(0.0, float(req.minimum_rssi_dbm) - values)
+                    for req, values in zip(requirements, proposed_strongest)
+                ]
+                handover_shortfalls = [
+                    np.maximum(0.0, float(req.minimum_rssi_dbm) - float(settings.handover_margin_db) - values)
+                    for req, values in zip(requirements, proposed_second)
+                ]
                 if str(settings.coverage_mode).lower() == "any":
-                    newly_covered = int(np.count_nonzero(np.logical_or.reduce(newly_covered_masks))) if newly_covered_masks else 0
-                    newly_handover = int(np.count_nonzero(np.logical_or.reduce(newly_handover_masks))) if newly_handover_masks else 0
+                    proposed_coverage_deficit = np.minimum.reduce(coverage_shortfalls)
+                    proposed_handover_deficit = np.minimum.reduce(handover_shortfalls)
+                    proposed_overall = np.logical_or.reduce(coverage_masks)
+                    proposed_handover = np.logical_or.reduce(handover_masks)
                 else:
-                    newly_covered = int(sum(np.count_nonzero(mask) for mask in newly_covered_masks))
-                    newly_handover = int(sum(np.count_nonzero(mask) for mask in newly_handover_masks))
+                    proposed_coverage_deficit = np.add.reduce(coverage_shortfalls)
+                    proposed_handover_deficit = np.add.reduce(handover_shortfalls)
+                    proposed_overall = np.logical_and.reduce(coverage_masks)
+                    proposed_handover = np.logical_and.reduce(handover_masks)
+                coverage_gain = np.sum(
+                    np.maximum(0.0, np.asarray(coverage_deficit[focus_subset], dtype=np.float32)[None, :] - proposed_coverage_deficit)
+                    * subset_weights[None, :],
+                    axis=1,
+                )
+                handover_gain = np.sum(
+                    np.maximum(0.0, np.asarray(handover_deficit[focus_subset], dtype=np.float32)[None, :] - proposed_handover_deficit)
+                    * subset_weights[None, :],
+                    axis=1,
+                )
+                newly_covered_weight = np.sum(
+                    np.where(proposed_overall & ~overall[focus_subset][None, :], subset_weights[None, :], 0.0),
+                    axis=1,
+                )
+                newly_handover_weight = np.sum(
+                    np.where(proposed_handover & ~handover_overall[focus_subset][None, :], subset_weights[None, :], 0.0),
+                    axis=1,
+                )
+                scores = np.zeros(len(candidate_xy), dtype=np.float32)
+                if coverage_needed:
+                    scores += coverage_gain.astype(np.float32) * 12.0 + newly_covered_weight.astype(np.float32) * 220.0
+                else:
+                    scores += coverage_gain.astype(np.float32) * 1.5
+                if handover_needed:
+                    scores += handover_gain.astype(np.float32) * 7.5 + newly_handover_weight.astype(np.float32) * 120.0
+                elif settings.handover_enabled:
+                    scores += handover_gain.astype(np.float32) * 0.6
+                if capacity_needed and not coverage_needed and not handover_needed:
+                    scores += np.asarray(min_distances, dtype=np.float32) * 10.0
+                else:
+                    scores += np.asarray(min_distances, dtype=np.float32) * 0.01
+                vertical_penalty = np.where(
+                    np.isfinite(vertical_distances) & (vertical_distances < float(vertical_avoidance_m)),
+                    (float(vertical_avoidance_m) - np.maximum(0.0, vertical_distances)) * 80.0,
+                    0.0,
+                ).astype(np.float32, copy=False)
+                scores -= vertical_penalty
+                if coverage_needed or handover_needed:
+                    scores = np.where(
+                        (coverage_gain > 1e-6) | (handover_gain > 1e-6),
+                        scores,
+                        -np.inf,
+                    ).astype(np.float32, copy=False)
+                return scores.astype(np.float32, copy=False)
+
+            def quick_candidate_scores_batch(
+                record_indices: Sequence[int],
+                focus_subset: np.ndarray,
+                coverage_needed: bool,
+                handover_needed: bool,
+                capacity_needed: bool,
+                weights: np.ndarray,
+            ) -> Tuple[List[Tuple[float, int, AccessPoint]], List[Tuple[float, int, AccessPoint]]]:
+                indices = np.asarray([int(index) for index in record_indices], dtype=np.int64)
+                if indices.size == 0:
+                    return [], []
+                spacing_ok, min_distances, vertical_distances = candidate_spacing_arrays(indices)
+                valid_positions = np.flatnonzero(spacing_ok)
+                if valid_positions.size == 0:
+                    return [], []
+                valid_indices = indices[valid_positions]
+                candidate_rows = candidate_spec_array[valid_indices]
+                candidate_xy = candidate_rows[:, :2].astype(np.float32, copy=False)
+                valid_min_distances = min_distances[valid_positions]
+                valid_vertical_distances = vertical_distances[valid_positions]
+                neutral = [
+                    (
+                        0.0,
+                        int(record_index),
+                        make_candidate_ap(float(row[0]), float(row[1]), float(row[2])),
+                    )
+                    for record_index, row in zip(valid_indices, candidate_rows)
+                ]
+                if np.any(quick_directional):
+                    ranked = []
+                    for record_index, row, min_distance, vertical_distance, candidate_ap in zip(
+                        valid_indices, candidate_rows, valid_min_distances, valid_vertical_distances,
+                        [item[2] for item in neutral],
+                    ):
+                        score = quick_candidate_score_at(
+                            float(row[0]), float(row[1]), float(row[2]), focus_subset,
+                            float(min_distance), float(vertical_distance),
+                            coverage_needed, handover_needed, capacity_needed, weights,
+                        )
+                        if math.isfinite(score):
+                            ranked.append((float(score), int(record_index), candidate_ap))
+                    return ranked, neutral
+
+                focus_xy = sample_points[focus_subset, :2].astype(np.float32, copy=False)
+                subset_weights = np.asarray(weights[focus_subset], dtype=np.float32)
+                strongest_subset = np.vstack([
+                    np.asarray(values[focus_subset], dtype=np.float32)
+                    for values in strongest_by_radio
+                ])
+                second_subset = np.vstack([
+                    np.asarray(values[focus_subset], dtype=np.float32)
+                    for values in second_by_radio
+                ])
+                gpu_scores = None
+                quick_work_items = len(candidate_xy) * max(1, len(focus_subset)) * max(1, len(requirements))
+                if quick_work_items >= 300_000:
+                    try:
+                        gpu_result = gpu_planner_candidate_scores(
+                            candidate_xy,
+                            focus_xy,
+                            subset_weights,
+                            strongest_subset,
+                            second_subset,
+                            np.asarray(coverage_deficit[focus_subset], dtype=np.float32),
+                            np.asarray(handover_deficit[focus_subset], dtype=np.float32),
+                            np.asarray(overall[focus_subset], dtype=np.uint8),
+                            np.asarray(handover_overall[focus_subset], dtype=np.uint8),
+                            quick_req_data,
+                            valid_min_distances,
+                            valid_vertical_distances,
+                            str(settings.coverage_mode).lower() != "any",
+                            coverage_needed,
+                            handover_needed,
+                            capacity_needed,
+                            float(quick_effective_ple),
+                            float(quick_vertical_delta),
+                            float(self.heatmap_settings.disconnected_rssi_dbm),
+                            float(vertical_avoidance_m),
+                            self.heatmap_settings,
+                        )
+                        if gpu_result is not None:
+                            gpu_scores = np.asarray(gpu_result[0], dtype=np.float32)
+                    except Exception:
+                        gpu_scores = None
+                scores = gpu_scores
+                if scores is None:
+                    scores = numpy_quick_candidate_scores(
+                        candidate_xy,
+                        focus_subset,
+                        valid_min_distances,
+                        valid_vertical_distances,
+                        coverage_needed,
+                        handover_needed,
+                        capacity_needed,
+                        weights,
+                    )
+                ranked = [
+                    (float(score), int(record_index), candidate_ap)
+                    for score, record_index, candidate_ap in zip(scores, valid_indices, [item[2] for item in neutral])
+                    if math.isfinite(float(score))
+                ]
+                return ranked, neutral
+
+            def quick_candidate_score_at(
+                x: float,
+                y: float,
+                azimuth: float,
+                subset_indices: Sequence[int],
+                min_distance: float,
+                vertical_distance: float,
+                coverage_needed: bool,
+                handover_needed: bool,
+                capacity_needed: bool,
+                weights: np.ndarray,
+            ) -> float:
+                if subset_indices is None:
+                    return -float("inf")
+                subset = np.asarray(subset_indices, dtype=np.int64)
+                if subset.size == 0:
+                    return -float("inf")
+                subset_weights = np.asarray(weights[subset], dtype=np.float32)
+                dx = sample_points[subset, 0] - float(x)
+                dy = sample_points[subset, 1] - float(y)
+                dz = quick_vertical_delta
+                horizontal_distance = np.maximum(1e-6, np.sqrt(dx * dx + dy * dy))
+                distance = np.maximum(1.0, np.sqrt(dx * dx + dy * dy + dz * dz))
+                bearing = np.degrees(np.arctan2(dy, dx))
+                elevation = np.degrees(np.arctan2(-dz, horizontal_distance))
+                proposed_strongest: List[np.ndarray] = []
+                proposed_second: List[np.ndarray] = []
+                proposed_coverage_masks: List[np.ndarray] = []
+                proposed_handover_masks: List[np.ndarray] = []
+                for req, current_strongest, current_second, ref_loss_1m, cutoff_radius, pattern, is_directional in zip(
+                    requirements, strongest_by_radio, second_by_radio,
+                    quick_reference_loss_1m, quick_cutoff_radius, quick_patterns, quick_directional
+                ):
+                    before_strongest = np.asarray(current_strongest[subset], dtype=np.float32)
+                    before_second = np.asarray(current_second[subset], dtype=np.float32)
+                    path_loss = (
+                        float(ref_loss_1m)
+                        + 10.0 * float(quick_effective_ple) * np.log10(distance)
+                    ).astype(np.float32, copy=False)
+                    pattern_gain = 0.0
+                    if is_directional and pattern is not None:
+                        az_rel = bearing - float(azimuth)
+                        el_rel = elevation
+                        pattern_gain = np.fromiter(
+                            (pattern.gain_dbi(float(az), float(el)) for az, el in zip(az_rel, el_rel)),
+                            dtype=np.float32, count=len(subset),
+                        )
+                    candidate_values = (
+                        float(req.tx_power_dbm)
+                        + float(getattr(req, "antenna_gain_dbi", 0.0) or 0.0)
+                        + pattern_gain
+                        - path_loss
+                    ).astype(np.float32, copy=False)
+                    if cutoff_radius > 0.0:
+                        candidate_values = np.where(
+                            distance <= float(cutoff_radius),
+                            candidate_values,
+                            float(self.heatmap_settings.disconnected_rssi_dbm),
+                        ).astype(np.float32, copy=False)
+                    after_strongest = np.maximum(before_strongest, candidate_values)
+                    after_second = np.where(
+                        candidate_values >= before_strongest,
+                        before_strongest,
+                        np.maximum(before_second, candidate_values),
+                    )
+                    threshold = float(req.minimum_rssi_dbm)
+                    handover_threshold = threshold - float(settings.handover_margin_db)
+                    proposed_strongest.append(after_strongest)
+                    proposed_second.append(after_second)
+                    proposed_coverage_masks.append(after_strongest >= threshold)
+                    proposed_handover_masks.append(after_second >= handover_threshold)
+
+                proposed_coverage_deficit = self._planner_rssi_deficit(
+                    proposed_strongest, requirements, settings.coverage_mode
+                )
+                proposed_handover_deficit = self._planner_rssi_deficit(
+                    proposed_second, requirements, settings.coverage_mode, settings.handover_margin_db
+                )
+                coverage_improvement = np.maximum(
+                    0.0, np.asarray(coverage_deficit[subset], dtype=np.float32) - proposed_coverage_deficit
+                )
+                handover_improvement = np.maximum(
+                    0.0, np.asarray(handover_deficit[subset], dtype=np.float32) - proposed_handover_deficit
+                )
+                coverage_gain = float(np.sum(coverage_improvement * subset_weights))
+                handover_gain = float(np.sum(handover_improvement * subset_weights))
+                if str(settings.coverage_mode).lower() == "any":
+                    proposed_overall = np.logical_or.reduce(proposed_coverage_masks) if proposed_coverage_masks else np.zeros(len(subset), dtype=bool)
+                    proposed_handover = np.logical_or.reduce(proposed_handover_masks) if proposed_handover_masks else np.zeros(len(subset), dtype=bool)
+                else:
+                    proposed_overall = np.logical_and.reduce(proposed_coverage_masks) if proposed_coverage_masks else np.zeros(len(subset), dtype=bool)
+                    proposed_handover = np.logical_and.reduce(proposed_handover_masks) if proposed_handover_masks else np.zeros(len(subset), dtype=bool)
+                newly_covered_weight = float(np.sum(subset_weights[proposed_overall & ~overall[subset]]))
+                newly_handover_weight = float(np.sum(subset_weights[proposed_handover & ~handover_overall[subset]]))
                 if (coverage_needed or handover_needed) and coverage_gain <= 1e-6 and handover_gain <= 1e-6:
                     return -float("inf")
                 score = 0.0
                 if coverage_needed:
-                    score += coverage_gain * 20.0 + newly_covered * 250.0
+                    score += coverage_gain * 12.0 + newly_covered_weight * 220.0
                 else:
-                    score += coverage_gain * 2.0
+                    score += coverage_gain * 1.5
                 if handover_needed:
-                    score += handover_gain * 12.0 + newly_handover * 160.0
+                    score += handover_gain * 7.5 + newly_handover_weight * 120.0
                 elif settings.handover_enabled:
-                    score += handover_gain
+                    score += handover_gain * 0.6
                 if capacity_needed and not coverage_needed and not handover_needed:
                     score += min_distance * 10.0
                 else:
@@ -18595,6 +19543,7 @@ out tags geom;
             def score_candidate(
                 candidate_ap: AccessPoint, candidate_rssi: List[np.ndarray], min_distance: float,
                 vertical_distance: float, coverage_needed: bool, handover_needed: bool, capacity_needed: bool,
+                weights: Optional[np.ndarray] = None,
             ):
                 state = insert_candidate_state(candidate_rssi)
                 (
@@ -18603,21 +19552,25 @@ out tags geom;
                     proposed_overall, proposed_handover,
                     proposed_coverage_deficit, proposed_handover_deficit,
                 ) = state
-                coverage_db_gain = float(np.sum(coverage_deficit - proposed_coverage_deficit))
-                newly_covered = int(np.count_nonzero(proposed_overall & ~overall))
-                handover_db_gain = float(np.sum(handover_deficit - proposed_handover_deficit))
-                newly_handover = int(np.count_nonzero(proposed_handover & ~handover_overall))
+                if weights is None:
+                    weights = planner_sample_weights(coverage_needed, handover_needed, capacity_needed)
+                coverage_improvement = np.maximum(0.0, coverage_deficit - proposed_coverage_deficit)
+                handover_improvement = np.maximum(0.0, handover_deficit - proposed_handover_deficit)
+                coverage_db_gain = float(np.sum(coverage_improvement * weights))
+                newly_covered_weight = float(np.sum(weights[proposed_overall & ~overall]))
+                handover_db_gain = float(np.sum(handover_improvement * weights))
+                newly_handover_weight = float(np.sum(weights[proposed_handover & ~handover_overall]))
                 if (coverage_needed or handover_needed) and coverage_db_gain <= 1e-6 and handover_db_gain <= 1e-6:
                     return -float("inf"), state
                 score = 0.0
                 if coverage_needed:
-                    score += coverage_db_gain * 20.0 + newly_covered * 250.0
+                    score += coverage_db_gain * 12.0 + newly_covered_weight * 220.0
                 else:
-                    score += coverage_db_gain * 2.0
+                    score += coverage_db_gain * 1.5
                 if handover_needed:
-                    score += handover_db_gain * 12.0 + newly_handover * 160.0
+                    score += handover_db_gain * 7.5 + newly_handover_weight * 120.0
                 elif settings.handover_enabled:
-                    score += handover_db_gain * 1.0
+                    score += handover_db_gain * 0.6
                 if capacity_needed and not coverage_needed and not handover_needed:
                     mean_margin = float(np.mean(np.maximum(0.0, proposed_strongest[0] - strongest_by_radio[0])))
                     score += min_distance * 10.0 + mean_margin
@@ -18625,6 +19578,97 @@ out tags geom;
                     score += min_distance * 0.01
                 score -= vertical_spacing_penalty(vertical_distance)
                 return score, state
+
+            def point_is_plannable(x: float, y: float) -> bool:
+                point = Point(float(x), float(y))
+                try:
+                    inside_area = area.covers(point)
+                except Exception:
+                    inside_area = area.contains(point)
+                return bool(inside_area) and not self._planner_point_is_blocked(point, wall_tree, walls)
+
+            def candidate_record_for_point(x: float, y: float, azimuth: float) -> Tuple[AccessPoint, List[np.ndarray]]:
+                temp_ap = make_candidate_ap(float(x), float(y), float(azimuth))
+                values = [
+                    candidate_values.astype(np.float16)
+                    for candidate_values in self._planner_ap_rssi_values(
+                        temp_ap, requirements, samples, wall_tree, walls,
+                        include_inter_floor=include_inter_floor_rf,
+                        wall_indexes=wall_indexes, opening_indexes=opening_indexes,
+                    )
+                ]
+                return temp_ap, values
+
+            def refine_candidate_locally(
+                source_index: int,
+                candidate_ap: AccessPoint,
+                candidate_rssi: List[np.ndarray],
+                candidate_state,
+                best_score: float,
+                coverage_needed: bool,
+                handover_needed: bool,
+                capacity_needed: bool,
+                weights: np.ndarray,
+                focus_indices: Sequence[int],
+            ) -> Tuple[AccessPoint, List[np.ndarray], object, float]:
+                step = max(0.5, float(settings.candidate_spacing_m) * 0.5)
+                offsets = [
+                    (step, 0.0), (-step, 0.0), (0.0, step), (0.0, -step),
+                    (step, step), (step, -step), (-step, step), (-step, -step),
+                ]
+                best_ap = candidate_ap
+                best_rssi = candidate_rssi
+                best_state_local = candidate_state
+                best_score_local = float(best_score)
+                x0, y0, azimuth = candidate_specs[source_index]
+                local_focus = list(focus_indices)
+                if len(local_focus) < 32 and len(samples) > len(local_focus):
+                    weighted_order = np.argsort(weights)[::-1]
+                    for value in weighted_order[:min(64, len(weighted_order))]:
+                        sample_index = int(value)
+                        if sample_index not in local_focus:
+                            local_focus.append(sample_index)
+                        if len(local_focus) >= 64:
+                            break
+                quick_trials: List[Tuple[float, float, float]] = []
+                for dx, dy in offsets:
+                    if progress.wasCanceled():
+                        raise RuntimeError("Predictive AP planning cancelled")
+                    x = float(x0) + float(dx)
+                    y = float(y0) + float(dy)
+                    if not point_is_plannable(x, y):
+                        continue
+                    trial_ap = make_candidate_ap(x, y, float(azimuth))
+                    spacing_ok, min_distance, vertical_distance = candidate_spacing_ok(trial_ap)
+                    if not spacing_ok:
+                        continue
+                    quick_score = quick_candidate_score_at(
+                        x, y, float(azimuth), local_focus, min_distance, vertical_distance,
+                        coverage_needed, handover_needed, capacity_needed, weights,
+                    )
+                    if math.isfinite(quick_score):
+                        quick_trials.append((float(quick_score), x, y))
+                if not quick_trials:
+                    return best_ap, best_rssi, best_state_local, best_score_local
+                quick_trials.sort(key=lambda item: item[0], reverse=True)
+                local_eval_limit = 1 if len(samples) >= 750 else 2
+                for _quick_score, x, y in quick_trials[:local_eval_limit]:
+                    if progress.wasCanceled():
+                        raise RuntimeError("Predictive AP planning cancelled")
+                    trial_ap, trial_rssi = candidate_record_for_point(x, y, float(azimuth))
+                    spacing_ok, min_distance, vertical_distance = candidate_spacing_ok(trial_ap)
+                    if not spacing_ok:
+                        continue
+                    trial_score, trial_state = score_candidate(
+                        trial_ap, trial_rssi, min_distance, vertical_distance,
+                        coverage_needed, handover_needed, capacity_needed, weights,
+                    )
+                    if trial_score > best_score_local + 1e-6:
+                        best_ap = trial_ap
+                        best_rssi = trial_rssi
+                        best_state_local = trial_state
+                        best_score_local = float(trial_score)
+                return best_ap, best_rssi, best_state_local, best_score_local
 
             def apply_selected(index: int, candidate_ap: AccessPoint, candidate_rssi: List[np.ndarray], state):
                 nonlocal strongest_by_radio, second_by_radio, coverage_by_radio, secondary_by_radio
@@ -18652,79 +19696,79 @@ out tags geom;
                 if not coverage_needed and not handover_needed and not capacity_needed:
                     break
 
-                if not positions:
-                    try:
-                        start_point = area.representative_point()
-                        sx, sy = float(start_point.x), float(start_point.y)
-                    except Exception:
-                        sx = float(np.mean(sample_points[:, 0])); sy = float(np.mean(sample_points[:, 1]))
-                    seed_index = min(
-                        remaining,
-                        key=lambda index: (
-                            math.hypot(float(candidate_specs[index][0]) - sx, float(candidate_specs[index][1]) - sy)
-                            + vertical_spacing_penalty(nearest_xy_distance(
-                                other_floor_positions,
-                                float(candidate_specs[index][0]),
-                                float(candidate_specs[index][1]),
-                            )) * 0.25
-                        ),
-                    )
-                    candidate_ap, candidate_rssi = candidate_record(seed_index)
-                    state = insert_candidate_state(candidate_rssi)
-                    apply_selected(seed_index, candidate_ap, candidate_rssi, state)
-                    set_progress_label("Placed the first AP and calculated RSSI extremities...")
-                    set_progress_value(len(selected))
-                    QApplication.processEvents()
-                    continue
-
                 best_index = None
                 best_score = -float("inf")
                 best_state = None
                 best_record = None
                 focus_indices = focus_sample_indices(coverage_needed, handover_needed, capacity_needed)
-                scan_limit = max(48, min(600, int(getattr(settings, "planner_candidate_scan_limit", 240) or 240)))
-                full_eval_limit = max(4, min(80, int(getattr(settings, "planner_full_evaluation_limit", 18) or 18)))
+                iteration_weights = planner_sample_weights(coverage_needed, handover_needed, capacity_needed)
+                configured_scan_limit = max(48, int(getattr(settings, "planner_candidate_scan_limit", 240) or 240))
+                batch_scan_floor = 1024 if len(candidate_specs) >= 1024 and not np.any(quick_directional) else configured_scan_limit
+                if len(candidate_specs) >= 8000 and not np.any(quick_directional):
+                    batch_scan_floor = 2048
+                scan_limit = max(48, min(4096, max(configured_scan_limit, batch_scan_floor)))
+                default_full_eval = 14
+                if len(samples) >= 1200 or len(walls) >= 60 or len(requirements) >= 3:
+                    default_full_eval = 10
+                if len(samples) >= 3000 or len(walls) >= 180:
+                    default_full_eval = 8
+                full_eval_limit = max(
+                    4,
+                    min(80, int(getattr(settings, "planner_full_evaluation_limit", default_full_eval) or default_full_eval)),
+                )
                 shortlist = nearby_candidate_indices(focus_indices, limit=scan_limit)
+                if not positions and remaining:
+                    remaining_indices = np.fromiter(remaining, dtype=np.int64, count=len(remaining))
+                    take = min(max(scan_limit, full_eval_limit * 8), int(remaining_indices.size))
+                    broad = remaining_indices[np.linspace(0, int(remaining_indices.size) - 1, take, dtype=np.int64)]
+                    shortlist = list(dict.fromkeys([int(index) for index in broad] + shortlist))
+                    shortlist = shortlist[:max(scan_limit, take)]
                 if not shortlist:
                     shortlist = list(remaining)[:180]
                 scanned_indices = set()
 
                 def scan_shortlist(indices: Sequence[int], phase_label: str):
                     nonlocal best_index, best_score, best_state, best_record
-                    ranked: List[Tuple[float, int, AccessPoint]] = []
-                    neutral: List[Tuple[float, int, AccessPoint]] = []
+                    candidate_indices: List[int] = []
                     focus_for_scan = list(focus_indices)
+                    if not positions and len(samples) > len(focus_for_scan):
+                        spread = np.linspace(0, len(samples) - 1, min(96, len(samples)), dtype=np.int64)
+                        focus_for_scan = list(dict.fromkeys(focus_for_scan + [int(value) for value in spread]))
+                    if len(focus_for_scan) < 64 and len(samples) > len(focus_for_scan):
+                        weighted_order = np.argsort(iteration_weights)[::-1]
+                        for value in weighted_order[:min(128, len(weighted_order))]:
+                            sample_index = int(value)
+                            if sample_index not in focus_for_scan:
+                                focus_for_scan.append(sample_index)
+                            if len(focus_for_scan) >= 96:
+                                break
                     if not focus_for_scan:
                         focus_for_scan = list(range(min(len(samples), 18)))
-                    for scan_index, record_index in enumerate(indices, start=1):
+                    focus_subset = np.asarray(focus_for_scan, dtype=np.int64)
+                    for record_index in indices:
                         if record_index in scanned_indices:
                             continue
                         scanned_indices.add(record_index)
-                        if progress.wasCanceled():
-                            raise RuntimeError("Predictive AP planning cancelled")
-                        if scan_index == 1 or scan_index % 20 == 0 or scan_index == len(indices):
-                            set_progress_label(
-                                f"AP {len(selected) + 1}: checking {scan_index}/{len(indices)} {phase_label}..."
-                            )
-                            set_progress_value(len(selected))
-                            QApplication.processEvents()
-                        x, y, azimuth = candidate_specs[record_index]
-                        candidate_ap = make_candidate_ap(float(x), float(y), float(azimuth))
-                        spacing_ok, min_distance, vertical_distance = candidate_spacing_ok(candidate_ap)
-                        if not spacing_ok:
-                            continue
-                        neutral.append((0.0, record_index, candidate_ap))
-                        try:
-                            subset_ap, subset_rssi = candidate_subset_rssi(record_index, focus_for_scan)
-                            quick_score = score_candidate_subset(
-                                subset_ap, subset_rssi, focus_for_scan, min_distance, vertical_distance,
-                                coverage_needed, handover_needed, capacity_needed,
-                            )
-                        except Exception:
-                            quick_score = -float("inf")
-                        if not math.isfinite(quick_score):
-                            continue
-                        ranked.append((quick_score, record_index, candidate_ap))
+                        candidate_indices.append(int(record_index))
+                    if not candidate_indices:
+                        return
+                    if progress.wasCanceled():
+                        raise RuntimeError("Predictive AP planning cancelled")
+                    set_progress_label(
+                        f"AP {len(selected) + 1}: batch-ranking {len(candidate_indices)} candidates against {len(focus_subset)} weighted samples {phase_label}..."
+                    )
+                    set_progress_value(len(selected))
+                    QApplication.processEvents()
+                    ranked, neutral = quick_candidate_scores_batch(
+                        candidate_indices,
+                        focus_subset,
+                        coverage_needed,
+                        handover_needed,
+                        capacity_needed,
+                        iteration_weights,
+                    )
+                    if progress.wasCanceled():
+                        raise RuntimeError("Predictive AP planning cancelled")
                     if not ranked:
                         ranked = neutral[:full_eval_limit]
                     if not ranked:
@@ -18735,7 +19779,7 @@ out tags geom;
                             raise RuntimeError("Predictive AP planning cancelled")
                         if eval_index == 1 or eval_index == len(ranked[:full_eval_limit]):
                             set_progress_label(
-                                f"AP {len(selected) + 1}: fully evaluating {eval_index}/{min(full_eval_limit, len(ranked))} shortlisted {phase_label}..."
+                                f"AP {len(selected) + 1}: resolving {eval_index}/{min(full_eval_limit, len(ranked))} set-cover candidates..."
                             )
                             set_progress_value(len(selected))
                             QApplication.processEvents()
@@ -18746,6 +19790,7 @@ out tags geom;
                         score, state = score_candidate(
                             candidate_ap, candidate_rssi, min_distance, vertical_distance,
                             coverage_needed, handover_needed, capacity_needed,
+                            iteration_weights,
                         )
                         if score > best_score:
                             best_score = score
@@ -18753,7 +19798,7 @@ out tags geom;
                             best_state = state
                             best_record = (candidate_ap, candidate_rssi)
 
-                scan_shortlist(shortlist, "locations near weakest RSSI samples")
+                scan_shortlist(shortlist, "locations near weighted coverage gaps")
                 if best_index is None and remaining:
                     fallback = nearby_candidate_indices(focus_indices, limit=max(scan_limit, 360)) or list(remaining)[:max(scan_limit, 360)]
                     scan_shortlist(fallback, "spacing-valid fallback locations")
@@ -18761,6 +19806,14 @@ out tags geom;
                 if best_index is None or best_state is None or best_record is None:
                     break
                 candidate_ap, candidate_rssi = best_record
+                set_progress_label(f"AP {len(selected) + 1}: refining selected location locally...")
+                set_progress_value(len(selected))
+                QApplication.processEvents()
+                candidate_ap, candidate_rssi, best_state, best_score = refine_candidate_locally(
+                    best_index, candidate_ap, candidate_rssi, best_state, best_score,
+                    coverage_needed, handover_needed, capacity_needed,
+                    iteration_weights, focus_indices,
+                )
                 apply_selected(best_index, candidate_ap, candidate_rssi, best_state)
                 set_progress_label(
                     f"Selected {len(selected)} AP(s): coverage {coverage_fraction_now() * 100.0:.1f}%"
@@ -18771,7 +19824,8 @@ out tags geom;
             new_aps: List[AccessPoint] = []
             used_names = {ap.name for ap in self.aps}
             next_name_index = 1
-            for candidate_ap, _ in selected:
+            planned_rssi_by_ap: Dict[int, List[np.ndarray]] = {}
+            for candidate_ap, candidate_rssi in selected:
                 while f"AP-{next_name_index}" in used_names:
                     next_name_index += 1
                 candidate_ap.name = f"AP-{next_name_index}"
@@ -18782,8 +19836,36 @@ out tags geom;
                 candidate_ap.antenna_pattern = candidate_ap.radios[0].antenna_pattern
                 self.aps.append(candidate_ap)
                 new_aps.append(candidate_ap)
+                planned_rssi_by_ap[id(candidate_ap)] = [
+                    np.asarray(values, dtype=np.float32) for values in candidate_rssi
+                ]
+            channel_sample_indices = None
+            if len(samples) > 2500:
+                channel_sample_indices = np.unique(
+                    np.linspace(0, len(samples) - 1, 2500, dtype=np.int64)
+                )
+            set_progress_label(
+                f"Assigning channels for {len(new_aps)} planned AP(s)..."
+            )
+            set_progress_value(len(selected))
+            QApplication.processEvents()
+
+            def channel_progress(done: int, total: int, label: str):
+                if progress.wasCanceled():
+                    raise RuntimeError("Predictive AP planning cancelled")
+                set_progress_label(label)
+                set_progress_value(len(selected))
+                QApplication.processEvents()
+
             self._assign_planner_channels(
-                new_aps, requirements, samples=samples, wall_tree=wall_tree, walls=walls
+                new_aps,
+                requirements,
+                samples=samples,
+                wall_tree=wall_tree,
+                walls=walls,
+                precomputed_rssi_by_ap=planned_rssi_by_ap,
+                sample_indices=channel_sample_indices,
+                progress_callback=channel_progress,
             )
 
         except RuntimeError as exc:
@@ -20438,47 +21520,276 @@ out tags geom;
             "dxf_overlay": hs.display_qcolour("dxf_overlay", dark, "#62B7FF" if dark else "#0096FF"),
         }
 
+    def _opacity_factor(self, setting_name: str, default_percent: int) -> float:
+        value = getattr(getattr(self, "heatmap_settings", None), setting_name, default_percent)
+        try:
+            percent = float(value)
+        except (TypeError, ValueError):
+            percent = float(default_percent)
+        return max(0.0, min(1.0, percent / 100.0))
+
+    @staticmethod
+    def _scale_colour_alpha(colour: QColor, factor: float, *, base_alpha: Optional[int] = None) -> QColor:
+        scaled = QColor(colour)
+        alpha = int(base_alpha if base_alpha is not None else scaled.alpha())
+        scaled.setAlpha(max(0, min(255, int(round(alpha * max(0.0, min(1.0, float(factor))))))))
+        return scaled
+
     def _apply_theme_styles(self):
         """Apply non-scene styling that depends on the OS theme."""
         colours = self._theme_colours()
+        dark = bool(getattr(self, "dark_theme", False))
+        app_bg = "#212529" if dark else "#F8F9FA"
+        panel_bg = "#2B3035" if dark else "#FFFFFF"
+        panel_alt = "#343A40" if dark else "#F1F3F5"
+        input_bg = "#1F2428" if dark else "#FFFFFF"
+        input_disabled = "#343A40" if dark else "#E9ECEF"
+        border = "#495057" if dark else "#DEE2E6"
+        border_strong = "#6C757D" if dark else "#CED4DA"
+        text = "#F8F9FA" if dark else "#212529"
+        muted = "#ADB5BD" if dark else "#6C757D"
+        primary = "#0D6EFD"
+        primary_hover = "#0B5ED7"
+        primary_soft = "#173A5E" if dark else "#E7F1FF"
+        success = "#198754"
+        danger = "#DC3545"
+        selection = "#0D6EFD"
+        self.setStyleSheet(
+            """
+            QMainWindow, QWidget {
+                background: %(app_bg)s;
+                color: %(text)s;
+                font-family: "Segoe UI", "Arial", sans-serif;
+                font-size: 9pt;
+            }
+            QFrame, QTabWidget::pane {
+                border-color: %(border)s;
+            }
+            QLabel {
+                color: %(text)s;
+                background: transparent;
+            }
+            QLabel:disabled {
+                color: %(muted)s;
+            }
+            QScrollArea, QAbstractScrollArea {
+                background: %(panel_bg)s;
+                border: 0;
+            }
+            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit {
+                background: %(input_bg)s;
+                color: %(text)s;
+                border: 1px solid %(border_strong)s;
+                border-radius: 4px;
+                padding: 4px 7px;
+                selection-background-color: %(selection)s;
+                selection-color: #FFFFFF;
+            }
+            QComboBox {
+                padding-right: 18px;
+            }
+            QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QTextEdit:focus {
+                border: 1px solid %(primary)s;
+                background: %(input_bg)s;
+            }
+            QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled {
+                background: %(input_disabled)s;
+                color: %(muted)s;
+                border-color: %(border)s;
+            }
+            QComboBox::drop-down {
+                border: 0;
+                width: 22px;
+            }
+            QComboBox QAbstractItemView {
+                background: %(panel_bg)s;
+                color: %(text)s;
+                border: 1px solid %(border)s;
+                selection-background-color: %(primary)s;
+                selection-color: #FFFFFF;
+                outline: 0;
+            }
+            QPushButton {
+                background: %(primary)s;
+                color: #FFFFFF;
+                border: 1px solid %(primary)s;
+                border-radius: 4px;
+                padding: 6px 12px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background: %(primary_hover)s;
+                border-color: %(primary_hover)s;
+            }
+            QPushButton:pressed {
+                background: #0A58CA;
+            }
+            QPushButton:disabled {
+                background: %(input_disabled)s;
+                border-color: %(border)s;
+                color: %(muted)s;
+            }
+            QCheckBox {
+                spacing: 8px;
+            }
+            QCheckBox::indicator {
+                width: 15px;
+                height: 15px;
+                border: 1px solid %(border_strong)s;
+                border-radius: 3px;
+                background: %(input_bg)s;
+            }
+            QCheckBox::indicator:checked {
+                background: %(primary)s;
+                border-color: %(primary)s;
+            }
+            QSlider::groove:horizontal {
+                height: 5px;
+                background: %(border)s;
+                border-radius: 2px;
+            }
+            QSlider::handle:horizontal {
+                background: %(primary)s;
+                border: 2px solid %(panel_bg)s;
+                width: 16px;
+                margin: -6px 0;
+                border-radius: 8px;
+            }
+            QTabWidget::pane {
+                background: %(panel_bg)s;
+                border: 1px solid %(border)s;
+                border-radius: 4px;
+                top: -1px;
+            }
+            QTabBar::tab {
+                background: %(panel_alt)s;
+                color: %(muted)s;
+                border: 1px solid %(border)s;
+                border-bottom: 0;
+                padding: 7px 14px;
+                min-width: 92px;
+            }
+            QTabBar::tab:selected {
+                background: %(panel_bg)s;
+                color: %(text)s;
+                font-weight: 600;
+            }
+            QTableWidget, QTableView {
+                background: %(panel_bg)s;
+                alternate-background-color: %(panel_alt)s;
+                color: %(text)s;
+                gridline-color: %(border)s;
+                border: 1px solid %(border)s;
+                border-radius: 4px;
+                selection-background-color: %(primary_soft)s;
+                selection-color: %(text)s;
+            }
+            QHeaderView::section {
+                background: %(panel_alt)s;
+                color: %(text)s;
+                border: 0;
+                border-right: 1px solid %(border)s;
+                border-bottom: 1px solid %(border)s;
+                padding: 6px 8px;
+                font-weight: 600;
+            }
+            QMenu {
+                background: %(panel_bg)s;
+                color: %(text)s;
+                border: 1px solid %(border)s;
+                padding: 5px;
+            }
+            QMenu::item {
+                padding: 6px 24px 6px 24px;
+                border-radius: 4px;
+            }
+            QMenu::item:selected {
+                background: %(primary_soft)s;
+                color: %(text)s;
+            }
+            QProgressBar {
+                border: 1px solid %(border)s;
+                border-radius: 4px;
+                background: %(panel_alt)s;
+                text-align: center;
+                color: %(text)s;
+            }
+            QProgressBar::chunk {
+                background: %(success)s;
+                border-radius: 3px;
+            }
+            QSplitter::handle {
+                background: %(border)s;
+            }
+            QToolTip {
+                background: %(panel_bg)s;
+                color: %(text)s;
+                border: 1px solid %(border)s;
+                padding: 4px;
+            }
+            QStatusBar {
+                background: %(panel_bg)s;
+                color: %(muted)s;
+                border-top: 1px solid %(border)s;
+            }
+            """ % {
+                "app_bg": app_bg,
+                "panel_bg": panel_bg,
+                "panel_alt": panel_alt,
+                "input_bg": input_bg,
+                "input_disabled": input_disabled,
+                "border": border,
+                "border_strong": border_strong,
+                "text": text,
+                "muted": muted,
+                "primary": primary,
+                "primary_hover": primary_hover,
+                "primary_soft": primary_soft,
+                "success": success,
+                "danger": danger,
+                "selection": selection,
+            }
+        )
         if hasattr(self, "view") and self.view.scene() is not None:
             self.view.scene().setBackgroundBrush(QBrush(colours["background"]))
         if hasattr(self, "rssi_legend"):
             self.rssi_legend.setStyleSheet(
-                "QLabel {{ background: {bg}; color: {fg}; border-top: 1px solid {border}; padding: 4px; }}".format(
-                    bg=colours["legend_background"].name(),
-                    fg=colours["legend_text"].name(),
-                    border=colours["legend_border"].name(),
+                "QLabel {{ background: {bg}; color: {fg}; border-top: 1px solid {border}; "
+                "padding: 6px 9px; font-size: 8.5pt; }}".format(
+                    bg=panel_bg,
+                    fg=text,
+                    border=border,
                 )
             )
         if hasattr(self, "ribbon"):
-            dark = bool(getattr(self, "dark_theme", False))
-            ribbon_bg = "#2F3338" if dark else "#F3F5F7"
-            group_bg = "#383D43" if dark else "#FFFFFF"
-            button_bg = "#434950" if dark else "#FAFBFC"
-            hover_bg = "#505861" if dark else "#E8F1FB"
-            checked_bg = "#405A72" if dark else "#D6E9FB"
-            text_colour = "#F2F2F2" if dark else "#202124"
-            border = "#555C64" if dark else "#C8CDD3"
+            ribbon_bg = "#252A30" if dark else "#F8F9FA"
+            group_bg = panel_bg
+            button_bg = panel_bg
+            hover_bg = "#343A40" if dark else "#E9F2FF"
+            checked_bg = "#0B5ED7" if dark else "#D6E9FF"
+            tab_bg = "#2B3035" if dark else "#E9ECEF"
             self.ribbon.setStyleSheet(
                 "QTabWidget#MainRibbon::pane { border: 0; border-bottom: 1px solid %(border)s; background: %(ribbon_bg)s; }"
-                "QTabWidget#MainRibbon QTabBar::tab { min-width: 120px; padding: 6px 16px; color: %(text)s; }"
-                "QTabWidget#MainRibbon QTabBar::tab:selected { background: %(group_bg)s; border: 1px solid %(border)s; border-bottom: 0; }"
+                "QTabWidget#MainRibbon QTabBar::tab { min-width: 118px; padding: 7px 16px; color: %(muted)s; background: %(tab_bg)s; border: 1px solid %(border)s; border-bottom: 0; }"
+                "QTabWidget#MainRibbon QTabBar::tab:selected { background: %(group_bg)s; color: %(text)s; font-weight: 600; }"
                 "QScrollArea#RibbonPage { background: %(ribbon_bg)s; }"
                 "QWidget#RibbonGroup { background: transparent; }"
-                "QFrame#RibbonGroupBox { background: %(group_bg)s; border: 1px solid %(border)s; border-radius: 3px; }"
-                "QLabel#RibbonGroupCaption { color: %(text)s; font-size: 10px; padding-top: 1px; }"
-                "QToolButton { background: %(button_bg)s; color: %(text)s; border: 1px solid transparent; border-radius: 3px; padding: 3px 5px; }"
-                "QToolButton:hover { background: %(hover_bg)s; border-color: %(border)s; }"
-                "QToolButton:pressed, QToolButton:checked { background: %(checked_bg)s; border-color: %(border)s; }"
+                "QFrame#RibbonGroupBox { background: %(group_bg)s; border: 1px solid %(border)s; border-radius: 6px; }"
+                "QLabel#RibbonGroupCaption { color: %(muted)s; font-size: 9px; font-weight: 600; padding-top: 0; }"
+                "QToolButton { background: %(button_bg)s; color: %(text)s; border: 1px solid transparent; border-radius: 5px; padding: 4px 5px; font-size: 8.3pt; }"
+                "QToolButton:hover { background: %(hover_bg)s; border-color: %(primary)s; }"
+                "QToolButton:pressed, QToolButton:checked { background: %(checked_bg)s; border-color: %(primary)s; color: %(text)s; }"
                 % {
                     "ribbon_bg": ribbon_bg,
                     "group_bg": group_bg,
                     "button_bg": button_bg,
                     "hover_bg": hover_bg,
                     "checked_bg": checked_bg,
-                    "text": text_colour,
+                    "tab_bg": tab_bg,
+                    "text": text,
+                    "muted": muted,
                     "border": border,
+                    "primary": primary,
                 }
             )
 
@@ -21147,7 +22458,7 @@ out tags geom;
         item.setZValue(Z_SATELLITE_OVERLAY)
         item.setAcceptedMouseButtons(Qt.NoButton)
         try:
-            item.setTransformationMode(Qt.SmoothTransformation)
+            item.setTransformationMode(Qt.FastTransformation)
         except Exception:
             pass
         scene.addItem(item)
@@ -21450,7 +22761,7 @@ out tags geom;
                 self._ifc_chunk_had_error = {}
                 self._ifc_process_executor = concurrent.futures.ProcessPoolExecutor(max_workers=process_count)
                 self._ifc_process_futures = {}
-                chunk_size = max(25, int(getattr(self.heatmap_settings, "ifc_geometry_chunk_size", 250) or 250))
+                chunk_size = max(25, int(getattr(self.heatmap_settings, "ifc_geometry_chunk_size", 1000) or 1000))
                 for job in base_jobs:
                     path = Path(job[0])
                     size_mb = (path.stat().st_size / (1024.0 * 1024.0)) if path.exists() else 0.0
@@ -21487,7 +22798,17 @@ out tags geom;
                                 fut = self._ifc_process_executor.submit(_load_ifc_file_in_process, job)
                                 self._ifc_process_futures[fut] = (path, "file")
                                 continue
-                            chunks = [records[i:i + chunk_size] for i in range(0, len(records), chunk_size)]
+                            effective_chunk_size = int(chunk_size)
+                            target_chunk_jobs = max(process_count * 4, process_count, 1)
+                            if len(records) > effective_chunk_size * target_chunk_jobs:
+                                effective_chunk_size = max(
+                                    effective_chunk_size,
+                                    int(math.ceil(len(records) / float(target_chunk_jobs))),
+                                )
+                            chunks = [
+                                records[i:i + effective_chunk_size]
+                                for i in range(0, len(records), effective_chunk_size)
+                            ]
                             key = self._ifc_path_key(path)
                             self._ifc_chunk_remaining[key] = len(chunks)
                             self._ifc_chunk_total[key] = len(chunks)
@@ -21506,7 +22827,7 @@ out tags geom;
                             active_jobs = min(process_count, len(chunks))
                             self.statusBar().showMessage(
                                 f"Chunked {path.name}: {len(records)} elements across {len(chunks)} geometry jobs "
-                                f"using up to {active_jobs}/{process_count} process(es)..."
+                                f"(~{effective_chunk_size} elements/job) using up to {active_jobs}/{process_count} process(es)..."
                             )
                         except Exception as exc:
                             self._load_errors.append(f"{path.name}: chunk index failed ({exc}); falling back to whole-file process loading")
@@ -21859,6 +23180,7 @@ out tags geom;
         scene.clear()
         self._heatmap_scene_items = []
         self._ap_ruler_items = []
+        self._ap_measurement_items = []
         self._ifc_snap_marker_items = []
         self._wall_preview_items = []
         self._space_preview_items = []
@@ -21868,6 +23190,7 @@ out tags geom;
         if not self.floor:
             self._drawing_floor = False
             return
+        ifc_opacity = self._opacity_factor("ifc_element_opacity_percent", 55)
         self._draw_satellite_overlay(scene)
         self._draw_rssi_extent_overlay(scene)
         # Draw heatmap first so the building geometry remains visible above it.
@@ -21893,17 +23216,13 @@ out tags geom;
             else:
                 pen_colour = colours["space_pen"]
                 fill_colour = QColor(colours["space_fill"])
-            if pdf_export_rendering:
-                # The RSSI raster is the primary PDF fill.  Space fills sit above
-                # it in the interactive scene, so make them transparent for the
-                # report while retaining their outlines and labels.
-                fill_colour.setAlpha(0)
-            elif space.ap_planning_selected:
+            if space.ap_planning_selected:
                 fill_colour.setAlpha(115)
             elif space.is_inferred:
                 fill_colour.setAlpha(70)
             elif space.is_user_created:
                 fill_colour.setAlpha(65)
+            fill_colour = self._scale_colour_alpha(fill_colour, ifc_opacity)
             pen = QPen(pen_colour, 0.20 if space.ap_planning_selected else (0.16 if (space.is_inferred or space.is_user_created) else 0.12))
             pen.setCosmetic(True)
             if space.is_inferred:
@@ -21938,7 +23257,7 @@ out tags geom;
 
         generic_element_pen_colour = QColor("#526D82") if not getattr(self, "dark_theme", False) else QColor("#88A6BC")
         generic_element_fill_colour = QColor("#B6C6D2") if not getattr(self, "dark_theme", False) else QColor("#364854")
-        generic_element_fill_colour.setAlpha(80)
+        generic_element_fill_colour.setAlpha(max(0, min(255, int(round(80 * ifc_opacity)))))
         for element in getattr(self.floor, "elements", []):
             try:
                 coords = list(element.polygon.exterior.coords)
@@ -21949,26 +23268,23 @@ out tags geom;
             if element.rf_category == "door":
                 element_pen_colour = QColor("#A85D00") if not getattr(self, "dark_theme", False) else QColor("#FFB454")
                 element_fill_colour = QColor("#E5A04B")
-                element_fill_colour.setAlpha(175)
+                element_fill_colour.setAlpha(max(0, min(255, int(round(175 * ifc_opacity)))))
             elif element.rf_category == "window":
                 element_pen_colour = QColor("#007EA8") if not getattr(self, "dark_theme", False) else QColor("#65D5FF")
                 element_fill_colour = QColor("#72C7E7")
-                element_fill_colour.setAlpha(165)
+                element_fill_colour.setAlpha(max(0, min(255, int(round(165 * ifc_opacity)))))
             elif element.rf_category == "vegetation":
                 element_pen_colour = QColor("#166534") if not getattr(self, "dark_theme", False) else QColor("#86EFAC")
                 element_fill_colour = QColor("#22C55E")
-                element_fill_colour.setAlpha(105 if getattr(element, "is_user_created", False) else 85)
+                base_alpha = 105 if getattr(element, "is_user_created", False) else 85
+                element_fill_colour.setAlpha(max(0, min(255, int(round(base_alpha * ifc_opacity)))))
             elif element.is_rf_barrier:
                 element_pen_colour = QColor("#7C3AED") if not getattr(self, "dark_theme", False) else QColor("#C4B5FD")
                 element_fill_colour = QColor("#A78BFA")
-                element_fill_colour.setAlpha(105)
+                element_fill_colour.setAlpha(max(0, min(255, int(round(105 * ifc_opacity)))))
             else:
                 element_pen_colour = QColor(generic_element_pen_colour)
                 element_fill_colour = QColor(generic_element_fill_colour)
-            if pdf_export_rendering:
-                # Preserve doors, windows and other IFC linework without laying
-                # their translucent/opaque brushes over the RSSI colour field.
-                element_fill_colour.setAlpha(0)
             element_pen = QPen(element_pen_colour, 0.11 if element.is_rf_barrier else 0.08)
             element_pen.setCosmetic(True)
             poly = QPolygonF([QPointF(float(x), float(y)) for x, y in coords])
@@ -21999,12 +23315,9 @@ out tags geom;
             wall_pen.setCosmetic(True)
             fill_key = "wall_alt_fill" if getattr(wall, "projected_to_floor", False) else "wall_fill"
             fill_colour = QColor("#FFB45A") if wall.is_user_created else QColor(colours[fill_key])
-            if pdf_export_rendering:
-                # Keep wall edges above the heatmap, but do not allow wall
-                # polygon brushes to conceal the exported RF raster.
-                fill_colour.setAlpha(0)
-            elif wall.is_user_created:
+            if wall.is_user_created:
                 fill_colour.setAlpha(150)
+            fill_colour = self._scale_colour_alpha(fill_colour, ifc_opacity)
             item = WallGraphicsItem(self, wall, poly, wall_pen, QBrush(fill_colour))
             scene.addItem(item)
         pending_ap_selection_ids = set(getattr(self, "_pending_ap_selection_ids", set()))
@@ -22150,9 +23463,10 @@ out tags geom;
         if len(xs) < 2 or len(ys) < 2 or z.size == 0:
             return
         pdf_export_rendering = bool(getattr(self, "_pdf_export_rendering", False))
+        heatmap_opacity = self._opacity_factor("heatmap_opacity_percent", 70)
         cache_key = (
             "heatmap_raster", tuple((zone.name, zone.min_dbm, zone.max_dbm, zone.colour, zone.alpha) for zone in self.heatmap_settings.zones),
-            tuple(z.shape), bool(getattr(self, "dark_theme", False)), pdf_export_rendering,
+            tuple(z.shape), bool(getattr(self, "dark_theme", False)), pdf_export_rendering, round(heatmap_opacity, 4),
         )
         image = result.render_cache.get(cache_key)
         if image is None:
@@ -22173,7 +23487,7 @@ out tags geom;
                 rgba[mask, 0] = int(colour.red())
                 rgba[mask, 1] = int(colour.green())
                 rgba[mask, 2] = int(colour.blue())
-                rgba[mask, 3] = 255 if pdf_export_rendering else max(0, min(255, int(zone.alpha)))
+                rgba[mask, 3] = max(0, min(255, int(round(int(zone.alpha) * heatmap_opacity))))
             # Cover values above/below the explicitly bounded zones using the configured end colours.
             if gpu_raster is None and np.any(finite):
                 uncovered = finite & (rgba[:, :, 3] == 0)
@@ -22191,12 +23505,16 @@ out tags geom;
                         rgba[mask, 0] = int(colour.red())
                         rgba[mask, 1] = int(colour.green())
                         rgba[mask, 2] = int(colour.blue())
-                        rgba[mask, 3] = 255 if pdf_export_rendering else max(0, min(255, int(zone.alpha)))
-            if pdf_export_rendering:
-                # OpenCL colourisation carries the interactive zone alpha.
-                # Reports use opaque bands so the white page and IFC overlays do
-                # not wash out or hide the RF result.
-                rgba[np.isfinite(z), 3] = 255
+                        rgba[mask, 3] = max(0, min(255, int(round(int(zone.alpha) * heatmap_opacity))))
+            if gpu_raster is not None:
+                # GPU colourisation carries the configured zone alpha.  Apply the
+                # app/PDF layer opacity here so both paths use the same visibility
+                # control. The report legend is drawn separately with opaque swatches.
+                rgba[np.isfinite(z), 3] = np.clip(
+                    np.rint(rgba[np.isfinite(z), 3].astype(np.float32) * heatmap_opacity),
+                    0,
+                    255,
+                ).astype(np.uint8)
             image_format = getattr(QImage, "Format_RGBA8888", None)
             if image_format is None:
                 image_format = QImage.Format.Format_RGBA8888
@@ -22335,7 +23653,11 @@ out tags geom;
             if path.isEmpty():
                 continue
             item = QGraphicsPathItem(path)
-            item.setBrush(QBrush(self.heatmap_settings.colour_for_rssi(colour_ref)))
+            fill_colour = self._scale_colour_alpha(
+                self.heatmap_settings.colour_for_rssi(colour_ref),
+                self._opacity_factor("heatmap_opacity_percent", 70),
+            )
+            item.setBrush(QBrush(fill_colour))
             item.setPen(QPen(Qt.NoPen))
             item.setZValue(Z_HEATMAP_FILL)
             self._add_heatmap_scene_item(item)
@@ -23815,6 +25137,18 @@ out tags geom;
         export_view.setScene(None)
         export_view.deleteLater()
 
+    def _pdf_map_attribution(self) -> str:
+        overlay = getattr(self, "satellite_overlay", None)
+        if overlay is None or not bool(getattr(overlay, "visible", True)):
+            return ""
+        attribution = str(getattr(overlay, "attribution", "") or "").strip()
+        source = str(getattr(overlay, "source_name", "") or "OpenStreetMap").strip()
+        if attribution:
+            return attribution
+        if "openstreetmap" in source.lower():
+            return "© OpenStreetMap contributors"
+        return source
+
     def _draw_pdf_rssi_legend(
         self,
         painter: QPainter,
@@ -24265,6 +25599,18 @@ out tags geom;
                     footer_font.setPointSize(8)
                     painter.setFont(footer_font)
                     painter.setPen(QColor("#64748B"))
+                    attribution = self._pdf_map_attribution()
+                    if attribution:
+                        painter.drawText(
+                            QRectF(
+                                page_rect.left() + margin,
+                                page_rect.bottom() - footer_height,
+                                page_rect.width() - (2.0 * margin),
+                                footer_height,
+                            ),
+                            Qt.AlignLeft | Qt.AlignVCenter,
+                            attribution,
+                        )
                     painter.drawText(
                         QRectF(
                             page_rect.left() + margin,
