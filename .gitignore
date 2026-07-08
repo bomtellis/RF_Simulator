@@ -219,3 +219,6 @@ __marimo__/
 
 # OpenStreetMap Tile Cache
 .rf_tile_cache
+
+# Terrain cache
+.rf_terrain_cache
