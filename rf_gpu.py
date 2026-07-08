@@ -559,7 +559,67 @@ if cuda is not None:
             if path_count == 0:
                 best = disconnected
             out_rssi[gid] = best
-            out_counts[gid] = path_count
+            out_counts[gid] = path_count if combine_mode == 1 else (1 if path_count > 0 else 0)
+
+    @cuda.jit(cache=True, fastmath=True)
+    def _cuda_inspect_direct_paths(ap_data, segments, segment_indices, segment_offsets,
+                                   x, y, disconnected, output):
+        ap_count = ap_data.shape[0]
+        start = cuda.grid(1)
+        stride = cuda.gridsize(1)
+        for ai in range(start, ap_count, stride):
+            ax = ap_data[ai, 0]
+            ay = ap_data[ai, 1]
+            az = ap_data[ai, 2]
+            z_delta = ap_data[ai, 3]
+            base_dbm = ap_data[ai, 4]
+            path_loss_factor = ap_data[ai, 5]
+            cutoff2 = ap_data[ai, 6]
+            dz2 = ap_data[ai, 7]
+            dx = x - ax
+            dy = y - ay
+            d2xy = dx * dx + dy * dy
+            d3 = math.sqrt(d2xy + dz2)
+            if d3 < 1.0:
+                d3 = 1.0
+            if cutoff2 > 0.0 and d2xy > cutoff2:
+                output[ai, 0] = disconnected
+                output[ai, 1] = d3
+                output[ai, 2] = 0.0
+                output[ai, 3] = 0.0
+                continue
+            ray_min_x = ax if ax < x else x
+            ray_max_x = x if x > ax else ax
+            ray_min_y = ay if ay < y else y
+            ray_max_y = y if y > ay else ay
+            wall_loss = 0.0
+            first_segment = segment_offsets[ai]
+            last_segment = segment_offsets[ai + 1]
+            for packed_index in range(first_segment, last_segment):
+                si = segment_indices[packed_index]
+                if (segments[si, 8] < ray_min_x - 1.0e-5 or segments[si, 7] > ray_max_x + 1.0e-5 or
+                        segments[si, 10] < ray_min_y - 1.0e-5 or segments[si, 9] > ray_max_y + 1.0e-5):
+                    continue
+                x1 = segments[si, 0]
+                y1 = segments[si, 1]
+                sdx = segments[si, 2]
+                sdy = segments[si, 3]
+                den = dx * sdy - dy * sdx
+                if den > -1.0e-7 and den < 1.0e-7:
+                    continue
+                t = ((x1 - ax) * sdy - (y1 - ay) * sdx) / den
+                u = ((x1 - ax) * dy - (y1 - ay) * dx) / den
+                if t >= 0.0 and t <= 1.0 and u >= 0.0 and u <= 1.0:
+                    zhit = az + z_delta * t
+                    if zhit >= segments[si, 4] and zhit <= segments[si, 5]:
+                        wall_loss += segments[si, 6]
+            rssi = base_dbm - path_loss_factor * math.log10(d3) - wall_loss
+            if rssi < disconnected:
+                rssi = disconnected
+            output[ai, 0] = rssi
+            output[ai, 1] = d3
+            output[ai, 2] = wall_loss
+            output[ai, 3] = 1.0
 
 else:  # pragma: no cover
     _cuda_influence_mask = None
@@ -569,6 +629,7 @@ else:  # pragma: no cover
     _cuda_direct_rssi_paths = None
     _cuda_direct_rssi_paths_block = None
     _cuda_reduce_rssi_paths = None
+    _cuda_inspect_direct_paths = None
 
 
 class NumbaCUDARFAccelerator:
@@ -938,6 +999,29 @@ class NumbaCUDARFAccelerator:
             }
         return rssi.reshape((rows, cols)), counts.reshape((rows, cols))
 
+    def inspect_direct_paths(self, receiver_x, receiver_y, ap_data, segments, disconnected, settings=None):
+        compact_aps, prepared_segments, segment_indices, segment_offsets = _prepare_direct_inputs(
+            ap_data, segments, np.float32
+        )
+        ap_count = int(compact_aps.shape[0])
+        if ap_count <= 0:
+            return np.zeros((0, 4), dtype=np.float32)
+        with self._lock, cuda.gpus[self.device_index]:
+            stream = cuda.stream()
+            d_aps = cuda.to_device(compact_aps, stream=stream)
+            d_segments = cuda.to_device(prepared_segments, stream=stream)
+            d_segment_indices = cuda.to_device(segment_indices, stream=stream)
+            d_offsets = cuda.to_device(segment_offsets, stream=stream)
+            d_output = cuda.device_array((ap_count, 4), dtype=np.float32, stream=stream)
+            blocks, threads = self._launch_shape(ap_count)
+            _cuda_inspect_direct_paths[blocks, threads, stream](
+                d_aps, d_segments, d_segment_indices, d_offsets,
+                np.float32(receiver_x), np.float32(receiver_y), np.float32(disconnected), d_output,
+            )
+            output = d_output.copy_to_host(stream=stream)
+            stream.synchronize()
+        return np.asarray(output, dtype=np.float32).reshape(ap_count, 4)
+
 
 # ------------------------------ OpenCL fallback -----------------------------
 _KERNEL_SOURCE = r"""
@@ -987,16 +1071,20 @@ __kernel void colourise(__global const float *values,const int points,__global c
 }
 __kernel void direct_rssi_paths(__global const float *xs,__global const float *ys,
  __global const uchar *valid,__global const float *aps,__global const float *segments,
- __global const int *segment_indices,__global const int *offsets,const int ap_count,
- const float disconnected,const int start_gid,const int work_count,__global float *path_rssi,
- const int cols,const int rows){
+ __global const int *segment_indices,__global const int *offsets,__global const float *receiver_z,
+ __global const float *terrain_z,const int terrain_enabled,const float ground_loss_db,
+ const float terrain_clearance,const int ap_count,const float disconnected,const int start_gid,
+ const int work_count,__global float *path_rssi,const int cols,const int rows){
  const int total=cols*rows;const int path_total=work_count*ap_count;
  for(int path_index=get_global_id(0);path_index<path_total;path_index+=get_global_size(0)){
   const int ai=path_index/work_count;const int local_gid=path_index-ai*work_count;
   const int gid=start_gid+local_gid;if(gid>=total||valid[gid]==0){path_rssi[path_index]=NAN;continue;}
   const int ix=gid%cols,iy=gid/cols;const float x=xs[ix],y=ys[iy];const int ab=ai*8;
-  const float ax=aps[ab],ay=aps[ab+1],az=aps[ab+2],z_delta=aps[ab+3];
-  const float base_dbm=aps[ab+4],path_loss_factor=aps[ab+5],cutoff2=aps[ab+6],dz2=aps[ab+7];
+  const float ax=aps[ab],ay=aps[ab+1],az=aps[ab+2];
+  float z_delta=aps[ab+3];
+  const float base_dbm=aps[ab+4],path_loss_factor=aps[ab+5],cutoff2=aps[ab+6];
+  float dz2=aps[ab+7];
+  if(terrain_enabled!=0){z_delta=receiver_z[gid]-az;dz2=z_delta*z_delta;}
   const float dx=x-ax,dy=y-ay;const float d2xy=dx*dx+dy*dy;
   if(cutoff2>0.0f&&d2xy>cutoff2){path_rssi[path_index]=NAN;continue;}
   float d3=sqrt(d2xy+dz2);d3=fmax(d3,1.0f);float wall_loss=0.0f;
@@ -1009,6 +1097,19 @@ __kernel void direct_rssi_paths(__global const float *xs,__global const float *y
    const float u=((x1-ax)*dy-(y1-ay)*dx)/den;
    if(t>=0.0f&&t<=1.0f&&u>=0.0f&&u<=1.0f){const float zhit=az+z_delta*t;
     if(zhit>=segments[sb+4]&&zhit<=segments[sb+5])wall_loss+=segments[sb+6];}}
+  if(terrain_enabled!=0&&ground_loss_db>0.0f){
+   const float sx0=xs[0],sy0=ys[0],sx1=xs[cols-1],sy1=ys[rows-1];
+   float spacing_x=cols>1?fabs(xs[1]-xs[0]):2.0f;float spacing_y=rows>1?fabs(ys[1]-ys[0]):2.0f;
+   float spacing=fmin(spacing_x,spacing_y);if(spacing<1.0f)spacing=1.0f;
+   int steps=(int)ceil(sqrt(d2xy)/spacing);if(steps<4)steps=4;else if(steps>32)steps=32;
+   for(int step=1;step<steps;++step){
+    const float tline=(float)step/(float)steps;const float sx=ax+dx*tline;const float sy=ay+dy*tline;
+    int tx=cols>1?(int)floor(((sx-sx0)/(sx1-sx0)*(float)(cols-1))+0.5f):0;
+    int ty=rows>1?(int)floor(((sy-sy0)/(sy1-sy0)*(float)(rows-1))+0.5f):0;
+    if(tx<0)tx=0;else if(tx>=cols)tx=cols-1;if(ty<0)ty=0;else if(ty>=rows)ty=rows-1;
+    const float los_z=az+z_delta*tline;if(terrain_z[ty*cols+tx]>=los_z-terrain_clearance){wall_loss+=ground_loss_db;break;}
+   }
+  }
   float rssi=base_dbm-path_loss_factor*log10(d3)-wall_loss;path_rssi[path_index]=fmax(rssi,disconnected);
  }
 }
@@ -1022,7 +1123,30 @@ __kernel void reduce_rssi_paths(__global const uchar *valid,__global const float
   for(int ai=0;ai<ap_count;++ai){const float rssi=path_rssi[ai*work_count+local_gid];if(!isfinite(rssi))continue;
    ++path_count;if(combine_mode==1)power_sum+=pow(10.0f,rssi/10.0f);else if(rssi>best)best=rssi;}
   if(combine_mode==1&&power_sum>0.0f)best=10.0f*log10(power_sum);if(path_count==0)best=disconnected;
-  out_rssi[gid]=best;out_counts[gid]=(short)path_count;
+  out_rssi[gid]=best;out_counts[gid]=(short)(combine_mode==1?path_count:(path_count>0?1:0));
+ }
+}
+__kernel void inspect_direct_paths(__global const float *aps,__global const float *segments,
+ __global const int *segment_indices,__global const int *offsets,const int ap_count,
+ const float x,const float y,const float disconnected,__global float *out){
+ for(int ai=get_global_id(0);ai<ap_count;ai+=get_global_size(0)){
+  const int ab=ai*8;const float ax=aps[ab],ay=aps[ab+1],az=aps[ab+2],z_delta=aps[ab+3];
+  const float base_dbm=aps[ab+4],path_loss_factor=aps[ab+5],cutoff2=aps[ab+6],dz2=aps[ab+7];
+  const float dx=x-ax,dy=y-ay;const float d2xy=dx*dx+dy*dy;const int ob=ai*4;
+  if(cutoff2>0.0f&&d2xy>cutoff2){out[ob]=disconnected;out[ob+1]=sqrt(fmax(d2xy+dz2,1.0f));out[ob+2]=0.0f;out[ob+3]=0.0f;continue;}
+  const float d3=fmax(sqrt(d2xy+dz2),1.0f);float wall_loss=0.0f;
+  const float ray_min_x=fmin(ax,x),ray_max_x=fmax(ax,x),ray_min_y=fmin(ay,y),ray_max_y=fmax(ay,y);
+  for(int pi=offsets[ai];pi<offsets[ai+1];++pi){const int si=segment_indices[pi];const int sb=si*11;
+   if(segments[sb+8]<ray_min_x-1.0e-5f||segments[sb+7]>ray_max_x+1.0e-5f||segments[sb+10]<ray_min_y-1.0e-5f||segments[sb+9]>ray_max_y+1.0e-5f)continue;
+   const float x1=segments[sb],y1=segments[sb+1],sdx=segments[sb+2],sdy=segments[sb+3];
+   const float den=dx*sdy-dy*sdx;if(fabs(den)<1.0e-7f)continue;
+   const float t=((x1-ax)*sdy-(y1-ay)*sdx)/den;
+   const float u=((x1-ax)*dy-(y1-ay)*dx)/den;
+   if(t>=0.0f&&t<=1.0f&&u>=0.0f&&u<=1.0f){const float zhit=az+z_delta*t;
+    if(zhit>=segments[sb+4]&&zhit<=segments[sb+5])wall_loss+=segments[sb+6];}}
+  float rssi=base_dbm-path_loss_factor*log10(d3)-wall_loss;
+  if(rssi<disconnected)rssi=disconnected;
+  out[ob]=rssi;out[ob+1]=d3;out[ob+2]=wall_loss;out[ob+3]=1.0f;
  }
 }
 """
@@ -1047,6 +1171,7 @@ class OpenCLRFAccelerator:
         self._colour_kernel = cl.Kernel(self.program, "colourise")
         self._direct_path_kernel = cl.Kernel(self.program, "direct_rssi_paths")
         self._direct_reduce_kernel = cl.Kernel(self.program, "reduce_rssi_paths")
+        self._inspect_direct_kernel = cl.Kernel(self.program, "inspect_direct_paths")
         platform = getattr(self.device, "platform", None)
         self.info = OpenCLDeviceInfo(
             platform=str(getattr(platform, "name", "OpenCL") or "OpenCL").strip(),
@@ -1146,6 +1271,17 @@ class OpenCLRFAccelerator:
         rows, cols = len(ys32), len(xs32)
         total = rows * cols
         valid = np.ones((rows, cols), dtype=np.uint8) if valid_mask is None else np.ascontiguousarray(valid_mask, dtype=np.uint8)
+        terrain_enabled = (
+            receiver_z_grid is not None
+            and terrain_elevation_grid is not None
+            and float(ground_loss_db) > 0.0
+        )
+        if terrain_enabled:
+            receiver_z = np.ascontiguousarray(receiver_z_grid, dtype=np.float32).reshape(rows, cols)
+            terrain_z = np.ascontiguousarray(terrain_elevation_grid, dtype=np.float32).reshape(rows, cols)
+        else:
+            receiver_z = np.zeros((1,), dtype=np.float32)
+            terrain_z = np.zeros((1,), dtype=np.float32)
         rssi = np.empty(total, dtype=np.float32)
         counts = np.empty(total, dtype=np.int16)
         mf = cl.mem_flags
@@ -1180,6 +1316,8 @@ class OpenCLRFAccelerator:
             sb = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=prepared_segments.ravel())
             sib = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=segment_indices)
             ob = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=offsets)
+            rzb = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=receiver_z.ravel())
+            tzb = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=terrain_z.ravel())
             rb = cl.Buffer(self.context, mf.WRITE_ONLY, rssi.nbytes)
             cb = cl.Buffer(self.context, mf.WRITE_ONLY, counts.nbytes)
             pathb = cl.Buffer(self.context, mf.READ_WRITE, chunk_points * ap_count * np.dtype(np.float32).itemsize)
@@ -1190,7 +1328,9 @@ class OpenCLRFAccelerator:
                 work = min(chunk_points, total - start_gid)
                 path_items = work * ap_count
                 self._direct_path_kernel.set_args(
-                    xb, yb, vb, ab, sb, sib, ob, np.int32(ap_count), np.float32(disconnected),
+                    xb, yb, vb, ab, sb, sib, ob, rzb, tzb,
+                    np.int32(1 if terrain_enabled else 0), np.float32(ground_loss_db),
+                    np.float32(terrain_clearance_m), np.int32(ap_count), np.float32(disconnected),
                     np.int32(start_gid), np.int32(work), pathb, np.int32(cols), np.int32(rows),
                 )
                 global_size, local_size = self._launch_shape(path_items)
@@ -1211,6 +1351,30 @@ class OpenCLRFAccelerator:
             cl.enqueue_copy(self.queue, rssi, rb)
             cl.enqueue_copy(self.queue, counts, cb).wait()
         return rssi.reshape((rows, cols)), counts.reshape((rows, cols))
+
+    def inspect_direct_paths(self, receiver_x, receiver_y, ap_data, segments, disconnected, settings=None):
+        compact_aps, prepared_segments, segment_indices, offsets = _prepare_direct_inputs(
+            ap_data, segments, np.float32
+        )
+        ap_count = int(compact_aps.shape[0])
+        if ap_count <= 0:
+            return np.zeros((0, 4), dtype=np.float32)
+        output = np.empty((ap_count, 4), dtype=np.float32)
+        mf = cl.mem_flags
+        with self._lock:
+            ab = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=compact_aps.ravel())
+            sb = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=prepared_segments.ravel())
+            sib = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=segment_indices)
+            ob = cl.Buffer(self.context, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=offsets)
+            out = cl.Buffer(self.context, mf.WRITE_ONLY, output.nbytes)
+            self._inspect_direct_kernel.set_args(
+                ab, sb, sib, ob, np.int32(ap_count), np.float32(receiver_x), np.float32(receiver_y),
+                np.float32(disconnected), out,
+            )
+            global_size, local_size = self._launch_shape(ap_count)
+            cl.enqueue_nd_range_kernel(self.queue, self._inspect_direct_kernel, global_size, local_size)
+            cl.enqueue_copy(self.queue, output, out).wait()
+        return output
 
 
 
@@ -1391,7 +1555,7 @@ if njit is not None:
             if pc == 0:
                 best = disconnected
             out[gid] = best
-            counts[gid] = pc
+            counts[gid] = pc if combine_mode == 1 else (1 if pc > 0 else 0)
 else:
     _numba_direct_rssi_grid = None
 
@@ -1412,9 +1576,6 @@ def gpu_direct_rssi_grid(xs: np.ndarray, ys: np.ndarray, ap_data: np.ndarray, se
         return None
     def _run_direct(backend):
         if not hasattr(backend, "direct_rssi_grid"):
-            return None
-        terrain_active = receiver_z_grid is not None and terrain_elevation_grid is not None and float(ground_loss_db) > 0.0
-        if terrain_active and getattr(backend, "backend_name", "") != "CUDA":
             return None
         grids = backend.direct_rssi_grid(
             xs, ys, ap_data, segments, valid_mask, disconnected, combine_mode, settings,
@@ -1438,6 +1599,27 @@ def gpu_direct_rssi_grid(xs: np.ndarray, ys: np.ndarray, ap_data: np.ndarray, se
     return rssi, counts, f"{backend_name}: {label}{detail}"
 
 
+def gpu_inspect_direct_paths(receiver_x: float, receiver_y: float, ap_data: np.ndarray, segments: np.ndarray,
+                             disconnected: float, settings: Any) -> Optional[Tuple[np.ndarray, str]]:
+    if not _enabled(settings):
+        return None
+    ap_array = np.asarray(ap_data)
+    if ap_array.size == 0:
+        return None
+
+    def _run_inspection(backend):
+        if not hasattr(backend, "inspect_direct_paths"):
+            return None
+        rows = backend.inspect_direct_paths(receiver_x, receiver_y, ap_data, segments, disconnected, settings)
+        return rows, backend.info.label, backend.backend_name
+
+    result = _execute_gpu(settings, "direct RSSI path inspection", _run_inspection)
+    if result is None:
+        return None
+    rows, label, backend_name = result
+    return np.asarray(rows, dtype=np.float32).reshape(-1, 4), f"{backend_name}: {label}"
+
+
 def numba_direct_rssi_grid(xs: np.ndarray, ys: np.ndarray, ap_data: np.ndarray, segments: np.ndarray,
                            valid_mask: Optional[np.ndarray], disconnected: float, combine_mode: int,
                            settings: Any = None) -> Optional[Tuple[np.ndarray, np.ndarray]]:
@@ -1452,9 +1634,23 @@ def numba_direct_rssi_grid(xs: np.ndarray, ys: np.ndarray, ap_data: np.ndarray, 
     counts = np.zeros(total, dtype=np.int16)
     cancel_event = getattr(settings, "_cancel_event", None) if settings is not None else None
     # A single call is fastest when cancellation is not being monitored. When
-    # it is, use large compiled chunks so Cancel is checked without reverting
-    # to Python per-point work.
-    chunk_points = total if cancel_event is None else max(65_536, int(_setting(settings, "numba_chunk_points", 262_144) or 262_144))
+    # it is, use bounded compiled chunks so Cancel is observed quickly even on
+    # dense IFCs with many AP/segment checks.  There is no safe way to kill a
+    # running Numba CPU kernel from the UI thread, so cooperative chunk sizing is
+    # the cancellation mechanism.
+    if cancel_event is None:
+        chunk_points = total
+    else:
+        configured_chunk = max(4_096, int(_setting(settings, "numba_chunk_points", 65_536) or 65_536))
+        ap_count = max(1, int(compact.shape[0]))
+        packed_segment_count = int(offsets[-1]) if len(offsets) else 0
+        average_segments = (packed_segment_count / ap_count) if ap_count else 0.0
+        max_ops_between_cancel = max(250_000, int(_setting(
+            settings, "numba_cancel_check_work_items", 2_000_000
+        ) or 2_000_000))
+        work_complexity = max(1.0, ap_count * max(1.0, average_segments))
+        max_points_by_work = max(512, int(max_ops_between_cancel / work_complexity))
+        chunk_points = max(512, min(total, configured_chunk, max_points_by_work))
     for start_gid in range(0, total, chunk_points):
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("RSSI calculation cancelled")
@@ -1509,8 +1705,22 @@ def _cuda_index(preference: str) -> int:
     return 0
 
 
-def _backend_key(settings: Any) -> Tuple[str, bool, bool]:
-    return (_preference(settings), bool(_setting(settings, "opencl_allow_cpu_device", False)), _force(settings))
+def _strict_device_preference(settings: Any) -> bool:
+    """Return True only when the caller explicitly wants no backend fallback.
+
+    The default is deliberately False: if a saved CUDA preference is no longer
+    usable, the simulator should still try an OpenCL GPU before dropping to CPU.
+    """
+    return bool(_setting(settings, "gpu_strict_device_preference", False))
+
+
+def _backend_key(settings: Any) -> Tuple[str, bool, bool, bool]:
+    return (
+        _preference(settings),
+        bool(_setting(settings, "opencl_allow_cpu_device", False)),
+        _force(settings),
+        _strict_device_preference(settings),
+    )
 
 
 def _cuda_requested(preference: str) -> bool:
@@ -1521,6 +1731,10 @@ def _opencl_requested(preference: str) -> bool:
     return preference == "auto" or preference == "opencl" or preference.startswith("opencl:") or not _cuda_requested(preference)
 
 
+def _has_opencl_gpu() -> bool:
+    return any("GPU" in record.device_type for record in _opencl_device_records(False))
+
+
 def get_existing_opencl_backend(settings: Any):
     if not _enabled(settings):
         return None
@@ -1529,11 +1743,18 @@ def get_existing_opencl_backend(settings: Any):
 
 
 def get_opencl_backend(settings: Any):
-    """Return CUDA first, then OpenCL GPU; CPU is used only if no GPU exists."""
+    """Return CUDA first, then OpenCL GPU; CPU is used only if no GPU exists.
+
+    A stale saved CUDA preference should not strand the calculation on CPU.
+    Unless gpu_strict_device_preference is explicitly enabled, CUDA failure is
+    followed by an OpenCL GPU probe.  OpenCL CPU devices remain excluded unless
+    opencl_allow_cpu_device is set and no real GPU backend is available.
+    """
     if not _enabled(settings):
         return None
     preference = _preference(settings)
     allow_cpu = bool(_setting(settings, "opencl_allow_cpu_device", False))
+    strict_preference = _strict_device_preference(settings)
     key = _backend_key(settings)
     with _BACKEND_LOCK:
         if key in _BACKENDS:
@@ -1548,15 +1769,25 @@ def get_opencl_backend(settings: Any):
                 return backend
             except Exception as exc:
                 errors.append(f"CUDA: {type(exc).__name__}: {exc}")
-                if preference.startswith("cuda") or preference == "cuda":
+                if strict_preference and (preference.startswith("cuda") or preference == "cuda"):
                     _FAILURES[key] = "; ".join(errors)
                     return None
-        if _opencl_requested(preference):
+        # Try an OpenCL GPU whenever OpenCL is requested, or when CUDA was the
+        # requested/preferred backend but was unavailable.  Passing 'auto' for a
+        # CUDA fallback avoids treating a stale cuda:0 token as a non-match.
+        attempt_opencl = _opencl_requested(preference) or (not strict_preference and _cuda_requested(preference))
+        if attempt_opencl:
+            opencl_preference = preference if _opencl_requested(preference) else "auto"
             try:
-                backend = OpenCLRFAccelerator(preference, allow_cpu)
+                backend = OpenCLRFAccelerator(opencl_preference, allow_cpu)
                 # Never select an OpenCL CPU while any GPU device exists.
-                if backend.info.device_type == "OpenCL CPU" and (len(_cuda_device_records()) or any("GPU" in d.device_type for d in _opencl_device_records(False))):
-                    raise RuntimeError("GPU exists; OpenCL CPU fallback refused")
+                if backend.info.device_type == "OpenCL CPU" and (len(_cuda_device_records()) or _has_opencl_gpu()):
+                    if strict_preference:
+                        raise RuntimeError("GPU exists; OpenCL CPU fallback refused")
+                    errors.append("OpenCL CPU preference ignored because a GPU exists")
+                    backend = OpenCLRFAccelerator("auto", False)
+                    if backend.info.device_type == "OpenCL CPU":
+                        raise RuntimeError("GPU exists; OpenCL CPU fallback refused")
                 _BACKENDS[key] = backend
                 return backend
             except Exception as exc:

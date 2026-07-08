@@ -69,6 +69,7 @@ from rf_gpu import (
     discover_opencl_devices,
     gpu_colourise,
     gpu_influence_mask,
+    gpu_inspect_direct_paths,
     gpu_resample_regular_grid,
     gpu_strongest_indices,
     gpu_direct_rssi_grid,
@@ -181,6 +182,182 @@ try:
 except Exception as exc:  # pragma: no cover
     raise SystemExit("Install shapely: pip install shapely") from exc
 
+
+
+
+VEGETATION_RF_KEYWORDS = (
+    "vegetation", "tree", "trees", "canopy", "foliage", "leaf", "leaves",
+    "hedge", "hedgerow", "shrub", "shrubs", "bush", "bushes", "plant",
+    "plants", "planting", "landscape", "landscaping", "green wall",
+    "living wall", "greenery", "woodland", "forest", "orchard", "grass",
+    "lawn", "soft landscape", "soft-landscape", "planter", "climber", "ivy",
+)
+
+
+def _contains_vegetation_keyword(*values: object) -> bool:
+    text = " ".join(str(value or "") for value in values).casefold().replace("_", " ").replace("-", " ")
+    return any(keyword in text for keyword in VEGETATION_RF_KEYWORDS)
+
+
+# ITU-R P.833-10 vegetation modelling support.  Table 1 gives the mixed
+# coniferous/deciduous woodland short-path specific attenuation rate, gamma,
+# and the maximum additional attenuation, Am, for representative VHF/UHF/L-band
+# measurements.  The simulator interpolates these values in log-frequency and
+# extrapolates gently above 2.117 GHz for Wi-Fi planning bands.  Exact links use
+# the actual path length through the vegetation footprint rather than applying
+# a fixed one-off wall loss.
+ITU_P833_WOODLAND_GAMMA_DB_PER_M: Tuple[Tuple[float, float], ...] = (
+    (105.9, 0.04),
+    (466.475, 0.12),
+    (949.0, 0.17),
+    (1852.2, 0.30),
+    (2117.5, 0.34),
+)
+ITU_P833_WOODLAND_MAX_ATTENUATION_DB: Tuple[Tuple[float, float], ...] = (
+    (105.9, 9.4),
+    (466.475, 18.0),
+    (949.0, 26.5),
+    (1852.2, 29.0),
+    (2117.5, 34.1),
+)
+
+
+def _log_interpolate_table(frequency_mhz: float, table: Sequence[Tuple[float, float]]) -> float:
+    f = max(1e-9, float(frequency_mhz))
+    points = sorted((max(1e-9, float(freq)), max(1e-12, float(value))) for freq, value in table)
+    if not points:
+        return 0.0
+    if len(points) == 1:
+        return points[0][1]
+    if f <= points[0][0]:
+        lo, hi = points[0], points[1]
+    elif f >= points[-1][0]:
+        lo, hi = points[-2], points[-1]
+    else:
+        lo, hi = points[0], points[-1]
+        for left, right in zip(points, points[1:]):
+            if left[0] <= f <= right[0]:
+                lo, hi = left, right
+                break
+    log_f0 = math.log(lo[0]); log_f1 = math.log(hi[0])
+    if abs(log_f1 - log_f0) < 1e-12:
+        return hi[1]
+    t = (math.log(f) - log_f0) / (log_f1 - log_f0)
+    return math.exp(math.log(lo[1]) + (math.log(hi[1]) - math.log(lo[1])) * t)
+
+
+def _itu_p833_specific_vegetation_attenuation_db_per_m(frequency_mhz: float) -> float:
+    f = max(1.0, float(frequency_mhz))
+    gamma = _log_interpolate_table(f, ITU_P833_WOODLAND_GAMMA_DB_PER_M)
+    # Above the tabulated 2.117 GHz point, keep increasing the short-path
+    # attenuation toward Wi-Fi/6 GHz without making the model unrealistically
+    # severe for single trees.  ITU-R P.833 Figure 2 is a typical curve rather
+    # than a deterministic material constant, so this extrapolation is bounded.
+    if f > ITU_P833_WOODLAND_GAMMA_DB_PER_M[-1][0]:
+        gamma = ITU_P833_WOODLAND_GAMMA_DB_PER_M[-1][1] * (f / ITU_P833_WOODLAND_GAMMA_DB_PER_M[-1][0]) ** 0.45
+    return max(0.0, min(3.0, float(gamma)))
+
+
+def _itu_p833_max_vegetation_attenuation_db(frequency_mhz: float) -> float:
+    f = max(1.0, float(frequency_mhz))
+    am = _log_interpolate_table(f, ITU_P833_WOODLAND_MAX_ATTENUATION_DB)
+    if f > ITU_P833_WOODLAND_MAX_ATTENUATION_DB[-1][0]:
+        am = ITU_P833_WOODLAND_MAX_ATTENUATION_DB[-1][1] * (f / ITU_P833_WOODLAND_MAX_ATTENUATION_DB[-1][0]) ** 0.42
+    return max(0.0, min(90.0, float(am)))
+
+
+def _vegetation_density_parameters(text: object) -> Tuple[float, float, float]:
+    """Return (gamma_scale, maximum_loss_scale, nominal_depth_m)."""
+    lowered = str(text or "").casefold().replace("_", " ").replace("-", " ")
+    if any(key in lowered for key in ("woodland", "forest", "dense tree", "dense canopy", "tree group", "copse", "orchard")):
+        return 1.00, 1.00, 20.0
+    if any(key in lowered for key in ("tree", "canopy", "foliage", "leaf", "leaves")):
+        return 0.90, 0.70, 7.0
+    if any(key in lowered for key in ("hedge", "hedgerow", "shrub", "bush")):
+        return 0.65, 0.45, 3.0
+    if any(key in lowered for key in ("green wall", "living wall", "ivy", "climber", "planter", "planting")):
+        return 0.45, 0.30, 1.5
+    if any(key in lowered for key in ("grass", "lawn")):
+        return 0.12, 0.10, 0.3
+    return 0.70, 0.50, 4.0
+
+
+def _itu_p833_leaf_factor(leaf_state: object) -> float:
+    state = str(leaf_state or "in_leaf").strip().casefold().replace("-", "_").replace(" ", "_")
+    if state in {"leafless", "winter", "no_leaf", "poor_vegetation"}:
+        # P.833 notes that around 1 GHz trees in leaf are about 20% higher
+        # attenuation per metre than leafless trees.  Use this as a practical
+        # scale where a seasonal setting is supplied.
+        return 1.0 / 1.2
+    if state in {"mixed", "partial", "part_leaf"}:
+        return 0.92
+    return 1.0
+
+
+def _itu_p833_vegetation_loss_db(
+    frequency_mhz: float,
+    depth_m: float,
+    vegetation_text: object = "vegetation",
+    leaf_state: object = "in_leaf",
+    wind_speed_m_s: float = 0.0,
+    include_wind_margin: bool = False,
+) -> float:
+    """Return vegetation excess attenuation using an ITU-R P.833 style model.
+
+    For the simulator's floor-plan geometry, ``depth_m`` is the link distance
+    inside the canopy/hedge/woodland footprint.  The calculation uses the
+    P.833 woodland saturation form A = Am * (1 - exp(-d * gamma / Am)).  For
+    a single tree/hedge this has the same small-depth behaviour as the P.833
+    single-obstruction approximation A = d * gamma while preventing unbounded
+    loss when a lower-loss diffracted/scattered route around the vegetation is
+    likely.
+    """
+    d = max(0.0, float(depth_m))
+    if d <= 1e-9:
+        return 0.0
+    gamma_scale, am_scale, _ = _vegetation_density_parameters(vegetation_text)
+    gamma = _itu_p833_specific_vegetation_attenuation_db_per_m(frequency_mhz) * gamma_scale * _itu_p833_leaf_factor(leaf_state)
+    am = max(0.25, _itu_p833_max_vegetation_attenuation_db(frequency_mhz) * am_scale)
+    if gamma <= 0.0:
+        return 0.0
+    loss = am * (1.0 - math.exp(-(d * gamma) / am))
+    if include_wind_margin:
+        # P.833 models dynamic foliage fading standard deviation using sigma = v/4 dB.
+        # Treat it as an optional margin; do not add it to deterministic mean loss
+        # unless explicitly configured.
+        loss += max(0.0, float(wind_speed_m_s)) / 4.0
+    return max(0.0, float(loss))
+
+
+def _vegetation_nominal_depth_m(text: object, footprint=None) -> float:
+    _, _, default_depth = _vegetation_density_parameters(text)
+    try:
+        if footprint is not None and not getattr(footprint, "is_empty", True):
+            minx, miny, maxx, maxy = [float(v) for v in footprint.bounds]
+            width = max(0.0, maxx - minx); height = max(0.0, maxy - miny)
+            if width > 0.0 and height > 0.0:
+                lowered = str(text or "").casefold().replace("_", " ").replace("-", " ")
+                if any(key in lowered for key in ("hedge", "green wall", "living wall", "ivy", "climber")):
+                    return max(0.1, min(20.0, min(width, height)))
+                if any(key in lowered for key in ("woodland", "forest", "dense", "tree group", "copse")):
+                    return max(0.5, min(120.0, 2.0 * math.sqrt(max(0.0, float(footprint.area)) / math.pi)))
+                return max(0.2, min(30.0, 2.0 * math.sqrt(max(0.0, float(footprint.area)) / math.pi)))
+    except Exception:
+        pass
+    return default_depth
+
+
+def _vegetation_attenuation_profile_for_text(text: object) -> Dict[float, float]:
+    """Return nominal P.833-derived loss defaults for display/edit presets."""
+    lowered = str(text or "vegetation").casefold().replace("_", " ").replace("-", " ")
+    depth = _vegetation_nominal_depth_m(lowered)
+    return {
+        433.0: round(_itu_p833_vegetation_loss_db(433.0, depth, lowered), 2),
+        868.0: round(_itu_p833_vegetation_loss_db(868.0, depth, lowered), 2),
+        2400.0: round(_itu_p833_vegetation_loss_db(2400.0, depth, lowered), 2),
+        5000.0: round(_itu_p833_vegetation_loss_db(5000.0, depth, lowered), 2),
+        6000.0: round(_itu_p833_vegetation_loss_db(6000.0, depth, lowered), 2),
+    }
 
 # ----------------------------- Reusable RF process pool -----------------------------
 
@@ -492,7 +669,7 @@ class APRadio:
     tx_power_dbm: float = 20.0
     antenna_pattern: str = "Omni ceiling AP"
     enabled: bool = True
-    cutoff_radius_m: float = 0.0  # Retained for legacy plans/UI; simulation no longer hard-clips by radius.
+    cutoff_radius_m: float = 0.0  # Optional per-radio planning cut-off; 0 uses the frequency/default setting.
     antenna_gain_dbi: float = 0.0  # Additional configured gain beyond the selected pattern data.
     channel: str = ""
     channel_width_mhz: float = 20.0
@@ -750,6 +927,7 @@ class IFCElement2D:
     attenuation_by_band_db: Dict[float, float] = field(default_factory=dict)
     rf_type_override: str = ""
     rf_customised: bool = False
+    is_user_created: bool = False
 
     @property
     def is_rf_opening(self) -> bool:
@@ -884,9 +1062,10 @@ class HeatmapSettings:
     ap_cutoff_radius_by_frequency_m: Dict[float, float] = field(default_factory=lambda: {
         433.0: 0.0,
         868.0: 0.0,
-        2400.0: 0.0,
-        5000.0: 0.0,
-        6000.0: 0.0,
+        2400.0: 100.0,
+        3500.0: 120.0,
+        5000.0: 65.0,
+        6000.0: 50.0,
     })
     show_ap_cutoff_zones: bool = True
     ap_cutoff_zone_line_width: float = 0.12
@@ -965,6 +1144,14 @@ class HeatmapSettings:
         "plywood": {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0},
         "metal": {433.0: 12.0, 868.0: 16.0, 2400.0: 20.0, 5000.0: 28.0, 6000.0: 35.0},
         "steel": {433.0: 12.0, 868.0: 16.0, 2400.0: 20.0, 5000.0: 28.0, 6000.0: 35.0},
+        "vegetation": _vegetation_attenuation_profile_for_text("vegetation"),
+        "tree": _vegetation_attenuation_profile_for_text("tree"),
+        "tree canopy": _vegetation_attenuation_profile_for_text("tree canopy"),
+        "dense tree canopy": _vegetation_attenuation_profile_for_text("dense tree canopy"),
+        "hedge": _vegetation_attenuation_profile_for_text("hedge"),
+        "shrub": _vegetation_attenuation_profile_for_text("shrub"),
+        "green wall": _vegetation_attenuation_profile_for_text("green wall"),
+        "woodland": _vegetation_attenuation_profile_for_text("woodland"),
         "furniture": {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0},
         "equipment": {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0},
         "distribution": {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0},
@@ -982,6 +1169,20 @@ class HeatmapSettings:
     auto_planner_settings: Dict[str, object] = field(default_factory=lambda: AutoPlannerSettings().to_dict())
     user_wall_default_type: str = "partition"
     user_wall_default_thickness_m: float = 0.15
+    # Manual vegetation/tree RF objects are stored as user-created IFCElement2D
+    # barriers. The radius is captured from two clicks; height supplies a
+    # practical default vertical canopy/foliage extent for 3D path checks.
+    user_vegetation_default_type: str = "tree canopy"
+    user_vegetation_default_height_m: float = 6.0
+    # Vegetation follows ITU-R P.833-style path-depth modelling by default:
+    # loss is based on the distance that the RF ray travels inside the
+    # canopy/hedge/woodland footprint, with a saturating maximum additional
+    # attenuation.  The optional wind margin uses the P.833 foliage dynamics
+    # sigma = wind_speed/4 dB relationship.
+    enable_itu_p833_vegetation_model: bool = True
+    itu_p833_vegetation_leaf_state: str = "in_leaf"
+    itu_p833_include_wind_fade_margin: bool = False
+    itu_p833_vegetation_wind_speed_m_s: float = 0.0
     # Text uses model-scaled scene units so it zooms naturally with the IFC view.
     # The numeric font sizes below are small logical sizes which are multiplied
     # by text_model_scale before drawing. Increase text_model_scale if labels
@@ -1049,6 +1250,8 @@ class HeatmapSettings:
     # are offloaded. Force mode ignores the workload threshold.
     enable_opencl_gpu: bool = True
     force_gpu_when_available: bool = True
+    gpu_primary_rssi_simulation: bool = True
+    enable_approximate_direct_rssi_acceleration: bool = True
     opencl_device_preference: str = "auto"
     opencl_allow_cpu_device: bool = False
     opencl_min_work_items: int = 100000
@@ -1060,7 +1263,11 @@ class HeatmapSettings:
     cuda_queue_depth: int = 4
     cuda_max_barrier_checks_per_launch: int = 1000000000
     cuda_blocks_per_sm: int = 32
-    numba_chunk_points: int = 262144
+    numba_chunk_points: int = 65536
+    numba_cancel_check_work_items: int = 2_000_000
+    # False by default: if a saved CUDA preference becomes unusable, try an
+    # OpenCL GPU before falling back to CPU.
+    gpu_strict_device_preference: bool = False
     opencl_accelerate_influence: bool = True
     opencl_accelerate_field_combine: bool = True
     opencl_accelerate_resampling: bool = True
@@ -1121,6 +1328,9 @@ class HeatmapSettings:
         "steel": {"relative_permittivity": 80.0, "conductivity_s_per_m": 1000000.0, "roughness_m": 0.001, "reflection_scale": 1.0},
         "timber": {"relative_permittivity": 2.0, "conductivity_s_per_m": 0.01, "roughness_m": 0.004, "reflection_scale": 0.75},
         "wood": {"relative_permittivity": 2.0, "conductivity_s_per_m": 0.01, "roughness_m": 0.004, "reflection_scale": 0.75},
+        "vegetation": {"relative_permittivity": 15.0, "conductivity_s_per_m": 0.08, "roughness_m": 0.05, "reflection_scale": 0.45},
+        "tree": {"relative_permittivity": 15.0, "conductivity_s_per_m": 0.08, "roughness_m": 0.06, "reflection_scale": 0.45},
+        "hedge": {"relative_permittivity": 12.0, "conductivity_s_per_m": 0.06, "roughness_m": 0.04, "reflection_scale": 0.40},
     })
     # Multi-storey model handling. Normal model elements are drawn only on their
     # assigned/nearest storey. External/envelope walls may be projected through
@@ -1352,6 +1562,12 @@ class HeatmapSettings:
             settings.auto_planner_settings = AutoPlannerSettings.from_dict(raw_planner).to_dict()
         settings.user_wall_default_type = str(data.get("user_wall_default_type", "partition"))
         settings.user_wall_default_thickness_m = max(0.02, float(data.get("user_wall_default_thickness_m", 0.15)))
+        settings.user_vegetation_default_type = str(data.get("user_vegetation_default_type", settings.user_vegetation_default_type))
+        settings.user_vegetation_default_height_m = max(0.1, min(80.0, float(data.get("user_vegetation_default_height_m", settings.user_vegetation_default_height_m))))
+        settings.enable_itu_p833_vegetation_model = bool(data.get("enable_itu_p833_vegetation_model", settings.enable_itu_p833_vegetation_model))
+        settings.itu_p833_vegetation_leaf_state = str(data.get("itu_p833_vegetation_leaf_state", settings.itu_p833_vegetation_leaf_state) or "in_leaf")
+        settings.itu_p833_include_wind_fade_margin = bool(data.get("itu_p833_include_wind_fade_margin", settings.itu_p833_include_wind_fade_margin))
+        settings.itu_p833_vegetation_wind_speed_m_s = max(0.0, min(80.0, float(data.get("itu_p833_vegetation_wind_speed_m_s", settings.itu_p833_vegetation_wind_speed_m_s))))
         # Font sizes are logical values converted to model-scaled scene text.
         # Text follows the view transform, so it enlarges when zooming in.
         settings.contour_label_font_size = int(data.get("contour_label_font_size", 6))
@@ -1412,6 +1628,11 @@ class HeatmapSettings:
         settings.use_shared_memory_rf_results = bool(performance.get("use_shared_memory_results", settings.use_shared_memory_rf_results))
         settings.enable_opencl_gpu = bool(performance.get("enable_opencl_gpu", settings.enable_opencl_gpu))
         settings.force_gpu_when_available = bool(performance.get("force_gpu_when_available", settings.force_gpu_when_available))
+        settings.gpu_primary_rssi_simulation = bool(performance.get("gpu_primary_rssi_simulation", settings.gpu_primary_rssi_simulation))
+        settings.enable_approximate_direct_rssi_acceleration = bool(performance.get(
+            "enable_approximate_direct_rssi_acceleration",
+            performance.get("gpu_direct_rssi_simulation", settings.enable_approximate_direct_rssi_acceleration),
+        ))
         settings.opencl_device_preference = str(performance.get("opencl_device_preference", settings.opencl_device_preference) or "auto")
         settings.opencl_allow_cpu_device = bool(performance.get("opencl_allow_cpu_device", settings.opencl_allow_cpu_device))
         settings.opencl_min_work_items = max(1, int(performance.get("opencl_min_work_items", settings.opencl_min_work_items)))
@@ -1421,7 +1642,9 @@ class HeatmapSettings:
         settings.cuda_queue_depth = max(1, min(8, int(performance.get("cuda_queue_depth", settings.cuda_queue_depth))))
         settings.cuda_max_barrier_checks_per_launch = max(10000000, int(performance.get("cuda_max_barrier_checks_per_launch", settings.cuda_max_barrier_checks_per_launch)))
         settings.cuda_blocks_per_sm = max(4, min(64, int(performance.get("cuda_blocks_per_sm", settings.cuda_blocks_per_sm))))
-        settings.numba_chunk_points = max(65536, int(performance.get("numba_chunk_points", settings.numba_chunk_points)))
+        settings.numba_chunk_points = max(4096, int(performance.get("numba_chunk_points", settings.numba_chunk_points)))
+        settings.numba_cancel_check_work_items = max(250000, int(performance.get("numba_cancel_check_work_items", settings.numba_cancel_check_work_items)))
+        settings.gpu_strict_device_preference = bool(performance.get("gpu_strict_device_preference", settings.gpu_strict_device_preference))
         settings.opencl_accelerate_influence = bool(performance.get("opencl_accelerate_influence", settings.opencl_accelerate_influence))
         settings.opencl_accelerate_field_combine = bool(performance.get("opencl_accelerate_field_combine", settings.opencl_accelerate_field_combine))
         settings.opencl_accelerate_resampling = bool(performance.get("opencl_accelerate_resampling", settings.opencl_accelerate_resampling))
@@ -1566,6 +1789,8 @@ class HeatmapSettings:
             "use_shared_memory_results": bool(self.use_shared_memory_rf_results),
             "enable_opencl_gpu": bool(self.enable_opencl_gpu),
             "force_gpu_when_available": bool(self.force_gpu_when_available),
+            "gpu_primary_rssi_simulation": bool(self.gpu_primary_rssi_simulation),
+            "enable_approximate_direct_rssi_acceleration": bool(self.enable_approximate_direct_rssi_acceleration),
             "opencl_device_preference": str(self.opencl_device_preference),
             "opencl_allow_cpu_device": bool(self.opencl_allow_cpu_device),
             "opencl_min_work_items": int(self.opencl_min_work_items),
@@ -1576,6 +1801,8 @@ class HeatmapSettings:
             "cuda_max_barrier_checks_per_launch": int(self.cuda_max_barrier_checks_per_launch),
             "cuda_blocks_per_sm": int(self.cuda_blocks_per_sm),
             "numba_chunk_points": int(self.numba_chunk_points),
+            "numba_cancel_check_work_items": int(self.numba_cancel_check_work_items),
+            "gpu_strict_device_preference": bool(self.gpu_strict_device_preference),
             "opencl_accelerate_influence": bool(self.opencl_accelerate_influence),
             "opencl_accelerate_field_combine": bool(self.opencl_accelerate_field_combine),
             "opencl_accelerate_resampling": bool(self.opencl_accelerate_resampling),
@@ -1612,6 +1839,10 @@ class HeatmapSettings:
             "calculate_delay_spread": bool(self.calculate_delay_spread),
             "combined_ap_mode": str(self.combined_ap_mode),
             "propagation_distance_model": str(self.propagation_distance_model),
+            "enable_itu_p833_vegetation_model": bool(self.enable_itu_p833_vegetation_model),
+            "itu_p833_vegetation_leaf_state": str(self.itu_p833_vegetation_leaf_state),
+            "itu_p833_include_wind_fade_margin": bool(self.itu_p833_include_wind_fade_margin),
+            "itu_p833_vegetation_wind_speed_m_s": float(self.itu_p833_vegetation_wind_speed_m_s),
             "enable_synthetic_floor_entities": bool(self.enable_synthetic_floor_entities),
             "synthetic_floor_entity_thickness_m": float(self.synthetic_floor_entity_thickness_m),
             "reflection_material_properties": {
@@ -1657,6 +1888,11 @@ class HeatmapSettings:
         self.use_shared_memory_rf_results = bool(data.get("use_shared_memory_results", self.use_shared_memory_rf_results))
         self.enable_opencl_gpu = bool(data.get("enable_opencl_gpu", self.enable_opencl_gpu))
         self.force_gpu_when_available = bool(data.get("force_gpu_when_available", self.force_gpu_when_available))
+        self.gpu_primary_rssi_simulation = bool(data.get("gpu_primary_rssi_simulation", self.gpu_primary_rssi_simulation))
+        self.enable_approximate_direct_rssi_acceleration = bool(data.get(
+            "enable_approximate_direct_rssi_acceleration",
+            data.get("gpu_direct_rssi_simulation", self.enable_approximate_direct_rssi_acceleration),
+        ))
         self.opencl_device_preference = str(data.get("opencl_device_preference", self.opencl_device_preference) or "auto")
         self.opencl_allow_cpu_device = bool(data.get("opencl_allow_cpu_device", self.opencl_allow_cpu_device))
         self.opencl_min_work_items = max(1, int(data.get("opencl_min_work_items", self.opencl_min_work_items)))
@@ -1666,7 +1902,9 @@ class HeatmapSettings:
         self.cuda_queue_depth = max(1, min(8, int(data.get("cuda_queue_depth", self.cuda_queue_depth))))
         self.cuda_max_barrier_checks_per_launch = max(10000000, int(data.get("cuda_max_barrier_checks_per_launch", self.cuda_max_barrier_checks_per_launch)))
         self.cuda_blocks_per_sm = max(4, min(64, int(data.get("cuda_blocks_per_sm", self.cuda_blocks_per_sm))))
-        self.numba_chunk_points = max(65536, int(data.get("numba_chunk_points", self.numba_chunk_points)))
+        self.numba_chunk_points = max(4096, int(data.get("numba_chunk_points", self.numba_chunk_points)))
+        self.numba_cancel_check_work_items = max(250000, int(data.get("numba_cancel_check_work_items", self.numba_cancel_check_work_items)))
+        self.gpu_strict_device_preference = bool(data.get("gpu_strict_device_preference", self.gpu_strict_device_preference))
         self.opencl_accelerate_influence = bool(data.get("opencl_accelerate_influence", self.opencl_accelerate_influence))
         self.opencl_accelerate_field_combine = bool(data.get("opencl_accelerate_field_combine", self.opencl_accelerate_field_combine))
         self.opencl_accelerate_resampling = bool(data.get("opencl_accelerate_resampling", self.opencl_accelerate_resampling))
@@ -1712,6 +1950,22 @@ class HeatmapSettings:
             if distance_model in {"itu_r_p525_free_space", "p525", "p_525", "free_space", "fspl"}
             else "itu_r_p525_log_distance"
         )
+        self.enable_itu_p833_vegetation_model = bool(data.get(
+            "enable_itu_p833_vegetation_model",
+            self.enable_itu_p833_vegetation_model,
+        ))
+        self.itu_p833_vegetation_leaf_state = str(data.get(
+            "itu_p833_vegetation_leaf_state",
+            self.itu_p833_vegetation_leaf_state,
+        ) or "in_leaf")
+        self.itu_p833_include_wind_fade_margin = bool(data.get(
+            "itu_p833_include_wind_fade_margin",
+            self.itu_p833_include_wind_fade_margin,
+        ))
+        self.itu_p833_vegetation_wind_speed_m_s = max(0.0, min(80.0, float(data.get(
+            "itu_p833_vegetation_wind_speed_m_s",
+            self.itu_p833_vegetation_wind_speed_m_s,
+        ))))
         self.enable_synthetic_floor_entities = bool(data.get(
             "enable_synthetic_floor_entities",
             data.get("synthetic_floor_entities_enabled", self.enable_synthetic_floor_entities),
@@ -2296,6 +2550,29 @@ class IFCModelLoader:
     @staticmethod
     def _rf_category_for_element(element) -> str:
         """Return a stable RF category for any imported IfcElement."""
+        text_parts = [
+            str(getattr(element, "Name", "") or ""),
+            str(getattr(element, "ObjectType", "") or ""),
+            str(getattr(element, "PredefinedType", "") or ""),
+            str(getattr(element, "Tag", "") or ""),
+        ]
+        try:
+            for rel in getattr(element, "IsTypedBy", []) or []:
+                typed = getattr(rel, "RelatingType", None)
+                if typed is not None:
+                    text_parts.extend([
+                        str(getattr(typed, "Name", "") or ""),
+                        str(getattr(typed, "ElementType", "") or ""),
+                        str(getattr(typed, "PredefinedType", "") or ""),
+                    ])
+        except Exception:
+            pass
+        try:
+            text_parts.append(str(element.is_a() or ""))
+        except Exception:
+            pass
+        if _contains_vegetation_keyword(*text_parts):
+            return "vegetation"
         checks = (
             ("IfcDoor", "door"), ("IfcWindow", "window"), ("IfcSlab", "slab"),
             ("IfcRoof", "roof"), ("IfcColumn", "column"), ("IfcBeam", "beam"),
@@ -2322,6 +2599,8 @@ class IFCModelLoader:
     def _default_ifc_element_attenuation_profile(category: str, material: str, type_name: str, ifc_class: str = "") -> Dict[float, float]:
         """Conservative defaults for non-wall IFC element categories."""
         text = f"{category} {material} {type_name} {ifc_class}".lower()
+        if category == "vegetation" or _contains_vegetation_keyword(text):
+            return _vegetation_attenuation_profile_for_text(text)
         if category in {"distribution", "equipment", "furniture", "proxy", "transport", "assembly", "other"}:
             return {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0}
         if "metal" in text or "steel" in text:
@@ -2672,22 +2951,50 @@ class RFEngine:
     def cutoff_radius_m_for_radio(radio: APRadio, settings: Optional[HeatmapSettings] = None) -> float:
         """Return the effective planning cut-off radius for one AP radio.
 
-        Hard RF cut-off radii are disabled for simulation. RSSI now decays from
-        the link budget and model attenuation rather than being clamped at an
-        arbitrary AP/frequency radius. Stored radio/profile values are retained
-        only for compatibility with older RF plans and UI tables.
+        A positive per-radio value wins. Otherwise the simulator uses the
+        frequency preset, then the default radius. A zero value means unlimited.
         """
-        return 0.0
+        if settings is not None and not bool(getattr(settings, "enable_ap_cutoff_zones", True)):
+            return 0.0
+        try:
+            radio_radius = max(0.0, float(getattr(radio, "cutoff_radius_m", 0.0) or 0.0))
+        except Exception:
+            radio_radius = 0.0
+        if radio_radius > 0.0:
+            return radio_radius
+        frequency = float(getattr(radio, "frequency_mhz", 0.0) or 0.0)
+        return RFEngine.ap_cutoff_radius_for_frequency(frequency, settings)
 
     @staticmethod
     def ap_cutoff_radius_for_frequency(frequency_mhz: float, settings: Optional[HeatmapSettings] = None) -> float:
         """Return the configured AP cut-off radius for a frequency.
 
-        This compatibility helper is used by the accelerated RSSI builders. It
-        mirrors cutoff_radius_m_for_radio() for radios that do not have an
-        explicit per-radio cut-off value.
+        This helper is used by scalar, planner and accelerated RSSI paths.
+        Values within 1 MHz of a preset are treated as the same band.
         """
-        return 0.0
+        if settings is not None and not bool(getattr(settings, "enable_ap_cutoff_zones", True)):
+            return 0.0
+        frequency = float(frequency_mhz or 0.0)
+        radius_map = getattr(settings, "ap_cutoff_radius_by_frequency_m", {}) if settings is not None else {}
+        if isinstance(radius_map, dict):
+            best_radius = 0.0
+            best_delta = float("inf")
+            for key, value in radius_map.items():
+                try:
+                    candidate_frequency = float(key)
+                    candidate_radius = max(0.0, float(value or 0.0))
+                except Exception:
+                    continue
+                delta = abs(candidate_frequency - frequency)
+                if delta <= 1.0 and delta < best_delta:
+                    best_delta = delta
+                    best_radius = candidate_radius
+            if best_delta < float("inf"):
+                return best_radius
+        try:
+            return max(0.0, float(getattr(settings, "default_ap_cutoff_radius_m", 0.0) if settings is not None else 0.0) or 0.0)
+        except Exception:
+            return 0.0
 
     @staticmethod
     def point_is_inside_radio_cutoff(
@@ -2842,7 +3149,13 @@ class RFEngine:
             if pattern:
                 pattern_gain = pattern.gain_dbi(az_rel, elev_rel)
         wall_loss = sum(wall.attenuation_db_for_frequency(radio.frequency_mhz) for wall in geometry["walls"])
-        element_loss = sum(element.attenuation_db_for_frequency(radio.frequency_mhz) for element in geometry["elements"])
+        element_loss = sum(
+            RFEngine._element_penetration_loss_db(
+                element, geometry["line"], radio.frequency_mhz,
+                float(geometry["ap_z"]), float(geometry["rx_z"]), heatmap_settings,
+            )
+            for element in geometry["elements"]
+        )
         floor_loss = RFEngine.floor_penetration_loss_db(
             receiver_floor, geometry["ap_floor"], floors, radio.frequency_mhz,
             list(geometry["slabs"]), heatmap_settings,
@@ -2915,7 +3228,13 @@ class RFEngine:
             for wall in geometry["walls"]
         ]
         elements = [
-            (element, float(element.attenuation_db_for_frequency(radio.frequency_mhz)))
+            (
+                element,
+                float(RFEngine._element_penetration_loss_db(
+                    element, geometry["line"], radio.frequency_mhz,
+                    float(geometry["ap_z"]), float(geometry["rx_z"]), heatmap_settings,
+                )),
+            )
             for element in geometry["elements"]
         ]
         slabs = list(geometry["slabs"])
@@ -2961,6 +3280,107 @@ class RFEngine:
     @staticmethod
     def _element_identity(element: IFCElement2D) -> str:
         return str(element.guid or f"{element.source_file}:{element.name}:{element.z_min:.3f}:{element.z_max:.3f}")
+
+    @staticmethod
+    def _is_vegetation_element(element: IFCElement2D) -> bool:
+        category = str(getattr(element, "rf_category", "") or "").casefold()
+        if category == "vegetation":
+            return True
+        return _contains_vegetation_keyword(
+            getattr(element, "rf_type_override", ""),
+            getattr(element, "type_name", ""),
+            getattr(element, "material", ""),
+            getattr(element, "name", ""),
+            getattr(element, "ifc_class", ""),
+        )
+
+    @staticmethod
+    def _vegetation_text_for_element(element: IFCElement2D) -> str:
+        return " ".join(
+            str(value or "") for value in (
+                getattr(element, "rf_type_override", ""),
+                getattr(element, "type_name", ""),
+                getattr(element, "material", ""),
+                getattr(element, "name", ""),
+                getattr(element, "ifc_class", ""),
+            )
+        ).strip() or "vegetation"
+
+    @staticmethod
+    def _vegetation_intersection_depth_m(
+        element: IFCElement2D,
+        line: LineString,
+        start_z: Optional[float] = None,
+        end_z: Optional[float] = None,
+    ) -> float:
+        try:
+            if line is None or element.polygon is None or getattr(element.polygon, "is_empty", True):
+                return 0.0
+            if not element.polygon.intersects(line):
+                return 0.0
+            intersected = element.polygon.intersection(line)
+            depth_2d = max(0.0, float(getattr(intersected, "length", 0.0) or 0.0))
+            if depth_2d <= 1e-9:
+                return 0.0
+            line_length = max(1e-9, float(getattr(line, "length", 0.0) or 0.0))
+            if start_z is None or end_z is None:
+                return depth_2d
+            dz = float(end_z) - float(start_z)
+            return depth_2d * math.sqrt(1.0 + (dz / line_length) ** 2)
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _vegetation_loss_db_for_path(
+        element: IFCElement2D,
+        line: LineString,
+        frequency_mhz: float,
+        start_z: Optional[float] = None,
+        end_z: Optional[float] = None,
+        heatmap_settings: Optional[HeatmapSettings] = None,
+    ) -> float:
+        if heatmap_settings is not None and not bool(getattr(heatmap_settings, "enable_itu_p833_vegetation_model", True)):
+            return float(element.attenuation_db_for_frequency(frequency_mhz))
+        depth_m = RFEngine._vegetation_intersection_depth_m(element, line, start_z, end_z)
+        if depth_m <= 1e-9:
+            return 0.0
+        text = RFEngine._vegetation_text_for_element(element)
+        leaf_state = getattr(heatmap_settings, "itu_p833_vegetation_leaf_state", "in_leaf") if heatmap_settings is not None else "in_leaf"
+        include_wind = bool(getattr(heatmap_settings, "itu_p833_include_wind_fade_margin", False)) if heatmap_settings is not None else False
+        wind_speed = float(getattr(heatmap_settings, "itu_p833_vegetation_wind_speed_m_s", 0.0) or 0.0) if heatmap_settings is not None else 0.0
+        return _itu_p833_vegetation_loss_db(
+            float(frequency_mhz), depth_m, text, leaf_state, wind_speed, include_wind
+        )
+
+    @staticmethod
+    def _element_penetration_loss_db(
+        element: IFCElement2D,
+        line: LineString,
+        frequency_mhz: float,
+        start_z: Optional[float] = None,
+        end_z: Optional[float] = None,
+        heatmap_settings: Optional[HeatmapSettings] = None,
+    ) -> float:
+        if RFEngine._is_vegetation_element(element):
+            return RFEngine._vegetation_loss_db_for_path(
+                element, line, frequency_mhz, start_z, end_z, heatmap_settings
+            )
+        return float(element.attenuation_db_for_frequency(frequency_mhz))
+
+    @staticmethod
+    def _element_nominal_penetration_loss_db(
+        element: IFCElement2D,
+        frequency_mhz: float,
+        heatmap_settings: Optional[HeatmapSettings] = None,
+    ) -> float:
+        if RFEngine._is_vegetation_element(element) and (heatmap_settings is None or bool(getattr(heatmap_settings, "enable_itu_p833_vegetation_model", True))):
+            text = RFEngine._vegetation_text_for_element(element)
+            depth_m = _vegetation_nominal_depth_m(text, getattr(element, "polygon", None))
+            leaf_state = getattr(heatmap_settings, "itu_p833_vegetation_leaf_state", "in_leaf") if heatmap_settings is not None else "in_leaf"
+            include_wind = bool(getattr(heatmap_settings, "itu_p833_include_wind_fade_margin", False)) if heatmap_settings is not None else False
+            wind_speed = float(getattr(heatmap_settings, "itu_p833_vegetation_wind_speed_m_s", 0.0) or 0.0) if heatmap_settings is not None else 0.0
+            return _itu_p833_vegetation_loss_db(float(frequency_mhz), depth_m, text, leaf_state, wind_speed, include_wind)
+        return float(element.attenuation_db_for_frequency(frequency_mhz))
 
     @staticmethod
     def _reflection_surfaces_from_polygon(
@@ -3089,9 +3509,13 @@ class RFEngine:
                 category = str(getattr(element, "rf_category", "other") or "other").lower()
                 if category in {"door", "window"}:
                     active_openings.append(element)
-                    element_loss += element.attenuation_db_for_frequency(radio.frequency_mhz)
+                    element_loss += RFEngine._element_penetration_loss_db(
+                        element, line, radio.frequency_mhz, segment_ap_z, segment_rx_z, None
+                    )
                 elif category not in {"slab", "roof"}:
-                    element_loss += element.attenuation_db_for_frequency(radio.frequency_mhz)
+                    element_loss += RFEngine._element_penetration_loss_db(
+                        element, line, radio.frequency_mhz, segment_ap_z, segment_rx_z, None
+                    )
 
             for wall in RFEngine._walls_intersecting_line(floor, line, wall_indexes):
                 wall_key = RFEngine._wall_identity(wall)
@@ -3180,6 +3604,57 @@ class RFEngine:
         az_max = max([float(value[1]) for value in (pattern.azimuth_points or [])] or [float(pattern.peak_gain_dbi)])
         el_max = max([float(value[1]) for value in (pattern.elevation_points or [])] or [0.0])
         return az_max + el_max - float(pattern.peak_gain_dbi)
+
+    @staticmethod
+    def _pattern_interp_array(points: List[Tuple[float, float]], angles, default: float):
+        if not points:
+            return np.full_like(np.asarray(angles, dtype=float), float(default), dtype=float)
+        wrapped = sorted(
+            (AntennaPattern._wrap_deg(float(angle)), float(gain))
+            for angle, gain in points
+        )
+        xp = np.asarray([wrapped[-1][0] - 360.0] + [item[0] for item in wrapped] + [wrapped[0][0] + 360.0], dtype=float)
+        fp = np.asarray([wrapped[-1][1]] + [item[1] for item in wrapped] + [wrapped[0][1]], dtype=float)
+        query = ((np.asarray(angles, dtype=float) + 180.0) % 360.0) - 180.0
+        return np.interp(query, xp, fp)
+
+    @staticmethod
+    def _pattern_gain_grid(
+        xs: np.ndarray,
+        ys: np.ndarray,
+        floor: FloorModel,
+        floors: Dict[str, FloorModel],
+        ap: AccessPoint,
+        radio: APRadio,
+        patterns: Optional[Dict[str, AntennaPattern]],
+        receiver_z_grid: Optional[np.ndarray] = None,
+    ) -> Optional[np.ndarray]:
+        if not patterns:
+            return None
+        pattern = patterns.get(str(getattr(radio, "antenna_pattern", "") or ""))
+        if pattern is None:
+            return None
+        ap_floor = floors.get(ap.floor)
+        if ap_floor is None:
+            return None
+        xs_array = np.asarray(xs, dtype=float)
+        ys_array = np.asarray(ys, dtype=float)
+        xx, yy = np.meshgrid(xs_array, ys_array)
+        dx = xx - float(ap.x)
+        dy = yy - float(ap.y)
+        horizontal = np.maximum(0.1, np.hypot(dx, dy))
+        bearing = np.degrees(np.arctan2(dy, dx))
+        az_rel = ((bearing - float(ap.azimuth_deg) + 180.0) % 360.0) - 180.0
+        ap_z = float(ap_floor.elevation) + float(ap.mount_height_m)
+        if receiver_z_grid is None:
+            rx_z = float(floor.elevation) + float(ap.rx_height_m)
+        else:
+            rx_z = np.asarray(receiver_z_grid, dtype=float)
+        elevation = np.degrees(np.arctan2(rx_z - ap_z, horizontal))
+        el_rel = elevation + float(ap.downtilt_deg)
+        az_gain = RFEngine._pattern_interp_array(pattern.azimuth_points, az_rel, float(pattern.peak_gain_dbi))
+        el_gain = RFEngine._pattern_interp_array(pattern.elevation_points, el_rel, 0.0)
+        return np.asarray(az_gain + el_gain - float(pattern.peak_gain_dbi), dtype=float)
 
     @staticmethod
     def propagation_at(
@@ -3900,8 +4375,13 @@ class RFEngine:
         if settings is None:
             return "none"
         return stable_digest({
+            "methodology": "exact-inspect-compatible-rssi-v4-point-pattern-gpu",
             "profile": getattr(settings, "rf_calculation_profile", "balanced"),
-            "cutoff": [getattr(settings, "enable_ap_cutoff_zones", True), getattr(settings, "ap_cutoff_radius_by_frequency_m", {})],
+            "cutoff": [
+                getattr(settings, "enable_ap_cutoff_zones", True),
+                getattr(settings, "default_ap_cutoff_radius_m", 0.0),
+                getattr(settings, "ap_cutoff_radius_by_frequency_m", {}),
+            ],
             "reflection": [
                 settings.enable_multipath_reflections, settings.max_reflection_order,
                 settings.max_reflection_surfaces, settings.max_reflection_paths,
@@ -4087,6 +4567,15 @@ class RFEngine:
         worker_count = max(int(result.worker_processes) for result in fields)
         execution_modes = {result.execution_mode for result in fields}
         execution_mode = "cache" if cache_misses == 0 else ("multiprocess" if "multiprocess" in execution_modes else next(iter(execution_modes)))
+        field_mode_note = ", ".join(sorted(str(mode) for mode in execution_modes if str(mode)))
+        field_notes = [
+            str(getattr(result, "performance_note", "") or "")
+            for result in fields
+            if "direct RSSI grid calculated on" in str(getattr(result, "performance_note", "") or "")
+        ]
+        direct_gpu_note = f"; AP field mode(s): {field_mode_note}" if field_mode_note else ""
+        if field_notes:
+            direct_gpu_note += f"; {field_notes[0]}"
         return SimulationResult(
             xs=first.xs.copy(), ys=first.ys.copy(), rssi=rssi,
             delay_spread_ns=delay, path_count=count,
@@ -4098,7 +4587,7 @@ class RFEngine:
             elapsed_seconds=float(elapsed),
             performance_note=(
                 f"combined {len(fields)} independently cached AP field(s); "
-                f"{cache_hits} cache hit(s), {cache_misses} recalculated field(s){gpu_note}"
+                f"{cache_hits} cache hit(s), {cache_misses} recalculated field(s){direct_gpu_note}{gpu_note}"
             ),
             approximate_points=max(int(result.approximate_points) for result in fields),
             exact_points=max(int(result.exact_points) for result in fields),
@@ -4107,7 +4596,11 @@ class RFEngine:
         )
 
     @staticmethod
-    def _attenuation_segment_rows_for_floor(floor: FloorModel, frequency_mhz: float) -> np.ndarray:
+    def _attenuation_segment_rows_for_floor(
+        floor: FloorModel,
+        frequency_mhz: float,
+        heatmap_settings: Optional[HeatmapSettings] = None,
+    ) -> np.ndarray:
         """Flatten RF wall/element polygon edges for CUDA/Numba ray tests.
 
         The GPU path evaluates line-of-sight path loss and adds attenuation for
@@ -4158,7 +4651,7 @@ class RFEngine:
                 getattr(element, "polygon", None),
                 float(getattr(element, "z_min", floor.elevation)),
                 float(getattr(element, "z_max", floor.elevation + 3.0)),
-                float(element.attenuation_db_for_frequency(frequency_mhz)),
+                float(RFEngine._element_nominal_penetration_loss_db(element, frequency_mhz, heatmap_settings)),
             )
         if not rows:
             return np.zeros((0, 7), dtype=np.float32)
@@ -4187,15 +4680,76 @@ class RFEngine:
             if ap_floor.name != floor.name:
                 floor_loss = RFEngine.floor_penetration_loss_db(floor, ap_floor, floors, frequency, [], heatmap_settings)
             effective_ple = RFEngine.distance_path_loss_exponent(ap.path_loss_exponent, heatmap_settings)
-            pattern_gain = RFEngine._maximum_pattern_gain(patterns, radio.antenna_pattern)
             rows.append((
                 float(ap.x), float(ap.y), ap_z, rx_z,
-                float(radio.tx_power_dbm), float(getattr(radio, "antenna_gain_dbi", 0.0) or 0.0) + float(pattern_gain),
+                float(radio.tx_power_dbm), float(getattr(radio, "antenna_gain_dbi", 0.0) or 0.0),
                 frequency, float(effective_ple), cutoff2, float(floor_loss),
             ))
         if not rows:
             return np.zeros((0, 10), dtype=np.float32)
         return np.asarray(rows, dtype=np.float32)
+
+    @staticmethod
+    def _inspection_accelerator_ap_rows(
+        x: float,
+        y: float,
+        floor: FloorModel,
+        floors: Dict[str, FloorModel],
+        links: Sequence[Tuple[AccessPoint, APRadio]],
+        heatmap_settings: Optional[HeatmapSettings],
+        patterns: Optional[Dict[str, AntennaPattern]] = None,
+        receiver_z_override: Optional[float] = None,
+    ) -> Tuple[np.ndarray, List[Dict[str, float]]]:
+        rows: List[Tuple[float, float, float, float, float, float, float, float, float, float]] = []
+        terms: List[Dict[str, float]] = []
+        for ap, radio in links:
+            ap_floor = floors.get(ap.floor)
+            if ap_floor is None:
+                continue
+            frequency = float(radio.frequency_mhz)
+            cutoff = RFEngine.cutoff_radius_m_for_radio(radio, heatmap_settings)
+            cutoff2 = cutoff * cutoff if cutoff > 0.0 else 0.0
+            ap_z = float(ap_floor.elevation) + float(ap.mount_height_m)
+            rx_z = float(receiver_z_override) if receiver_z_override is not None else float(floor.elevation) + float(ap.rx_height_m)
+            dx = float(x) - float(ap.x)
+            dy = float(y) - float(ap.y)
+            horizontal = max(0.1, math.hypot(dx, dy))
+            bearing = math.degrees(math.atan2(dy, dx))
+            elevation = math.degrees(math.atan2(rx_z - ap_z, horizontal))
+            az_rel = AntennaPattern._wrap_deg(bearing - float(ap.azimuth_deg))
+            el_rel = elevation + float(ap.downtilt_deg)
+            pattern_gain = 0.0
+            if patterns:
+                pattern = patterns.get(radio.antenna_pattern)
+                if pattern is not None:
+                    pattern_gain = float(pattern.gain_dbi(az_rel, el_rel))
+            radio_gain = float(getattr(radio, "antenna_gain_dbi", 0.0) or 0.0)
+            floor_loss = 0.0
+            if ap_floor.name != floor.name:
+                floor_loss = RFEngine.floor_penetration_loss_db(floor, ap_floor, floors, frequency, [], heatmap_settings)
+            effective_ple = RFEngine.distance_path_loss_exponent(ap.path_loss_exponent, heatmap_settings)
+            rows.append((
+                float(ap.x), float(ap.y), ap_z, rx_z,
+                float(radio.tx_power_dbm), radio_gain + pattern_gain,
+                frequency, float(effective_ple), cutoff2, float(floor_loss),
+            ))
+            terms.append({
+                "ap_z": float(ap_z),
+                "rx_z": float(rx_z),
+                "horizontal_d": float(horizontal),
+                "bearing": float(bearing),
+                "elevation": float(elevation),
+                "azimuth_relative_deg": float(az_rel),
+                "elevation_relative_deg": float(el_rel),
+                "pattern_gain_dbi": float(pattern_gain),
+                "radio_antenna_gain_dbi": float(radio_gain),
+                "floor_loss_db": float(floor_loss),
+                "tx_power_dbm": float(radio.tx_power_dbm),
+                "path_loss_exponent": float(ap.path_loss_exponent),
+            })
+        if not rows:
+            return np.zeros((0, 10), dtype=np.float32), []
+        return np.asarray(rows, dtype=np.float32), terms
 
     @staticmethod
     def _try_accelerated_direct_grid(
@@ -4220,8 +4774,19 @@ class RFEngine:
     ) -> Optional[Dict[object, SimulationResult]]:
         if heatmap_settings is None:
             return None
+        gpu_primary = bool(getattr(heatmap_settings, "gpu_primary_rssi_simulation", True))
+        direct_acceleration = bool(getattr(
+            heatmap_settings,
+            "enable_approximate_direct_rssi_acceleration",
+            gpu_primary,
+        ))
+        if not direct_acceleration:
+            return None
         gpu_enabled = bool(getattr(heatmap_settings, "enable_opencl_gpu", True))
-        numba_enabled = bool(getattr(heatmap_settings, "enable_numba_rf_kernels", True))
+        numba_enabled = (
+            bool(getattr(heatmap_settings, "enable_numba_rf_kernels", True))
+            and not (gpu_primary and gpu_enabled)
+        )
         if not gpu_enabled and not numba_enabled:
             return None
         cancel_event = getattr(heatmap_settings, "_cancel_event", None)
@@ -4237,48 +4802,100 @@ class RFEngine:
             if cancel_event is not None and cancel_event.is_set():
                 raise RuntimeError("RSSI calculation cancelled")
             links = radio_links_by_group.get(key, [])
-            ap_rows = RFEngine._direct_accelerator_ap_rows(floor, floors, links, heatmap_settings, patterns=patterns)
-            if ap_rows.size == 0:
+            if not links:
                 continue
-            frequency = float(ap_rows[0, 6])
-            segments = RFEngine._attenuation_segment_rows_for_floor(floor, frequency)
-            accelerated = None
-            try:
-                if gpu_enabled:
-                    terrain_clearance = 0.5
-                    ground_loss = 0.0
-                    if terrain_model is not None:
-                        terrain_clearance = max(0.05, min(
-                            0.75,
-                            float(getattr(terrain_model, "receiver_height_m", 1.0)) * 0.5,
-                        ))
-                        ground_loss = max(0.0, float(getattr(terrain_model, "ground_attenuation_db", 80.0)))
-                    accelerated = gpu_direct_rssi_grid(
-                        xs, ys, ap_rows, segments, valid, disconnected, combine_mode, heatmap_settings,
-                        receiver_z_grid, terrain_elevation_grid, ground_loss, terrain_clearance,
-                    )
-            except GPUExecutionError:
-                # A selected/detected GPU failed. In forced mode this is a real
-                # calculation error and must not be hidden by CPU fallback.
-                raise
-            except RuntimeError as exc:
-                if (cancel_event is not None and cancel_event.is_set()) or "cancel" in str(exc).lower():
+            link_rssi_fields: List[np.ndarray] = []
+            link_count_fields: List[np.ndarray] = []
+            mode = "gpu-direct-rssi"
+            use_point_pattern = bool(patterns)
+            process_links = links if use_point_pattern else [None]
+            for link_item in process_links:
+                link_batch = links if link_item is None else [link_item]
+                ap_rows = RFEngine._direct_accelerator_ap_rows(floor, floors, link_batch, heatmap_settings, patterns=None)
+                if ap_rows.size == 0:
+                    continue
+                frequency = float(ap_rows[0, 6])
+                segments = RFEngine._attenuation_segment_rows_for_floor(floor, frequency, heatmap_settings)
+                accelerated = None
+                try:
+                    if gpu_enabled:
+                        terrain_clearance = 0.5
+                        ground_loss = 0.0
+                        if terrain_model is not None:
+                            terrain_clearance = max(0.05, min(
+                                0.75,
+                                float(getattr(terrain_model, "receiver_height_m", 1.0)) * 0.5,
+                            ))
+                            ground_loss = max(0.0, float(getattr(terrain_model, "ground_attenuation_db", 80.0)))
+                        accelerated = gpu_direct_rssi_grid(
+                            xs, ys, ap_rows, segments, valid, disconnected, 0 if use_point_pattern else combine_mode,
+                            heatmap_settings, receiver_z_grid, terrain_elevation_grid, ground_loss, terrain_clearance,
+                        )
+                except GPUExecutionError:
+                    # A selected/detected GPU failed. In forced mode this is a real
+                    # calculation error and must not be hidden by CPU fallback.
                     raise
-                accelerated = None
-            except Exception:
-                accelerated = None
-            if accelerated is not None:
-                rssi, counts, gpu_used = accelerated
-                mode = "gpu-direct-rssi"
+                except RuntimeError as exc:
+                    if (cancel_event is not None and cancel_event.is_set()) or "cancel" in str(exc).lower():
+                        raise
+                    accelerated = None
+                except Exception:
+                    accelerated = None
+                if accelerated is not None:
+                    link_rssi, link_counts, gpu_used = accelerated
+                    mode = "gpu-direct-rssi"
+                else:
+                    if gpu_primary and gpu_enabled:
+                        raise GPUExecutionError(
+                            "GPU-primary RSSI simulation is enabled, but no CUDA/OpenCL GPU backend completed "
+                            "the direct RSSI grid. Check the selected GPU device/runtime instead of falling back to CPU."
+                        )
+                    if not numba_enabled:
+                        return None
+                    fallback = numba_direct_rssi_grid(
+                        xs, ys, ap_rows, segments, valid, disconnected,
+                        0 if use_point_pattern else combine_mode, heatmap_settings,
+                    )
+                    if fallback is None:
+                        return None
+                    link_rssi, link_counts = fallback
+                    cpu_parallel_used = True
+                    mode = "numba-parallel-rssi"
+                if link_item is not None:
+                    ap, radio = link_item
+                    gain_grid = RFEngine._pattern_gain_grid(
+                        xs, ys, floor, floors, ap, radio, patterns, receiver_z_grid
+                    )
+                    if gain_grid is not None:
+                        finite = np.isfinite(link_rssi) & (np.asarray(link_counts) > 0)
+                        link_rssi = np.asarray(link_rssi, dtype=float)
+                        link_rssi[finite] += gain_grid[finite]
+                        link_rssi[finite] = np.maximum(link_rssi[finite], disconnected)
+                link_rssi_fields.append(np.asarray(link_rssi, dtype=float))
+                link_count_fields.append(np.asarray(link_counts, dtype=np.int16))
+            if not link_rssi_fields:
+                continue
+            if len(link_rssi_fields) == 1:
+                rssi = link_rssi_fields[0]
+                counts = link_count_fields[0]
+            elif combine_mode == 1:
+                stack = np.stack(link_rssi_fields, axis=0)
+                powers = np.where(np.isfinite(stack), np.power(10.0, stack / 10.0), 0.0)
+                total_power = np.sum(powers, axis=0)
+                rssi = np.full((rows, cols), disconnected, dtype=float)
+                positive = total_power > 0.0
+                rssi[positive] = 10.0 * np.log10(total_power[positive])
+                counts = np.sum(np.stack(link_count_fields, axis=0).astype(np.int32), axis=0).clip(0, 32767).astype(np.int16)
             else:
-                if not numba_enabled:
-                    return None
-                fallback = numba_direct_rssi_grid(xs, ys, ap_rows, segments, valid, disconnected, combine_mode, heatmap_settings)
-                if fallback is None:
-                    return None
-                rssi, counts = fallback
-                cpu_parallel_used = True
-                mode = "numba-parallel-rssi"
+                stack = np.stack(link_rssi_fields, axis=0)
+                finite_stack = np.where(np.isfinite(stack), stack, -np.inf)
+                strongest_index = np.argmax(finite_stack, axis=0)
+                rssi = np.take_along_axis(finite_stack, strongest_index[None, :, :], axis=0)[0]
+                all_invalid = ~np.any(np.isfinite(stack), axis=0)
+                rssi[all_invalid] = np.nan
+                count_stack = np.stack(link_count_fields, axis=0)
+                counts = np.take_along_axis(count_stack, strongest_index[None, :, :], axis=0)[0].astype(np.int16)
+                counts[all_invalid] = 0
             if boundary_mask is not None:
                 rssi = np.asarray(rssi, dtype=float)
                 rssi[~boundary_mask] = np.nan
@@ -4295,7 +4912,7 @@ class RFEngine:
             if receiver_z_grid is not None and terrain_elevation_grid is not None:
                 note += "; terrain receiver heights and ground obstruction loss included in the direct-grid batch"
             if patterns:
-                note += "; antenna pattern peak gain included to match direct link-budget inspection"
+                note += "; point-specific antenna pattern gain applied to match RSSI loss inspection"
             results[key] = SimulationResult(
                 xs=xs, ys=ys, rssi=rssi, delay_spread_ns=delays, path_count=counts,
                 valid_mask=None if boundary_mask is None else boundary_mask.copy(),
@@ -4828,10 +5445,14 @@ class RFEngine:
             if cancel_event is not None and cancel_event.is_set():
                 raise RuntimeError("RSSI calculation cancelled")
             for ix, xx in enumerate(xs):
+                if cancel_event is not None and (ix & 31) == 0 and cancel_event.is_set():
+                    raise RuntimeError("RSSI calculation cancelled")
                 if work_mask is not None and not bool(work_mask[iy, ix]):
                     continue
                 geometry_cache = {} if bool(getattr(heatmap_settings, "reuse_path_geometry_across_frequencies", True)) else None
                 for key in group_order:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise RuntimeError("RSSI calculation cancelled")
                     samples = []
                     receiver_z = None if receiver_z_grid is None else float(receiver_z_grid[iy, ix])
                     for ap, radio in radio_links_by_group[key]:
@@ -8066,6 +8687,21 @@ class RFPerformanceSettingsDialog(QDialog):
         )
         form.addRow(self.force_gpu)
 
+        self.gpu_primary = QCheckBox("Use GPU as the primary RSSI simulation engine")
+        self.gpu_primary.setChecked(bool(getattr(settings, "gpu_primary_rssi_simulation", True)))
+        self.gpu_primary.setToolTip(
+            "Runs the dense RSSI grid through the direct GPU engine and prevents silent CPU multiprocessing fallback. "
+            "CPU remains responsible only for setup, UI, and non-GPU geometry preparation."
+        )
+        form.addRow(self.gpu_primary)
+
+        self.gpu_direct_grid = QCheckBox("Use direct GPU RSSI/barrier grid")
+        self.gpu_direct_grid.setChecked(bool(getattr(settings, "enable_approximate_direct_rssi_acceleration", True)))
+        self.gpu_direct_grid.setToolTip(
+            "Calculates RSSI from APs and RF barrier edges in GPU batches. Disable only when you need the older CPU multipath grid."
+        )
+        form.addRow(self.gpu_direct_grid)
+
         self.opencl_device = QComboBox()
         self.opencl_device.addItem("Automatic (prefer NVIDIA CUDA)", "auto")
         known = discover_opencl_devices(include_cpu=True)
@@ -8132,6 +8768,8 @@ class RFPerformanceSettingsDialog(QDialog):
         probe = copy.copy(self.parent().heatmap_settings) if self.parent() is not None else HeatmapSettings.default()
         probe.enable_opencl_gpu = self.enable_opencl.isChecked()
         probe.force_gpu_when_available = self.force_gpu.isChecked()
+        probe.gpu_primary_rssi_simulation = self.gpu_primary.isChecked()
+        probe.enable_approximate_direct_rssi_acceleration = self.gpu_direct_grid.isChecked()
         probe.opencl_device_preference = str(self.opencl_device.currentData() or "auto")
         probe.opencl_allow_cpu_device = self.opencl_allow_cpu.isChecked()
         self.opencl_status_label.setText(opencl_status(probe))
@@ -8150,6 +8788,8 @@ class RFPerformanceSettingsDialog(QDialog):
         self.quick_cutoff.toggled.connect(self._update_enabled_state)
         self.enable_opencl.toggled.connect(self._update_enabled_state)
         self.force_gpu.toggled.connect(self._update_enabled_state)
+        self.gpu_primary.toggled.connect(self._update_enabled_state)
+        self.gpu_direct_grid.toggled.connect(self._update_enabled_state)
 
     def _apply_quick_cutoff_preset(self, *_):
         value = self.quick_cutoff_preset.currentData()
@@ -8157,8 +8797,10 @@ class RFPerformanceSettingsDialog(QDialog):
             self.quick_cutoff_dbm.setValue(float(value))
 
     def _update_enabled_state(self, *_):
+        gpu_primary_active = self.enable_opencl.isChecked() and self.gpu_primary.isChecked() and self.gpu_direct_grid.isChecked()
+        self.enable_rf_mp.setEnabled(not gpu_primary_active)
         for widget in (self.rf_workers, self.rf_min_points, self.tile_rows, self.tiles_per_worker, self.reuse_pool, self.worker_index_cache):
-            widget.setEnabled(self.enable_rf_mp.isChecked())
+            widget.setEnabled(self.enable_rf_mp.isChecked() and not gpu_primary_active)
         for widget in (self.ifc_workers, self.huge_ifc_workers):
             widget.setEnabled(self.enable_ifc_mp.isChecked())
         for widget in (self.coarse_resolution, self.gradient_threshold, self.threshold_margin, self.geometry_buffer, self.ap_refine_radius):
@@ -8174,7 +8816,7 @@ class RFPerformanceSettingsDialog(QDialog):
         self.diffraction_paths.setEnabled(self.diffraction.isChecked())
         self.quick_cutoff_preset.setEnabled(self.quick_cutoff.isChecked())
         self.quick_cutoff_dbm.setEnabled(self.quick_cutoff.isChecked())
-        for widget in (self.force_gpu, self.opencl_device, self.opencl_allow_cpu, self.opencl_influence, self.opencl_combine, self.opencl_resample, self.opencl_raster):
+        for widget in (self.force_gpu, self.gpu_primary, self.gpu_direct_grid, self.opencl_device, self.opencl_allow_cpu, self.opencl_influence, self.opencl_combine, self.opencl_resample, self.opencl_raster):
             widget.setEnabled(self.enable_opencl.isChecked())
         self.opencl_min_work.setEnabled(self.enable_opencl.isChecked() and not self.force_gpu.isChecked())
         self._update_summary()
@@ -8212,6 +8854,8 @@ class RFPerformanceSettingsDialog(QDialog):
         self.load_results_disk.setChecked(True)
         self.enable_opencl.setChecked(True)
         self.force_gpu.setChecked(True)
+        self.gpu_primary.setChecked(True)
+        self.gpu_direct_grid.setChecked(True)
         self.opencl_device.setCurrentIndex(max(0, self.opencl_device.findData("auto")))
         self.opencl_min_work.setValue(1)
         self._update_enabled_state()
@@ -8251,6 +8895,8 @@ class RFPerformanceSettingsDialog(QDialog):
         self.load_results_disk.setChecked(True)
         self.enable_opencl.setChecked(True)
         self.force_gpu.setChecked(True)
+        self.gpu_primary.setChecked(True)
+        self.gpu_direct_grid.setChecked(True)
         self.opencl_device.setCurrentIndex(max(0, self.opencl_device.findData("auto")))
         self.opencl_min_work.setValue(1)
         self._update_enabled_state()
@@ -8268,10 +8914,18 @@ class RFPerformanceSettingsDialog(QDialog):
         self._update_enabled_state()
 
     def _update_summary(self, *_):
-        rf_workers = "automatic" if self.rf_workers.value() == 0 else str(self.rf_workers.value())
+        gpu_primary_active = (
+            getattr(self, "gpu_primary", None) is not None
+            and getattr(self, "gpu_direct_grid", None) is not None
+            and self.enable_opencl.isChecked()
+            and self.gpu_primary.isChecked()
+            and self.gpu_direct_grid.isChecked()
+        )
+        rf_workers = "GPU bypass" if gpu_primary_active else ("automatic" if self.rf_workers.value() == 0 else str(self.rf_workers.value()))
         ifc_workers = "automatic" if self.ifc_workers.value() == 0 else str(self.ifc_workers.value())
         boundary = "on" if self.boundary_filter.isChecked() else "off"
-        gpu = "off" if not self.enable_opencl.isChecked() else ("forced " if self.force_gpu.isChecked() else "threshold ") + str(self.opencl_device.currentText())
+        gpu_mode = "primary " if getattr(self, "gpu_primary", None) is not None and self.gpu_primary.isChecked() else ""
+        gpu = "off" if not self.enable_opencl.isChecked() else gpu_mode + ("forced " if self.force_gpu.isChecked() else "threshold ") + str(self.opencl_device.currentText())
         warning = ""
         if self.boundary_filter.isChecked() and not self._has_planner_boundaries:
             warning = " Boundary limiting is selected, but this project currently contains no planner boundaries."
@@ -8316,6 +8970,8 @@ class RFPerformanceSettingsDialog(QDialog):
         settings.use_shared_memory_rf_results = self.shared_memory.isChecked()
         settings.enable_opencl_gpu = self.enable_opencl.isChecked()
         settings.force_gpu_when_available = self.force_gpu.isChecked()
+        settings.gpu_primary_rssi_simulation = self.gpu_primary.isChecked()
+        settings.enable_approximate_direct_rssi_acceleration = self.gpu_direct_grid.isChecked()
         settings.opencl_device_preference = str(self.opencl_device.currentData() or "auto")
         settings.opencl_allow_cpu_device = self.opencl_allow_cpu.isChecked()
         settings.opencl_min_work_items = int(self.opencl_min_work.value())
@@ -9842,10 +10498,11 @@ class IFCElementGraphicsItem(QGraphicsPolygonItem):
             behaviour = "When the 3D radio path crosses this element, its loss is added."
         else:
             behaviour = "This type currently has 0 dB loss and is visual context only."
+        source_note = "User-created RF vegetation/object" if getattr(element, "is_user_created", False) else "Imported IFC element"
         rf_note = f"\nRF category: {element.rf_category}\nAttenuation: {losses or '0 dB'}\n{behaviour}"
         self.setToolTip(
-            f"{element.name or element.guid}\n{element.ifc_class} | {element.rf_type_override or element.type_name}{material}{rf_note}\n"
-            "Right-click to edit attenuation, open the bulk type manager, or remove this IFC element."
+            f"{element.name or element.guid}\n{source_note}\n{element.ifc_class} | {element.rf_type_override or element.type_name}{material}{rf_note}\n"
+            "Right-click to edit attenuation, open the bulk type manager, or remove this RF element."
         )
 
     def contextMenuEvent(self, event):
@@ -9861,7 +10518,11 @@ class IFCElementGraphicsItem(QGraphicsPolygonItem):
         reset_action = menu.addAction("Reset attenuation from IFC type/material")
         bulk_action = menu.addAction("Bulk attenuation by IFC type…")
         menu.addSeparator()
-        delete_action = menu.addAction("Remove imported IFC element from this RF model")
+        delete_action = menu.addAction(
+            "Delete user-created RF vegetation/object"
+            if getattr(self.element, "is_user_created", False)
+            else "Remove imported IFC element from this RF model"
+        )
         chosen = menu.exec(event.screenPos())
         for action, space in inferred_space_actions:
             if chosen == action:
@@ -9875,7 +10536,10 @@ class IFCElementGraphicsItem(QGraphicsPolygonItem):
         elif chosen == bulk_action:
             self.main.show_bulk_ifc_attenuation()
         elif chosen == delete_action:
-            self.main.delete_imported_element(self.element)
+            if getattr(self.element, "is_user_created", False):
+                self.main.delete_user_element(self.element)
+            else:
+                self.main.delete_imported_element(self.element)
         event.accept()
 
 
@@ -11364,6 +12028,10 @@ class PlanView(QGraphicsView):
                 snap = self.main.axis_constrained_point(start, pos)
             self.main.show_user_wall_preview(snap)
 
+        if getattr(self.main, "vegetation_draw_mode", False) and getattr(self.main, "_vegetation_draw_center", None) is not None:
+            pos = self.mapToScene(event.position().toPoint())
+            self.main.show_vegetation_preview(pos)
+
         if self._middle_panning and self._last_pan_pos is not None:
             delta = event.position().toPoint() - self._last_pan_pos
             self._last_pan_pos = event.position().toPoint()
@@ -11423,6 +12091,17 @@ class PlanView(QGraphicsView):
                 pos = self.mapToScene(event.position().toPoint())
                 shift_constrain = bool(event.modifiers() & Qt.ShiftModifier)
                 self.main.capture_user_wall_point(pos, shift_constrain=shift_constrain)
+                event.accept()
+                return
+
+        if getattr(self.main, "vegetation_draw_mode", False):
+            if event.button() == Qt.RightButton:
+                self.main.cancel_vegetation_drawing()
+                event.accept()
+                return
+            if event.button() == Qt.LeftButton:
+                pos = self.mapToScene(event.position().toPoint())
+                self.main.capture_vegetation_point(pos)
                 event.accept()
                 return
 
@@ -11492,6 +12171,14 @@ class PlanView(QGraphicsView):
             return
         if event.key() == Qt.Key_Escape and getattr(self.main, "alignment_pick_mode", None):
             self.main.cancel_alignment_pick()
+            event.accept()
+            return
+        if event.key() == Qt.Key_Escape and getattr(self.main, "vegetation_draw_mode", False):
+            self.main.cancel_vegetation_drawing()
+            event.accept()
+            return
+        if event.key() == Qt.Key_Escape and getattr(self.main, "wall_draw_mode", False):
+            self.main.cancel_user_wall_drawing()
             event.accept()
             return
         if event.key() == Qt.Key_Escape and getattr(self.main, "inferred_space_interaction_mode", False):
@@ -11978,6 +12665,9 @@ class MainWindow(QMainWindow):
         self.draw_wall_action = QAction("Draw RF wall", self)
         self.draw_wall_action.setCheckable(True)
         self.draw_wall_action.toggled.connect(self.toggle_wall_draw_mode)
+        self.draw_vegetation_action = QAction("Add vegetation / tree", self)
+        self.draw_vegetation_action.setCheckable(True)
+        self.draw_vegetation_action.toggled.connect(self.toggle_vegetation_draw_mode)
         self.bulk_attenuation_action = QAction("Bulk IFC attenuation", self)
         self.bulk_attenuation_action.triggered.connect(self.show_bulk_ifc_attenuation)
         self.attenuation_review_action = QAction("IFC attenuation wizard", self)
@@ -12683,8 +13373,11 @@ out tags geom;
                 floor = self.floors.get(item.element.floor)
                 if floor is not None:
                     floor.elements = [candidate for candidate in floor.elements if candidate is not item.element]
-                    self._remember_ifc_exclusion("element", item.element.source_file, item.element.guid)
-                    deleted_labels.append(f"IFC element '{item.element.name or item.element.guid}'")
+                    if getattr(item.element, "is_user_created", False):
+                        deleted_labels.append(f"RF element '{item.element.name or item.element.guid}'")
+                    else:
+                        self._remember_ifc_exclusion("element", item.element.source_file, item.element.guid)
+                        deleted_labels.append(f"IFC element '{item.element.name or item.element.guid}'")
 
         if not deleted_labels:
             return False
@@ -12877,6 +13570,10 @@ out tags geom;
                 "Draw RF wall", "Draw a connected RF-blocking wall where the IFC model has missing geometry. Hold Shift to constrain it horizontal or vertical.",
                 "SP_FileDialogContentsView", ""
             ),
+            "draw_vegetation_action": (
+                "Add vegetation", "Create a circular RF vegetation/tree obstruction: first click the centre, second click the canopy/hedge radius. Exact RSSI paths use ITU-R P.833-style path-depth vegetation loss; presets remain editable in the attenuation table.",
+                "SP_DirIcon", ""
+            ),
             "bulk_attenuation_action": (
                 "Bulk IFC attenuation", "Edit attenuation once per unique IFC wall/element type and apply it to every matching instance.",
                 "SP_FileDialogDetailedView", "Ctrl+Alt+T"
@@ -13041,7 +13738,7 @@ out tags geom;
             ("View orientation", ["rotate_left_action", "rotate_right_action", "reset_rotation_action"]),
         ]), "Model and view")
         ribbon.addTab(self._make_ribbon_page([
-            ("RF obstructions", ["draw_wall_action", "edit_rf_presets_action", "bulk_attenuation_action", "attenuation_review_action"]),
+            ("RF obstructions", ["draw_wall_action", "draw_vegetation_action", "edit_rf_presets_action", "bulk_attenuation_action", "attenuation_review_action"]),
             ("Space creation", ["draw_space_action", "create_spaces_action"]),
             ("Space interaction", ["inferred_space_interaction_action", "select_ap_spaces_action", "clear_inferred_spaces_action"]),
             ("Permitted planning area", ["draw_boundary_action", "draw_polygon_boundary_action", "suggest_external_boundary_action", "clear_boundaries_action"]),
@@ -13345,6 +14042,8 @@ out tags geom;
             self.cancel_space_drawing(show_status=False)
         if getattr(self, "boundary_draw_mode", False):
             self.cancel_planner_boundary_drawing(show_status=False)
+        if getattr(self, "vegetation_draw_mode", False):
+            self.cancel_vegetation_drawing(show_status=False)
         if self.inferred_space_interaction_mode:
             self.inferred_space_interaction_mode = False
             self._set_interaction_action_checked("inferred_space_interaction_action", False)
@@ -14167,6 +14866,8 @@ out tags geom;
             self.cancel_planner_boundary_drawing()
         if enabled and getattr(self, "space_draw_mode", False):
             self.cancel_space_drawing()
+        if enabled and getattr(self, "vegetation_draw_mode", False):
+            self.cancel_vegetation_drawing()
         self.wall_draw_mode = bool(enabled)
         self._wall_draw_start = None
         self._clear_wall_preview()
@@ -14191,6 +14892,150 @@ out tags geom;
         self.view.setCursor(Qt.ArrowCursor)
         self.statusBar().showMessage("RF wall drawing cancelled")
 
+    def _clear_vegetation_preview(self):
+        scene = self.view.scene()
+        for item in list(getattr(self, "_vegetation_preview_items", [])):
+            try:
+                if scene is not None and item.scene() is scene:
+                    scene.removeItem(item)
+            except RuntimeError:
+                pass
+        self._vegetation_preview_items = []
+
+    def toggle_vegetation_draw_mode(self, enabled: bool):
+        if enabled:
+            self._disable_ap_tools_for_geometry_mode()
+        if enabled and getattr(self, "wall_draw_mode", False):
+            self.cancel_user_wall_drawing()
+        if enabled and getattr(self, "space_draw_mode", False):
+            self.cancel_space_drawing(show_status=False)
+        if enabled and getattr(self, "boundary_draw_mode", False):
+            self.cancel_planner_boundary_drawing(show_status=False)
+        self.vegetation_draw_mode = bool(enabled)
+        self._vegetation_draw_center = None
+        self._clear_vegetation_preview()
+        if enabled:
+            if not self.floor:
+                QMessageBox.information(self, "No floor selected", "Load an IFC and select a floor before adding vegetation.")
+                self.cancel_vegetation_drawing(show_status=False)
+                return
+            self.view.setCursor(Qt.CrossCursor)
+            self.statusBar().showMessage(
+                "Add vegetation/tree: click the centre of the tree/canopy/hedge, then click the outer edge to set its radius. RSSI uses ITU-R P.833-style path-depth vegetation loss. Right-click or Esc to cancel."
+            )
+        else:
+            self.view.setCursor(Qt.ArrowCursor)
+            self.statusBar().showMessage("Vegetation drawing stopped")
+
+    def cancel_vegetation_drawing(self, show_status: bool = True):
+        self._vegetation_draw_center = None
+        self._clear_vegetation_preview()
+        self.vegetation_draw_mode = False
+        if hasattr(self, "draw_vegetation_action"):
+            self.draw_vegetation_action.blockSignals(True)
+            self.draw_vegetation_action.setChecked(False)
+            self.draw_vegetation_action.blockSignals(False)
+        self.view.setCursor(Qt.ArrowCursor)
+        if show_status:
+            self.statusBar().showMessage("Vegetation drawing cancelled")
+
+    def show_vegetation_preview(self, edge_point: QPointF):
+        self._clear_vegetation_preview()
+        centre = getattr(self, "_vegetation_draw_center", None)
+        if centre is None or self.view.scene() is None:
+            return
+        radius = max(0.05, math.hypot(float(edge_point.x()) - float(centre.x()), float(edge_point.y()) - float(centre.y())))
+        pen = QPen(QColor("#15803D"), 0)
+        pen.setCosmetic(True)
+        pen.setStyle(Qt.DashLine)
+        fill = QColor("#22C55E")
+        fill.setAlpha(45)
+        ellipse = self.view.scene().addEllipse(
+            centre.x() - radius, centre.y() - radius, radius * 2.0, radius * 2.0,
+            pen, QBrush(fill),
+        )
+        ellipse.setZValue(Z_IFC_WALL + 2)
+        marker = self.view.scene().addEllipse(
+            centre.x() - 0.15, centre.y() - 0.15, 0.3, 0.3,
+            QPen(QColor("#15803D"), 0), QBrush(QColor("#15803D")),
+        )
+        marker.setZValue(Z_IFC_WALL + 3)
+        self._vegetation_preview_items = [ellipse, marker]
+
+    def _vegetation_profile_for_type(self, vegetation_type: str) -> Dict[float, float]:
+        profiles = self.heatmap_settings.default_ifc_element_attenuation_by_type_db
+        text = str(vegetation_type or "vegetation").strip().lower()
+        for key in sorted((k for k in profiles if k != "default"), key=len, reverse=True):
+            if str(key).lower() in text:
+                return dict(profiles[key])
+        if "vegetation" in profiles:
+            return dict(profiles["vegetation"])
+        return _vegetation_attenuation_profile_for_text(text)
+
+    def capture_vegetation_point(self, scene_pos: QPointF):
+        if not self.floor:
+            return
+        if getattr(self, "_vegetation_draw_center", None) is None:
+            self._vegetation_draw_center = QPointF(float(scene_pos.x()), float(scene_pos.y()))
+            self.show_vegetation_preview(scene_pos)
+            self.statusBar().showMessage("Vegetation centre captured. Click the outer edge to set canopy/hedge radius.")
+            return
+        centre = self._vegetation_draw_center
+        radius = math.hypot(float(scene_pos.x()) - float(centre.x()), float(scene_pos.y()) - float(centre.y()))
+        if radius < 0.15:
+            self.statusBar().showMessage("The vegetation radius is too small. Click further away from the centre.")
+            return
+        radius = max(0.15, min(250.0, float(radius)))
+        polygon = Point(float(centre.x()), float(centre.y())).buffer(radius, resolution=48)
+        if polygon.is_empty:
+            self.statusBar().showMessage("Could not create the vegetation footprint.")
+            return
+        vegetation_type = str(getattr(self.heatmap_settings, "user_vegetation_default_type", "tree canopy") or "tree canopy")
+        profile = self._vegetation_profile_for_type(vegetation_type)
+        existing = sum(
+            1 for element in getattr(self.floor, "elements", [])
+            if getattr(element, "is_user_created", False) and getattr(element, "rf_category", "") == "vegetation"
+        )
+        height = max(0.1, float(getattr(self.heatmap_settings, "user_vegetation_default_height_m", 6.0) or 6.0))
+        element = IFCElement2D(
+            guid=f"user-rf-vegetation-{uuid.uuid4().hex}",
+            name=f"Vegetation {existing + 1}",
+            floor=self.floor.name,
+            source_file="User RF vegetation",
+            type_name=vegetation_type,
+            material=vegetation_type,
+            polygon=polygon,
+            z_min=float(self.floor.elevation),
+            z_max=float(self.floor.elevation) + height,
+            source_storey=self.floor.name,
+            ifc_class="UserVegetation",
+            rf_category="vegetation",
+            attenuation_by_band_db=profile,
+            rf_type_override=vegetation_type,
+            rf_customised=True,
+            is_user_created=True,
+        )
+        self.floor.elements.append(element)
+        self._vegetation_draw_center = None
+        self._clear_vegetation_preview()
+        self._invalidate_interactive_preview_requests()
+        self.last_result = None
+        self.rssi_results_by_frequency = {}
+        self.edit_ifc_element_rf_properties(element)
+        self.draw_floor(); self.populate_wall_table()
+        self.statusBar().showMessage("Created RF vegetation/tree obstruction. Continue adding another, or right-click to finish.")
+
+    def delete_user_element(self, element: IFCElement2D):
+        if not getattr(element, "is_user_created", False):
+            return
+        floor = self.floors.get(element.floor)
+        if floor is not None:
+            floor.elements = [candidate for candidate in getattr(floor, "elements", []) if candidate is not element]
+        self._invalidate_interactive_preview_requests()
+        self.last_result = None
+        self.rssi_results_by_frequency = {}
+        self.populate_wall_table(); self.draw_floor()
+
     def _clear_space_preview(self):
         scene = self.view.scene()
         for item in list(getattr(self, "_space_preview_items", [])):
@@ -14208,6 +15053,8 @@ out tags geom;
             self.cancel_user_wall_drawing()
         if enabled and getattr(self, "boundary_draw_mode", False):
             self.cancel_planner_boundary_drawing(show_status=False)
+        if enabled and getattr(self, "vegetation_draw_mode", False):
+            self.cancel_vegetation_drawing(show_status=False)
         self.space_draw_mode = bool(enabled)
         self._space_polygon_points = []
         self._clear_space_preview()
@@ -14268,6 +15115,8 @@ out tags geom;
             self.cancel_user_wall_drawing()
         if enabled and getattr(self, "space_draw_mode", False):
             self.cancel_space_drawing()
+        if enabled and getattr(self, "vegetation_draw_mode", False):
+            self.cancel_vegetation_drawing(show_status=False)
         if enabled and self.boundary_draw_mode and self.boundary_draw_shape != shape:
             self.cancel_planner_boundary_drawing(show_status=False)
 
@@ -16233,6 +17082,9 @@ out tags geom;
         self.statusBar().showMessage(f"Removed {removed} imported IFC space instance{'s' if removed != 1 else ''} from the RF model")
 
     def delete_imported_element(self, element: IFCElement2D):
+        if getattr(element, "is_user_created", False):
+            self.delete_user_element(element)
+            return
         answer = QMessageBox.question(
             self,
             "Remove imported IFC element",
@@ -17968,6 +18820,7 @@ out tags geom;
                 "radios": [self._radio_to_dict(radio) for radio in ap.radios],
             })
         user_walls = []
+        user_elements = []
         overrides = []
         element_overrides = []
         for floor in self.floors.values():
@@ -17991,6 +18844,31 @@ out tags geom;
                         override["polygon"] = [[float(x), float(y)] for x, y in wall.polygon.exterior.coords]
                     overrides.append(override)
             for element in getattr(floor, "elements", []):
+                if getattr(element, "is_user_created", False):
+                    try:
+                        coords = [[float(x), float(y)] for x, y in element.polygon.exterior.coords]
+                    except Exception:
+                        coords = []
+                    if coords:
+                        user_elements.append({
+                            "guid": element.guid,
+                            "name": element.name,
+                            "floor": element.floor,
+                            "source_file": element.source_file,
+                            "type_name": element.type_name,
+                            "material": element.material,
+                            "ifc_class": element.ifc_class,
+                            "rf_category": element.rf_category,
+                            "polygon": coords,
+                            "z_min": element.z_min,
+                            "z_max": element.z_max,
+                            "source_storey": element.source_storey,
+                            "rf_type_override": element.rf_type_override,
+                            "attenuation_by_band_db": {
+                                str(key): float(value) for key, value in element.attenuation_by_band_db.items()
+                            },
+                        })
+                    continue
                 if element.rf_customised:
                     element_overrides.append({
                         "guid": element.guid,
@@ -18047,7 +18925,7 @@ out tags geom;
                     inferred_spaces.append(item)
         dxf_export_alignment = self._active_dxf_export_alignment()
         return {
-            "format": "rf-attenuation-plan", "version": 9,
+            "format": "rf-attenuation-plan", "version": 10,
             "ifc_paths": [str(path) for path in self.loaded_ifc_paths],
             "selected_floor": self.floor.name if self.floor else "", "view_rotation_deg": self.view_rotation_deg,
             "ifc_alignment": {"dx": self.ifc_alignment.dx, "dy": self.ifc_alignment.dy, "rotation_deg": self.ifc_alignment.rotation_deg, "scale": self.ifc_alignment.scale},
@@ -18062,6 +18940,12 @@ out tags geom;
                 for floor, extent in sorted(getattr(self, "rssi_calculation_extents", {}).items())
             },
             "rf_preset_defaults": self._rf_preset_defaults_dict(),
+            "user_vegetation_default_type": str(getattr(self.heatmap_settings, "user_vegetation_default_type", "tree canopy")),
+            "user_vegetation_default_height_m": float(getattr(self.heatmap_settings, "user_vegetation_default_height_m", 6.0)),
+            "enable_itu_p833_vegetation_model": bool(getattr(self.heatmap_settings, "enable_itu_p833_vegetation_model", True)),
+            "itu_p833_vegetation_leaf_state": str(getattr(self.heatmap_settings, "itu_p833_vegetation_leaf_state", "in_leaf")),
+            "itu_p833_include_wind_fade_margin": bool(getattr(self.heatmap_settings, "itu_p833_include_wind_fade_margin", False)),
+            "itu_p833_vegetation_wind_speed_m_s": float(getattr(self.heatmap_settings, "itu_p833_vegetation_wind_speed_m_s", 0.0)),
             "auto_planner_settings": self.auto_planner_settings.to_dict(),
             "custom_radio_profiles": copy.deepcopy(getattr(self.heatmap_settings, "custom_radio_profiles", {})),
             "propagation_model": self.heatmap_settings.propagation_model_dict(),
@@ -18077,7 +18961,7 @@ out tags geom;
             "selected_ap_spaces": selected_ap_spaces,
             "user_spaces": user_spaces,
             "inferred_spaces": inferred_spaces,
-            "access_points": aps, "user_walls": user_walls, "wall_overrides": overrides,
+            "access_points": aps, "user_walls": user_walls, "user_elements": user_elements, "wall_overrides": overrides,
             "element_overrides": element_overrides,
         }
 
@@ -18437,6 +19321,24 @@ out tags geom;
         if isinstance(preset_defaults, dict):
             self._apply_rf_preset_defaults_dict(preset_defaults)
             self._apply_frequency_settings_to_model(replace_existing=True)
+        if "user_vegetation_default_type" in data:
+            self.heatmap_settings.user_vegetation_default_type = str(data.get("user_vegetation_default_type") or self.heatmap_settings.user_vegetation_default_type)
+        if "user_vegetation_default_height_m" in data:
+            try:
+                self.heatmap_settings.user_vegetation_default_height_m = max(0.1, min(80.0, float(data.get("user_vegetation_default_height_m"))))
+            except Exception:
+                pass
+        if "enable_itu_p833_vegetation_model" in data:
+            self.heatmap_settings.enable_itu_p833_vegetation_model = bool(data.get("enable_itu_p833_vegetation_model"))
+        if "itu_p833_vegetation_leaf_state" in data:
+            self.heatmap_settings.itu_p833_vegetation_leaf_state = str(data.get("itu_p833_vegetation_leaf_state") or self.heatmap_settings.itu_p833_vegetation_leaf_state)
+        if "itu_p833_include_wind_fade_margin" in data:
+            self.heatmap_settings.itu_p833_include_wind_fade_margin = bool(data.get("itu_p833_include_wind_fade_margin"))
+        if "itu_p833_vegetation_wind_speed_m_s" in data:
+            try:
+                self.heatmap_settings.itu_p833_vegetation_wind_speed_m_s = max(0.0, min(80.0, float(data.get("itu_p833_vegetation_wind_speed_m_s"))))
+            except Exception:
+                pass
         alignment_data = data.get("ifc_alignment", {}) or {}
         try:
             target_alignment = AlignmentTransform(
@@ -18450,6 +19352,7 @@ out tags geom;
         for floor in self.floors.values():
             floor.walls = [wall for wall in floor.walls if not wall.is_user_created]
             floor.spaces = [space for space in floor.spaces if not space.is_inferred and not space.is_user_created]
+            floor.elements = [element for element in getattr(floor, "elements", []) if not getattr(element, "is_user_created", False)]
             for wall in floor.walls:
                 if wall.rf_original_polygon is not None:
                     wall.polygon = wall.rf_original_polygon
@@ -18532,6 +19435,48 @@ out tags geom;
                 rf_type_override=str(item.get("rf_type_override", item.get("type_name", "partition"))),
                 rf_customised=True, is_user_created=True, user_wall_thickness_m=float(item.get("thickness_m", 0.15)),
             ))
+        for item in data.get("user_elements", data.get("user_vegetation", [])):
+            if not isinstance(item, dict):
+                continue
+            floor = self.floors.get(str(item.get("floor", "")))
+            coords = item.get("polygon", [])
+            if floor is None or not isinstance(coords, list) or len(coords) < 3:
+                continue
+            try:
+                polygon = Polygon([(float(value[0]), float(value[1])) for value in coords])
+                if not polygon.is_valid:
+                    polygon = polygon.buffer(0)
+                if polygon.is_empty:
+                    continue
+                if polygon.geom_type != "Polygon":
+                    parts = list(getattr(polygon, "geoms", []))
+                    if not parts:
+                        continue
+                    polygon = max(parts, key=lambda value: float(value.area))
+                floor.elements.append(IFCElement2D(
+                    guid=str(item.get("guid", f"user-rf-vegetation-{uuid.uuid4().hex}")),
+                    name=str(item.get("name", "Vegetation")),
+                    floor=floor.name,
+                    source_file=str(item.get("source_file", "User RF vegetation")),
+                    type_name=str(item.get("type_name", item.get("rf_type_override", "tree canopy"))),
+                    material=str(item.get("material", item.get("type_name", "tree canopy"))),
+                    polygon=polygon,
+                    z_min=float(item.get("z_min", floor.elevation)),
+                    z_max=float(item.get("z_max", floor.elevation + self.heatmap_settings.user_vegetation_default_height_m)),
+                    source_storey=str(item.get("source_storey", floor.name)),
+                    ifc_class=str(item.get("ifc_class", "UserVegetation")),
+                    rf_category=str(item.get("rf_category", "vegetation")),
+                    attenuation_by_band_db={
+                        float(key): float(value)
+                        for key, value in dict(item.get("attenuation_by_band_db", {})).items()
+                    } or self._vegetation_profile_for_type(str(item.get("rf_type_override", item.get("type_name", "tree canopy")))),
+                    rf_type_override=str(item.get("rf_type_override", item.get("type_name", "tree canopy"))),
+                    rf_customised=True,
+                    is_user_created=True,
+                ))
+            except Exception:
+                continue
+
         for item in data.get("user_spaces", []):
             if not isinstance(item, dict):
                 continue
@@ -18972,6 +19917,33 @@ out tags geom;
         floor_name = self.floor.name if self.floor is not None else "No floor"
         lines.append(f"RSSI loss calculation at X {x:.3f} m, Y {y:.3f} m on {floor_name}")
         lines.append("=" * 78)
+        strongest = None
+        strongest_rssi = -math.inf
+        for item in breakdowns:
+            if not bool(item.get("available", False)):
+                continue
+            try:
+                rssi = float(item.get("rssi_dbm", float("nan")))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(rssi) and rssi > strongest_rssi:
+                strongest = item
+                strongest_rssi = rssi
+        if strongest is not None:
+            ap = strongest.get("ap")
+            radio = strongest.get("radio")
+            ap_name = str(getattr(ap, "name", "AP"))
+            radio_name = str(getattr(radio, "name", "radio"))
+            frequency = float(getattr(radio, "frequency_mhz", 0.0) or 0.0)
+            lines.append(
+                "Highest RSSI: "
+                f"{strongest_rssi:.2f} dBm from {ap_name} / {radio_name} "
+                f"({self._format_frequency_label(frequency)})"
+            )
+            lines.append("")
+        elif breakdowns:
+            lines.append("Highest RSSI: unavailable; no enabled radio path reaches this point.")
+            lines.append("")
         if terrain_note:
             lines.append(terrain_note)
             lines.append("")
@@ -19001,6 +19973,9 @@ out tags geom;
                 f"bearing {float(geometry.get('bearing', 0.0)):.1f} deg, "
                 f"elevation {float(geometry.get('elevation', 0.0)):.1f} deg"
             )
+            calculation_note = str(item.get("calculation_note", "") or "")
+            if calculation_note:
+                lines.append(f"   Calculation: {calculation_note}")
             lines.append("   Link budget:")
             lines.append(f"      TX power                                      +{float(item.get('tx_power_dbm', 0.0)):8.2f} dBm")
             lines.append(
@@ -19023,6 +19998,9 @@ out tags geom;
                     lines.append(f"      Element/opening: {self._rf_object_loss_label(element):<34} -{float(loss):8.2f} dB")
             else:
                 lines.append("      IFC/OSM elements crossed                       -    0.00 dB")
+            gpu_barrier_loss = float(item.get("gpu_barrier_loss_db", 0.0) or 0.0)
+            if gpu_barrier_loss > 1.0e-9:
+                lines.append(f"      GPU numeric wall/element barriers              -{gpu_barrier_loss:8.2f} dB")
             floor_loss = float(item.get("floor_loss_db", 0.0))
             if floor_loss > 1.0e-9:
                 slab_names = ", ".join(self._rf_object_loss_label(slab) for slab in slabs) if slabs else "configured inter-floor loss"
@@ -19035,6 +20013,106 @@ out tags geom;
             lines.append(f"      Final RSSI                                      {rssi:8.2f} dBm")
             lines.append("")
         return "\n".join(lines).rstrip()
+
+    def _gpu_rssi_loss_calculation_breakdowns(
+        self,
+        x: float,
+        y: float,
+        receiver_floor: FloorModel,
+        floors: Dict[str, FloorModel],
+        links: Sequence[Tuple[AccessPoint, APRadio]],
+        receiver_z_override: Optional[float],
+        include_inter_floor: bool,
+    ) -> Optional[List[Dict[str, object]]]:
+        if receiver_z_override is not None and self._active_terrain_model() is not None:
+            return None
+        usable_links = [
+            (ap, radio) for ap, radio in links
+            if floors.get(ap.floor) is not None and (include_inter_floor or ap.floor == receiver_floor.name)
+        ]
+        if not usable_links:
+            return None
+        grouped: Dict[float, List[Tuple[AccessPoint, APRadio]]] = {}
+        for ap, radio in usable_links:
+            grouped.setdefault(round(float(radio.frequency_mhz), 6), []).append((ap, radio))
+        breakdowns: List[Dict[str, object]] = []
+        gpu_device = ""
+        for frequency_key, group_links in grouped.items():
+            ap_rows, terms = RFEngine._inspection_accelerator_ap_rows(
+                x, y, receiver_floor, floors, group_links, self.heatmap_settings,
+                self.antenna_patterns, receiver_z_override,
+            )
+            if ap_rows.size == 0 or len(terms) != len(group_links):
+                continue
+            segments = RFEngine._attenuation_segment_rows_for_floor(receiver_floor, float(frequency_key))
+            gpu_result = gpu_inspect_direct_paths(
+                x, y, ap_rows, segments,
+                float(getattr(self.heatmap_settings, "disconnected_rssi_dbm", -120.0)),
+                self.heatmap_settings,
+            )
+            if gpu_result is None:
+                return None
+            rows, gpu_device = gpu_result
+            if rows.shape[0] != len(group_links):
+                return None
+            for (ap, radio), term, row in zip(group_links, terms, rows):
+                rssi = float(row[0])
+                distance_3d = float(row[1])
+                barrier_loss = max(0.0, float(row[2]))
+                valid = bool(float(row[3]) > 0.5)
+                disconnected = float(getattr(self.heatmap_settings, "disconnected_rssi_dbm", -120.0))
+                if not valid:
+                    breakdowns.append({
+                        "available": False,
+                        "reason": "Receiver is outside the radio cut-off radius.",
+                        "rssi_dbm": disconnected,
+                        "ap": ap,
+                        "radio": radio,
+                        "calculation_note": f"GPU direct-path inspection on {gpu_device}",
+                    })
+                    continue
+                path_loss = RFEngine.distance_path_loss_db(
+                    radio.frequency_mhz, distance_3d, ap.path_loss_exponent, self.heatmap_settings
+                )
+                breakdowns.append({
+                    "available": True,
+                    "rssi_dbm": rssi,
+                    "ap": ap,
+                    "radio": radio,
+                    "geometry": {
+                        "ap_z": float(term["ap_z"]),
+                        "rx_z": float(term["rx_z"]),
+                        "horizontal_d": float(term["horizontal_d"]),
+                        "distance_3d": distance_3d,
+                        "bearing": float(term["bearing"]),
+                        "elevation": float(term["elevation"]),
+                    },
+                    "tx_power_dbm": float(term["tx_power_dbm"]),
+                    "antenna_pattern": str(getattr(radio, "antenna_pattern", "") or ""),
+                    "pattern_gain_dbi": float(term["pattern_gain_dbi"]),
+                    "radio_antenna_gain_dbi": float(term["radio_antenna_gain_dbi"]),
+                    "azimuth_relative_deg": float(term["azimuth_relative_deg"]),
+                    "elevation_relative_deg": float(term["elevation_relative_deg"]),
+                    "path_loss_db": float(path_loss),
+                    "path_loss_model": (
+                        "ITU-R P.525 free-space"
+                        if RFEngine._uses_strict_p525_distance_model(self.heatmap_settings)
+                        else f"ITU-R P.525 at 1 m + log-distance exponent {float(ap.path_loss_exponent):g}"
+                    ),
+                    "walls": [],
+                    "elements": [],
+                    "slabs": [],
+                    "floor_loss_db": float(term["floor_loss_db"]),
+                    "gpu_barrier_loss_db": barrier_loss,
+                    "extra_path_loss_db": 0.0,
+                    "calculation_note": (
+                        f"GPU direct-path inspection on {gpu_device}; CPU formats labels/report. "
+                        "Reflections, diffraction and object-by-object labels use the CPU fallback when required."
+                    ),
+                })
+        if not breakdowns:
+            return None
+        return breakdowns
 
     def show_rssi_loss_calculation_at_point(self, scene_pos: QPointF):
         if self.floor is None:
@@ -19072,11 +20150,31 @@ out tags geom;
                 f"epsr={float(getattr(terrain_model, 'ground_relative_permittivity', 15.0)):g}, "
                 f"sigma={float(getattr(terrain_model, 'ground_conductivity_s_per_m', 0.005)):g} S/m"
             )
+        include_inter_floor = bool(self.include_inter_floor.isChecked()) if hasattr(self, "include_inter_floor") else True
+        breakdowns = self._gpu_rssi_loss_calculation_breakdowns(
+            x, y, receiver_floor, floors, links, receiver_z_override, include_inter_floor
+        )
+        if breakdowns is not None:
+            breakdowns.sort(key=lambda item: float(item.get("rssi_dbm", -999.0)), reverse=True)
+            report = self._format_link_budget_report(x, y, breakdowns, terrain_note)
+            dialog = QDialog(self)
+            dialog.setWindowTitle("RSSI loss calculation")
+            dialog.resize(980, 720)
+            layout = QVBoxLayout(dialog)
+            text = QTextEdit()
+            text.setReadOnly(True)
+            text.setFont(QFont("Consolas", 9))
+            text.setPlainText(report)
+            layout.addWidget(text, 1)
+            buttons = QDialogButtonBox(QDialogButtonBox.Close)
+            buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
+            dialog.exec()
+            return
         wall_indexes = RFEngine._build_wall_indexes(floors)
         opening_indexes = RFEngine._build_opening_indexes(floors)
         geometry_cache: Dict[object, object] = {}
         breakdowns: List[Dict[str, object]] = []
-        include_inter_floor = bool(self.include_inter_floor.isChecked()) if hasattr(self, "include_inter_floor") else True
         for ap, radio in links:
             ground_loss = 0.0
             if (
@@ -20065,6 +21163,8 @@ out tags geom;
                 self.cancel_user_wall_drawing()
             if getattr(self, "space_draw_mode", False) or bool(getattr(self, "_space_polygon_points", [])):
                 self.cancel_space_drawing()
+            if getattr(self, "vegetation_draw_mode", False) or getattr(self, "_vegetation_draw_center", None) is not None:
+                self.cancel_vegetation_drawing()
             if (
                 getattr(self, "boundary_draw_mode", False)
                 or getattr(self, "_boundary_draw_start", None) is not None
@@ -20415,7 +21515,7 @@ out tags geom;
         self.clear_ap_action.setEnabled(not loading)
         self.load_pattern_action.setEnabled(not loading)
         for action_name in (
-            "planner_settings_action", "propagation_settings_action", "predict_aps_action", "bulk_ap_action", "draw_wall_action", "bulk_attenuation_action", "attenuation_review_action", "draw_space_action", "select_ap_spaces_action", "inferred_space_interaction_action",
+            "planner_settings_action", "propagation_settings_action", "predict_aps_action", "bulk_ap_action", "draw_wall_action", "draw_vegetation_action", "bulk_attenuation_action", "attenuation_review_action", "draw_space_action", "select_ap_spaces_action", "inferred_space_interaction_action",
             "draw_boundary_action", "draw_polygon_boundary_action", "suggest_external_boundary_action",
             "create_spaces_action", "clear_inferred_spaces_action", "clear_boundaries_action", "ifc_origin_action", "building_3d_view_action",
             "open_satellite_action", "edit_satellite_action", "align_satellite_action",
@@ -20436,6 +21536,8 @@ out tags geom;
             self.cancel_user_wall_drawing()
         if getattr(self, "space_draw_mode", False) or bool(getattr(self, "_space_polygon_points", [])):
             self.cancel_space_drawing()
+        if getattr(self, "vegetation_draw_mode", False) or getattr(self, "_vegetation_draw_center", None) is not None:
+            self.cancel_vegetation_drawing()
         if (
             getattr(self, "boundary_draw_mode", False)
             or getattr(self, "_boundary_draw_start", None) is not None
@@ -20674,6 +21776,10 @@ out tags geom;
                 element_pen_colour = QColor("#007EA8") if not getattr(self, "dark_theme", False) else QColor("#65D5FF")
                 element_fill_colour = QColor("#72C7E7")
                 element_fill_colour.setAlpha(165)
+            elif element.rf_category == "vegetation":
+                element_pen_colour = QColor("#166534") if not getattr(self, "dark_theme", False) else QColor("#86EFAC")
+                element_fill_colour = QColor("#22C55E")
+                element_fill_colour.setAlpha(105 if getattr(element, "is_user_created", False) else 85)
             elif element.is_rf_barrier:
                 element_pen_colour = QColor("#7C3AED") if not getattr(self, "dark_theme", False) else QColor("#C4B5FD")
                 element_fill_colour = QColor("#A78BFA")
@@ -20872,7 +21978,7 @@ out tags geom;
         )
         image = result.render_cache.get(cache_key)
         if image is None:
-            gpu_raster = gpu_colourise(z, self.heatmap_settings.zones, self.heatmap_settings)
+            gpu_raster = gpu_colourise(z, self.heatmap_settings.zones, self.heatmap_settings, initialize=True)
             if gpu_raster is not None:
                 rgba, gpu_device = gpu_raster
                 result.render_cache[("gpu_raster_device",)] = gpu_device
@@ -21351,15 +22457,16 @@ out tags geom;
             profiles = self.heatmap_settings.default_window_attenuation_by_material_db
         else:
             profiles = self.heatmap_settings.default_ifc_element_attenuation_by_type_db
-            if not element.rf_customised and element.rf_category in profiles:
-                return dict(profiles[element.rf_category])
         override = element.rf_type_override if element.rf_customised else ""
         text = f"{override} {element.rf_category} {element.ifc_class} {element.material} {element.type_name} {element.name}".lower()
         # Prefer the longest matching key so a precise type/material wins over a
-        # broad category such as 'metal' or 'default'.
-        for key in sorted((k for k in profiles if k != "default"), key=len, reverse=True):
+        # broad category such as 'metal' or 'default'. This lets tree canopy,
+        # hedge and woodland presets override the broader vegetation category.
+        for key in sorted((k for k in profiles if k not in {"default", str(element.rf_category).lower()}), key=len, reverse=True):
             if key.lower() in text:
                 return dict(profiles[key])
+        if not element.rf_customised and element.rf_category in profiles:
+            return dict(profiles[element.rf_category])
         return dict(profiles.get("default", {}))
 
     # Backwards-compatible name retained for older call sites/extensions.
@@ -21737,7 +22844,7 @@ out tags geom;
                 "align_ifc_action", "clear_dxf_action", "clear_ap_action",
                 "planner_settings_action", "propagation_settings_action",
                 "performance_settings_action", "predict_aps_action", "bulk_ap_action",
-                "draw_wall_action", "bulk_attenuation_action", "attenuation_review_action", "draw_space_action",
+                "draw_wall_action", "draw_vegetation_action", "bulk_attenuation_action", "attenuation_review_action", "draw_space_action",
                 "select_ap_spaces_action", "inferred_space_interaction_action",
                 "draw_boundary_action", "draw_polygon_boundary_action",
                 "suggest_external_boundary_action", "create_spaces_action",
