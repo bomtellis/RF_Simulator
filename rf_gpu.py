@@ -1070,10 +1070,14 @@ class OpenCLRFAccelerator:
                 dtype = _device_type_name(device)
                 if dtype == "OpenCL CPU" and not self.allow_cpu:
                     continue
-                text = " ".join([str(getattr(platform, "name", "")), str(getattr(device, "vendor", "")), str(getattr(device, "name", "")), dtype]).lower()
-                preferred = self.preference in {"auto", "opencl"} or self.preference in text
+                vendor = str(getattr(device, "vendor", "") or "").strip()
+                name = str(getattr(device, "name", "") or "").strip()
+                token = f"opencl:{stable_index}:{vendor} {name}".lower()
+                short_token = f"opencl:{stable_index}"
+                text = " ".join([token, short_token, str(getattr(platform, "name", "")), vendor, name, dtype]).lower()
+                preferred = self.preference in {"auto", "opencl"} or self.preference == short_token or self.preference in text
                 priority = 0 if dtype == "OpenCL GPU" else (1 if "accelerator" in dtype else 2)
-                candidates.append((0 if preferred else 1, priority, -int(getattr(device, "global_mem_size", 0) or 0), stable_index, device))
+                candidates.append((0 if preferred else 1, priority, stable_index, -int(getattr(device, "global_mem_size", 0) or 0), device))
                 stable_index += 1
         if not candidates:
             raise RuntimeError("No suitable OpenCL GPU/accelerator was found")
@@ -1469,6 +1473,17 @@ _BACKENDS = {}
 _FAILURES = {}
 
 
+class _PreferenceOverride:
+    def __init__(self, settings: Any, preference: str):
+        self._settings = settings
+        self.opencl_device_preference = preference
+
+    def __getattr__(self, name: str) -> Any:
+        if self._settings is None:
+            raise AttributeError(name)
+        return getattr(self._settings, name)
+
+
 def _setting(settings: Any, name: str, default: Any) -> Any:
     return getattr(settings, name, default) if settings is not None else default
 
@@ -1550,6 +1565,38 @@ def get_opencl_backend(settings: Any):
         return None
 
 
+def _backend_signature(backend: Any) -> Tuple[str, str, str, str]:
+    info = getattr(backend, "info", None)
+    return (
+        str(getattr(backend, "backend_name", "")),
+        str(getattr(info, "platform", "")),
+        str(getattr(info, "vendor", "")),
+        str(getattr(info, "name", "")),
+    )
+
+
+def _gpu_backend_candidates(settings: Any):
+    primary = get_opencl_backend(settings)
+    seen = set()
+    if primary is not None:
+        seen.add(_backend_signature(primary))
+        yield primary
+    if _preference(settings) != "auto":
+        return
+    allow_cpu = bool(_setting(settings, "opencl_allow_cpu_device", False))
+    for record in _opencl_device_records(include_cpu=allow_cpu):
+        if record.device_type == "OpenCL CPU":
+            continue
+        backend = get_opencl_backend(_PreferenceOverride(settings, record.token.lower()))
+        if backend is None:
+            continue
+        signature = _backend_signature(backend)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        yield backend
+
+
 def reset_opencl_backends() -> None:
     with _BACKEND_LOCK:
         _BACKENDS.clear()
@@ -1595,18 +1642,24 @@ def _large_enough(settings: Any, work_items: int) -> bool:
 
 
 def _execute_gpu(settings: Any, operation: str, callback):
-    backend = get_opencl_backend(settings)
-    if backend is None:
-        return None
-    try:
-        return callback(backend)
-    except Exception as exc:
-        if _force(settings):
-            raise GPUExecutionError(
-                f"{backend.backend_name} GPU '{backend.info.name}' failed during {operation}; "
-                f"CPU fallback was not used because force-GPU mode is enabled: {type(exc).__name__}: {exc}"
-            ) from exc
-        return None
+    failures = []
+    last_error = None
+    for backend in _gpu_backend_candidates(settings):
+        try:
+            result = callback(backend)
+        except Exception as exc:
+            last_error = exc
+            failures.append(f"{backend.backend_name} GPU '{backend.info.name}': {type(exc).__name__}: {exc}")
+            continue
+        if result is not None:
+            return result
+    if _force(settings) and failures:
+        detail = " | ".join(failures)
+        raise GPUExecutionError(
+            f"All available GPU backends failed during {operation}; "
+            f"CPU fallback was not used because force-GPU mode is enabled: {detail}"
+        ) from last_error
+    return None
 
 
 def gpu_influence_mask(xs: np.ndarray, ys: np.ndarray, links: np.ndarray,

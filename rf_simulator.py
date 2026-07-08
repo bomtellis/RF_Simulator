@@ -187,6 +187,7 @@ except Exception as exc:  # pragma: no cover
 _RF_PROCESS_EXECUTOR: Optional[concurrent.futures.ProcessPoolExecutor] = None
 _RF_PROCESS_EXECUTOR_WORKERS = 0
 _RF_PROCESS_EXECUTOR_LOCK = threading.Lock()
+_RF_ACTIVE_PROCESS_EXECUTORS: List[concurrent.futures.ProcessPoolExecutor] = []
 _RF_WORKER_CONTEXT_CACHE: Dict[str, tuple] = {}
 _RF_WORKER_CONTEXT_ORDER: List[str] = []
 _RF_CONTEXT_FILE_CACHE: Dict[str, str] = {}
@@ -195,15 +196,43 @@ _RF_CONTEXT_FILE_LOCK = threading.Lock()
 _RF_AP_FIELD_CACHE = BoundedLRU(maximum_items=192, maximum_bytes=768 * 1024 * 1024)
 
 
-def _shutdown_rf_process_executor(wait: bool = False) -> None:
+def _terminate_process_pool(executor) -> None:
+    """Best-effort immediate termination for running ProcessPoolExecutor jobs."""
+    if executor is None:
+        return
+    for method_name in ("terminate_workers", "kill_workers"):
+        method = getattr(executor, method_name, None)
+        if callable(method):
+            try:
+                method()
+                return
+            except Exception:
+                pass
+    processes = getattr(executor, "_processes", None)
+    if isinstance(processes, dict):
+        for process in list(processes.values()):
+            try:
+                if process is not None and process.is_alive():
+                    process.terminate()
+            except Exception:
+                pass
+
+
+def _shutdown_rf_process_executor(wait: bool = False, terminate: bool = False) -> None:
     """Stop the reusable RF worker pool. Safe to call repeatedly."""
     global _RF_PROCESS_EXECUTOR, _RF_PROCESS_EXECUTOR_WORKERS
     with _RF_PROCESS_EXECUTOR_LOCK:
+        executors = list(_RF_ACTIVE_PROCESS_EXECUTORS)
         executor = _RF_PROCESS_EXECUTOR
+        if executor is not None and executor not in executors:
+            executors.append(executor)
         _RF_PROCESS_EXECUTOR = None
         _RF_PROCESS_EXECUTOR_WORKERS = 0
-    if executor is not None:
+        _RF_ACTIVE_PROCESS_EXECUTORS.clear()
+    for executor in executors:
         try:
+            if terminate:
+                _terminate_process_pool(executor)
             executor.shutdown(wait=wait, cancel_futures=True)
         except TypeError:
             executor.shutdown(wait=wait)
@@ -225,12 +254,17 @@ def _get_rf_process_executor(max_workers: int, reuse: bool):
     global _RF_PROCESS_EXECUTOR, _RF_PROCESS_EXECUTOR_WORKERS
     max_workers = max(1, int(max_workers))
     if not reuse:
-        return concurrent.futures.ProcessPoolExecutor(max_workers=max_workers), True
+        executor = concurrent.futures.ProcessPoolExecutor(max_workers=max_workers)
+        with _RF_PROCESS_EXECUTOR_LOCK:
+            _RF_ACTIVE_PROCESS_EXECUTORS.append(executor)
+        return executor, True
     with _RF_PROCESS_EXECUTOR_LOCK:
         if _RF_PROCESS_EXECUTOR is not None and _RF_PROCESS_EXECUTOR_WORKERS != max_workers:
             stale = _RF_PROCESS_EXECUTOR
             _RF_PROCESS_EXECUTOR = None
             _RF_PROCESS_EXECUTOR_WORKERS = 0
+            while stale in _RF_ACTIVE_PROCESS_EXECUTORS:
+                _RF_ACTIVE_PROCESS_EXECUTORS.remove(stale)
             try:
                 stale.shutdown(wait=False, cancel_futures=True)
             except TypeError:
@@ -240,6 +274,7 @@ def _get_rf_process_executor(max_workers: int, reuse: bool):
         if _RF_PROCESS_EXECUTOR is None:
             _RF_PROCESS_EXECUTOR = concurrent.futures.ProcessPoolExecutor(max_workers=max_workers)
             _RF_PROCESS_EXECUTOR_WORKERS = max_workers
+            _RF_ACTIVE_PROCESS_EXECUTORS.append(_RF_PROCESS_EXECUTOR)
         return _RF_PROCESS_EXECUTOR, False
 
 
@@ -1217,13 +1252,24 @@ class HeatmapSettings:
         def _freq_dict(raw, fallback):
             if not isinstance(raw, dict):
                 return fallback
-            return {float(k): float(v) for k, v in raw.items()}
+            merged = dict(fallback)
+            merged.update({float(k): float(v) for k, v in raw.items()})
+            return merged
+        raw_preset_defaults = data.get("rf_preset_defaults", {})
+        if not isinstance(raw_preset_defaults, dict):
+            raw_preset_defaults = {}
         settings.ap_cutoff_radius_by_frequency_m = _freq_dict(
             data.get("ap_cutoff_radius_by_frequency_m", data.get("ap_cutoff_radius_by_frequency", {})),
             settings.ap_cutoff_radius_by_frequency_m,
         )
         settings.default_floor_attenuation_by_frequency_db = _freq_dict(
-            data.get("default_floor_attenuation_by_frequency_db", data.get("floor_attenuation_by_frequency_db", {})),
+            data.get(
+                "default_floor_attenuation_by_frequency_db",
+                data.get(
+                    "floor_attenuation_by_frequency_db",
+                    raw_preset_defaults.get("default_floor_attenuation_by_frequency_db", {}),
+                ),
+            ),
             settings.default_floor_attenuation_by_frequency_db,
         )
         settings.enable_synthetic_floor_entities = bool(data.get(
@@ -1237,33 +1283,58 @@ class HeatmapSettings:
                 data.get("floor_entity_thickness_m", settings.synthetic_floor_entity_thickness_m),
             ))),
         )
-        raw_materials = data.get("default_wall_attenuation_by_material_db", data.get("wall_attenuation_by_material_db", {}))
-        if isinstance(raw_materials, dict):
-            parsed = {}
-            for mat, profile in raw_materials.items():
-                if isinstance(profile, dict):
-                    parsed[str(mat).lower()] = {float(k): float(v) for k, v in profile.items()}
-            if parsed:
-                settings.default_wall_attenuation_by_material_db = parsed
+        preset_defaults = raw_preset_defaults
+
         def _material_profile_dict(raw, fallback):
             if not isinstance(raw, dict):
                 return fallback
-            parsed_profiles = {}
+            parsed_profiles = dict(fallback)
             for material_name, profile in raw.items():
                 if isinstance(profile, dict):
-                    parsed_profiles[str(material_name).lower()] = {float(k): float(v) for k, v in profile.items()}
-            return parsed_profiles or fallback
+                    parsed_profiles[str(material_name).strip().lower()] = {
+                        float(k): float(v) for k, v in profile.items()
+                    }
+            return parsed_profiles
+
+        settings.default_wall_attenuation_by_material_db = _material_profile_dict(
+            data.get(
+                "default_wall_attenuation_by_material_db",
+                data.get(
+                    "wall_attenuation_by_material_db",
+                    preset_defaults.get("default_wall_attenuation_by_material_db", {}),
+                ),
+            ),
+            settings.default_wall_attenuation_by_material_db,
+        )
 
         settings.default_door_attenuation_by_material_db = _material_profile_dict(
-            data.get("default_door_attenuation_by_material_db", data.get("door_attenuation_by_material_db", {})),
+            data.get(
+                "default_door_attenuation_by_material_db",
+                data.get(
+                    "door_attenuation_by_material_db",
+                    preset_defaults.get("default_door_attenuation_by_material_db", {}),
+                ),
+            ),
             settings.default_door_attenuation_by_material_db,
         )
         settings.default_window_attenuation_by_material_db = _material_profile_dict(
-            data.get("default_window_attenuation_by_material_db", data.get("window_attenuation_by_material_db", {})),
+            data.get(
+                "default_window_attenuation_by_material_db",
+                data.get(
+                    "window_attenuation_by_material_db",
+                    preset_defaults.get("default_window_attenuation_by_material_db", {}),
+                ),
+            ),
             settings.default_window_attenuation_by_material_db,
         )
         settings.default_ifc_element_attenuation_by_type_db = _material_profile_dict(
-            data.get("default_ifc_element_attenuation_by_type_db", data.get("ifc_element_attenuation_by_type_db", {})),
+            data.get(
+                "default_ifc_element_attenuation_by_type_db",
+                data.get(
+                    "ifc_element_attenuation_by_type_db",
+                    preset_defaults.get("default_ifc_element_attenuation_by_type_db", {}),
+                ),
+            ),
             settings.default_ifc_element_attenuation_by_type_db,
         )
         raw_radios = data.get("default_ap_radios", settings.default_ap_radios)
@@ -4600,6 +4671,7 @@ class RFEngine:
         threshold = int(getattr(heatmap_settings, "rf_multiprocessing_min_points", 5000) if heatmap_settings else 5000)
         fallback_note = ""
         geometry_floors = floors if include_inter_floor else {str(floor.name): floor}
+        cancel_event = getattr(heatmap_settings, "_cancel_event", None) if heatmap_settings is not None else None
 
         if use_mp and work_units >= threshold and rows > 1:
             requested = int(getattr(heatmap_settings, "max_rf_worker_processes", 0) or 0)
@@ -4647,41 +4719,55 @@ class RFEngine:
                 futures = [executor.submit(_rf_grid_multi_tile_worker, job) for job in jobs]
                 completed_rows = 0
                 next_progressive = max(5, int(getattr(heatmap_settings, "progressive_update_percent", 20)))
-                for future in concurrent.futures.as_completed(futures):
-                    start_index, row_count, tile_results = future.result()
-                    if not use_shared and tile_results is not None:
-                        for key, (tile, delay_tile, count_tile) in tile_results.items():
-                            grids[key][start_index:start_index + row_count, :] = tile
-                            delays[key][start_index:start_index + row_count, :] = delay_tile
-                            counts[key][start_index:start_index + row_count, :] = count_tile
-                    completed_rows += int(row_count)
-                    if progress_callback:
-                        progress_callback(min(completed_rows, rows), rows)
-                    percent = int(100.0 * completed_rows / max(1, rows))
-                    if progressive_callback and bool(getattr(heatmap_settings, "progressive_heatmap_updates", True)) and percent >= next_progressive:
-                        if use_shared:
-                            preview = {
-                                key: SimulationResult(
-                                    xs=xs, ys=ys, rssi=rssi_stack[index].copy(),
-                                    delay_spread_ns=delay_stack[index].copy(), path_count=count_stack[index].copy(),
-                                    valid_mask=None if boundary_mask is None else boundary_mask.copy(),
-                                    boundary_geometry=calculation_boundary, ignored_point_count=ignored,
-                                    execution_mode="multiprocess-progressive", worker_processes=process_count,
-                                    progressive_fraction=min(0.99, completed_rows / max(1, rows)),
-                                ) for index, key in enumerate(group_order)
-                            }
-                        else:
-                            preview = {
-                                key: SimulationResult(
-                                    xs=xs, ys=ys, rssi=grids[key].copy(), delay_spread_ns=delays[key].copy(),
-                                    path_count=counts[key].copy(), valid_mask=None if boundary_mask is None else boundary_mask.copy(),
-                                    boundary_geometry=calculation_boundary, ignored_point_count=ignored,
-                                    execution_mode="multiprocess-progressive", worker_processes=process_count,
-                                    progressive_fraction=min(0.99, completed_rows / max(1, rows)),
-                                ) for key in group_order
-                            }
-                        progressive_callback(preview, completed_rows / max(1, rows))
-                        next_progressive += max(5, int(getattr(heatmap_settings, "progressive_update_percent", 20)))
+                pending_futures = set(futures)
+                while pending_futures:
+                    if cancel_event is not None and cancel_event.is_set():
+                        for pending in futures:
+                            pending.cancel()
+                        _shutdown_rf_process_executor(wait=False, terminate=True)
+                        raise RuntimeError("RSSI calculation cancelled")
+                    done_futures, pending_futures = concurrent.futures.wait(
+                        pending_futures,
+                        timeout=0.10,
+                        return_when=concurrent.futures.FIRST_COMPLETED,
+                    )
+                    if not done_futures:
+                        continue
+                    for future in done_futures:
+                        start_index, row_count, tile_results = future.result()
+                        if not use_shared and tile_results is not None:
+                            for key, (tile, delay_tile, count_tile) in tile_results.items():
+                                grids[key][start_index:start_index + row_count, :] = tile
+                                delays[key][start_index:start_index + row_count, :] = delay_tile
+                                counts[key][start_index:start_index + row_count, :] = count_tile
+                        completed_rows += int(row_count)
+                        if progress_callback:
+                            progress_callback(min(completed_rows, rows), rows)
+                        percent = int(100.0 * completed_rows / max(1, rows))
+                        if progressive_callback and bool(getattr(heatmap_settings, "progressive_heatmap_updates", True)) and percent >= next_progressive:
+                            if use_shared:
+                                preview = {
+                                    key: SimulationResult(
+                                        xs=xs, ys=ys, rssi=rssi_stack[index].copy(),
+                                        delay_spread_ns=delay_stack[index].copy(), path_count=count_stack[index].copy(),
+                                        valid_mask=None if boundary_mask is None else boundary_mask.copy(),
+                                        boundary_geometry=calculation_boundary, ignored_point_count=ignored,
+                                        execution_mode="multiprocess-progressive", worker_processes=process_count,
+                                        progressive_fraction=min(0.99, completed_rows / max(1, rows)),
+                                    ) for index, key in enumerate(group_order)
+                                }
+                            else:
+                                preview = {
+                                    key: SimulationResult(
+                                        xs=xs, ys=ys, rssi=grids[key].copy(), delay_spread_ns=delays[key].copy(),
+                                        path_count=counts[key].copy(), valid_mask=None if boundary_mask is None else boundary_mask.copy(),
+                                        boundary_geometry=calculation_boundary, ignored_point_count=ignored,
+                                        execution_mode="multiprocess-progressive", worker_processes=process_count,
+                                        progressive_fraction=min(0.99, completed_rows / max(1, rows)),
+                                    ) for key in group_order
+                                }
+                            progressive_callback(preview, completed_rows / max(1, rows))
+                            next_progressive += max(5, int(getattr(heatmap_settings, "progressive_update_percent", 20)))
                 if use_shared:
                     for index, key in enumerate(group_order):
                         grids[key] = rssi_stack[index].copy()
@@ -4707,7 +4793,13 @@ class RFEngine:
                     ) for key in group_order
                 }
             except Exception as exc:
-                if "cancel" in str(exc).lower():
+                if (cancel_event is not None and cancel_event.is_set()) or "cancel" in str(exc).lower():
+                    for pending in locals().get("futures", []):
+                        try:
+                            pending.cancel()
+                        except Exception:
+                            pass
+                    _shutdown_rf_process_executor(wait=False, terminate=True)
                     raise
                 _shutdown_rf_process_executor(wait=False)
                 fallback_note = f"RF multiprocessing failed ({type(exc).__name__}: {exc}); used single-process fallback."
@@ -4718,7 +4810,13 @@ class RFEngine:
                     try: memory.unlink()
                     except Exception: pass
                 if 'owned' in locals() and owned and 'executor' in locals():
-                    try: executor.shutdown(wait=True)
+                    with _RF_PROCESS_EXECUTOR_LOCK:
+                        while executor in _RF_ACTIVE_PROCESS_EXECUTORS:
+                            _RF_ACTIVE_PROCESS_EXECUTORS.remove(executor)
+                    try: executor.shutdown(wait=not (cancel_event is not None and cancel_event.is_set()), cancel_futures=True)
+                    except TypeError:
+                        try: executor.shutdown(wait=not (cancel_event is not None and cancel_event.is_set()))
+                        except Exception: pass
                     except Exception: pass
 
         wall_indexes = RFEngine._build_wall_indexes(geometry_floors)
@@ -4726,7 +4824,6 @@ class RFEngine:
         reflection_indexes = RFEngine._build_reflection_indexes(geometry_floors, heatmap_settings)
         if progress_callback:
             progress_callback(0, rows)
-        cancel_event = getattr(heatmap_settings, "_cancel_event", None) if heatmap_settings is not None else None
         for iy, yy in enumerate(ys):
             if cancel_event is not None and cancel_event.is_set():
                 raise RuntimeError("RSSI calculation cancelled")
@@ -8807,6 +8904,282 @@ class RadioProfileManagerDialog(QDialog):
         super().accept()
 
 
+class RFPresetEditorDialog(QDialog):
+    CATEGORIES = [
+        ("wall", "Wall materials/types", "default_wall_attenuation_by_material_db"),
+        ("door", "Door materials/types", "default_door_attenuation_by_material_db"),
+        ("window", "Window materials/types", "default_window_attenuation_by_material_db"),
+        ("ifc", "Generic IFC elements", "default_ifc_element_attenuation_by_type_db"),
+        ("floor", "Floor/slab loss", "default_floor_attenuation_by_frequency_db"),
+    ]
+
+    def __init__(self, parent, settings: HeatmapSettings, frequencies: Sequence[float], settings_path: Optional[Path] = None):
+        super().__init__(parent)
+        self.setWindowTitle("RF preset editor")
+        self.resize(980, 620)
+        self._settings_path = Path(settings_path) if settings_path else None
+        self._frequencies = sorted({float(value) for value in frequencies})
+        self._profiles: Dict[str, object] = self._copy_profiles(settings)
+        self._active_category = ""
+        self._active_preset = ""
+        self._loading = False
+
+        layout = QVBoxLayout(self)
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Preset category"))
+        self.category_combo = QComboBox()
+        for key, label, _attr in self.CATEGORIES:
+            self.category_combo.addItem(label, key)
+        top.addWidget(self.category_combo, 1)
+        layout.addLayout(top)
+
+        columns = QHBoxLayout()
+        layout.addLayout(columns, 1)
+
+        left = QVBoxLayout()
+        left.addWidget(QLabel("Presets"))
+        self.preset_list = QListWidget()
+        self.preset_list.setAlternatingRowColors(True)
+        left.addWidget(self.preset_list, 1)
+        preset_buttons = QHBoxLayout()
+        add_preset = QPushButton("Add")
+        duplicate_preset = QPushButton("Duplicate")
+        delete_preset = QPushButton("Delete")
+        preset_buttons.addWidget(add_preset)
+        preset_buttons.addWidget(duplicate_preset)
+        preset_buttons.addWidget(delete_preset)
+        left.addLayout(preset_buttons)
+        columns.addLayout(left, 1)
+
+        right = QVBoxLayout()
+        right.addWidget(QLabel("Attenuation by frequency"))
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["Frequency MHz", "Loss dB"])
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
+        right.addWidget(self.table, 1)
+        self.floor_note = QLabel("Floor/slab loss uses one default profile, so the preset list is locked to 'default'.")
+        self.floor_note.setWordWrap(True)
+        right.addWidget(self.floor_note)
+        columns.addLayout(right, 2)
+
+        self.save_global_defaults = QCheckBox("Also save these presets to the loaded heatmap settings JSON")
+        self.save_global_defaults.setEnabled(self._settings_path is not None)
+        layout.addWidget(self.save_global_defaults)
+
+        add_preset.clicked.connect(self._add_preset)
+        duplicate_preset.clicked.connect(self._duplicate_preset)
+        delete_preset.clicked.connect(self._delete_preset)
+        self.category_combo.currentIndexChanged.connect(self._category_changed)
+        self.preset_list.currentItemChanged.connect(self._preset_item_changed)
+        self.preset_list.itemChanged.connect(self._preset_name_changed)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self._category_changed()
+
+    @classmethod
+    def _copy_profiles(cls, settings: HeatmapSettings) -> Dict[str, object]:
+        data: Dict[str, object] = {}
+        for key, _label, attr in cls.CATEGORIES:
+            value = getattr(settings, attr)
+            if key == "floor":
+                data[key] = {float(band): float(loss) for band, loss in dict(value).items()}
+            else:
+                data[key] = {
+                    str(name).strip().lower(): {float(band): float(loss) for band, loss in dict(profile).items()}
+                    for name, profile in dict(value).items()
+                    if str(name).strip() and isinstance(profile, dict)
+                }
+        return data
+
+    def _current_category(self) -> str:
+        return str(self.category_combo.currentData() or "wall")
+
+    def _category_profiles(self, category: Optional[str] = None) -> Dict[str, Dict[float, float]]:
+        category = str(category or self._current_category())
+        if category == "floor":
+            return {"default": dict(self._profiles.get("floor", {}))}
+        value = self._profiles.get(category, {})
+        return value if isinstance(value, dict) else {}
+
+    def _set_category_profiles(self, category: str, profiles: Dict[str, Dict[float, float]]):
+        category = str(category or self._current_category())
+        if category == "floor":
+            self._profiles["floor"] = dict(profiles.get("default", {}))
+        else:
+            self._profiles[category] = {
+                str(name).strip().lower(): {float(band): float(loss) for band, loss in profile.items()}
+                for name, profile in profiles.items()
+                if str(name).strip()
+            }
+
+    def _table_profile(self) -> Dict[float, float]:
+        profile: Dict[float, float] = {}
+        for row in range(self.table.rowCount()):
+            try:
+                band = float(self.table.item(row, 0).data(Qt.UserRole))
+                loss = float(self.table.item(row, 1).text())
+            except Exception:
+                continue
+            profile[band] = max(0.0, loss)
+        return profile
+
+    def _save_active_profile(self):
+        if self._loading or not self._active_category or not self._active_preset:
+            return
+        profiles = self._category_profiles(self._active_category)
+        profiles[self._active_preset] = self._table_profile()
+        self._set_category_profiles(self._active_category, profiles)
+
+    def _category_changed(self, *_):
+        self._save_active_profile()
+        category = self._current_category()
+        self._active_category = category
+        self._active_preset = ""
+        profiles = self._category_profiles(category)
+        if not profiles:
+            profiles["default"] = {band: 0.0 for band in self._frequencies}
+            self._set_category_profiles(category, profiles)
+
+        self._loading = True
+        try:
+            self.preset_list.clear()
+            for name in sorted(profiles):
+                item = QListWidgetItem(str(name))
+                if category != "floor":
+                    item.setFlags(item.flags() | Qt.ItemIsEditable)
+                item.setData(Qt.UserRole, str(name))
+                self.preset_list.addItem(item)
+            self.floor_note.setVisible(category == "floor")
+            if self.preset_list.count():
+                self.preset_list.setCurrentRow(0)
+        finally:
+            self._loading = False
+        self._load_selected_preset()
+
+    def _preset_item_changed(self, current: Optional[QListWidgetItem], previous: Optional[QListWidgetItem]):
+        if self._loading:
+            return
+        self._save_active_profile()
+        self._load_selected_preset()
+
+    def _preset_name_changed(self, item: QListWidgetItem):
+        if self._loading or self._current_category() == "floor":
+            return
+        old_name = str(item.data(Qt.UserRole) or "").strip().lower()
+        new_name = str(item.text() or "").strip().lower()
+        if not new_name:
+            item.setText(old_name or "default")
+            return
+        profiles = self._category_profiles()
+        if new_name != old_name and new_name in profiles:
+            QMessageBox.warning(self, "Preset exists", f"A preset named '{new_name}' already exists.")
+            item.setText(old_name)
+            return
+        if old_name and old_name in profiles:
+            profiles[new_name] = profiles.pop(old_name)
+        else:
+            profiles.setdefault(new_name, {band: 0.0 for band in self._frequencies})
+        item.setData(Qt.UserRole, new_name)
+        self._active_preset = new_name
+        self._set_category_profiles(self._current_category(), profiles)
+
+    def _load_selected_preset(self):
+        item = self.preset_list.currentItem()
+        self.table.setRowCount(0)
+        if item is None:
+            return
+        category = self._current_category()
+        name = str(item.data(Qt.UserRole) or item.text()).strip().lower()
+        self._active_category = category
+        self._active_preset = name
+        profile = self._category_profiles(category).get(name, {})
+        for band in self._frequencies:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            band_item = QTableWidgetItem(f"{band:g}")
+            band_item.setData(Qt.UserRole, float(band))
+            band_item.setFlags(band_item.flags() & ~Qt.ItemIsEditable)
+            self.table.setItem(row, 0, band_item)
+            self.table.setItem(row, 1, QTableWidgetItem(f"{float(profile.get(float(band), 0.0)):.3f}"))
+        self.table.resizeColumnsToContents()
+
+    def _unique_name(self, base: str, profiles: Dict[str, Dict[float, float]]) -> str:
+        base = str(base or "new preset").strip().lower() or "new preset"
+        if base not in profiles:
+            return base
+        suffix = 2
+        while f"{base} {suffix}" in profiles:
+            suffix += 1
+        return f"{base} {suffix}"
+
+    def _add_preset(self):
+        self._save_active_profile()
+        category = self._current_category()
+        if category == "floor":
+            return
+        profiles = self._category_profiles(category)
+        name = self._unique_name("new preset", profiles)
+        profiles[name] = {band: 0.0 for band in self._frequencies}
+        self._set_category_profiles(category, profiles)
+        self._category_changed()
+        matches = self.preset_list.findItems(name, Qt.MatchExactly)
+        if matches:
+            self.preset_list.setCurrentItem(matches[0])
+
+    def _duplicate_preset(self):
+        self._save_active_profile()
+        category = self._current_category()
+        item = self.preset_list.currentItem()
+        if category == "floor" or item is None:
+            return
+        profiles = self._category_profiles(category)
+        source = str(item.data(Qt.UserRole) or item.text()).strip().lower()
+        name = self._unique_name(f"{source} copy", profiles)
+        profiles[name] = dict(profiles.get(source, {}))
+        self._set_category_profiles(category, profiles)
+        self._category_changed()
+        matches = self.preset_list.findItems(name, Qt.MatchExactly)
+        if matches:
+            self.preset_list.setCurrentItem(matches[0])
+
+    def _delete_preset(self):
+        self._save_active_profile()
+        category = self._current_category()
+        item = self.preset_list.currentItem()
+        if category == "floor" or item is None:
+            return
+        name = str(item.data(Qt.UserRole) or item.text()).strip().lower()
+        if name == "default":
+            QMessageBox.information(self, "Default preset", "The default preset cannot be deleted.")
+            return
+        profiles = self._category_profiles(category)
+        profiles.pop(name, None)
+        if not profiles:
+            profiles["default"] = {band: 0.0 for band in self._frequencies}
+        self._set_category_profiles(category, profiles)
+        self._category_changed()
+
+    def accept(self):
+        self._save_active_profile()
+        for category in ("wall", "door", "window", "ifc"):
+            profiles = self._category_profiles(category)
+            if "default" not in profiles:
+                QMessageBox.warning(self, "Missing default", "Each preset category must include a 'default' preset.")
+                return
+        super().accept()
+
+    def apply_to(self, settings: HeatmapSettings):
+        settings.default_wall_attenuation_by_material_db = copy.deepcopy(self._profiles["wall"])
+        settings.default_door_attenuation_by_material_db = copy.deepcopy(self._profiles["door"])
+        settings.default_window_attenuation_by_material_db = copy.deepcopy(self._profiles["window"])
+        settings.default_ifc_element_attenuation_by_type_db = copy.deepcopy(self._profiles["ifc"])
+        settings.default_floor_attenuation_by_frequency_db = copy.deepcopy(self._profiles["floor"])
+
+
 class PDFExportSelectionDialog(QDialog):
     """Choose the floors and active RF frequencies included in a PDF report."""
 
@@ -11338,6 +11711,7 @@ class MainWindow(QMainWindow):
         self._rssi_calculation_poll_timer.timeout.connect(self._poll_rssi_calculation)
         self._rssi_calculation_progress_dialog: Optional[QProgressDialog] = None
         self._rssi_calculation_cancel_event: Optional[threading.Event] = None
+        self._rssi_calculation_cancel_requested: bool = False
         self._rssi_calculation_state_lock = threading.Lock()
         self._rssi_calculation_progress_state: Dict[str, object] = {
             "done": 0, "total": 1, "label": "Preparing RSSI calculation..."
@@ -11583,6 +11957,8 @@ class MainWindow(QMainWindow):
         self.load_pattern_action.triggered.connect(self.load_pattern_csv)
         self.manage_radio_profiles_action = QAction("Manage radio profiles", self)
         self.manage_radio_profiles_action.triggered.connect(self.show_radio_profile_manager)
+        self.edit_rf_presets_action = QAction("RF preset editor", self)
+        self.edit_rf_presets_action.triggered.connect(self.show_rf_preset_editor)
         self.load_heatmap_settings_action = QAction("Load heatmap settings", self)
         self.load_heatmap_settings_action.triggered.connect(self.load_heatmap_settings)
         self.propagation_settings_action = QAction("Propagation model", self)
@@ -12469,6 +12845,10 @@ out tags geom;
                 "Manage radio profiles", "Add, duplicate, delete and edit AP radio profiles used by manual and predictive AP placement.",
                 "SP_FileDialogDetailedView", ""
             ),
+            "edit_rf_presets_action": (
+                "RF preset editor", "Edit default RF attenuation presets for walls, doors, windows, IFC elements and floor/slab loss, or add custom presets.",
+                "SP_FileDialogDetailedView", ""
+            ),
             "load_heatmap_settings_action": (
                 "Load display settings", "Load RF heatmap, colour, IFC and rendering settings from JSON.",
                 "SP_ComputerIcon", ""
@@ -12661,7 +13041,7 @@ out tags geom;
             ("View orientation", ["rotate_left_action", "rotate_right_action", "reset_rotation_action"]),
         ]), "Model and view")
         ribbon.addTab(self._make_ribbon_page([
-            ("RF obstructions", ["draw_wall_action", "bulk_attenuation_action", "attenuation_review_action"]),
+            ("RF obstructions", ["draw_wall_action", "edit_rf_presets_action", "bulk_attenuation_action", "attenuation_review_action"]),
             ("Space creation", ["draw_space_action", "create_spaces_action"]),
             ("Space interaction", ["inferred_space_interaction_action", "select_ap_spaces_action", "clear_inferred_spaces_action"]),
             ("Permitted planning area", ["draw_boundary_action", "draw_polygon_boundary_action", "suggest_external_boundary_action", "clear_boundaries_action"]),
@@ -15280,6 +15660,93 @@ out tags geom;
                 presets[label] = {float(key): float(value) for key, value in profile.items()}
         return presets
 
+    def _rf_preset_defaults_dict(self) -> Dict[str, object]:
+        def profile_block(profiles: Dict[str, Dict[float, float]]) -> Dict[str, Dict[str, float]]:
+            return {
+                str(name): {str(float(band)): float(loss) for band, loss in dict(profile).items()}
+                for name, profile in dict(profiles).items()
+            }
+        return {
+            "default_floor_attenuation_by_frequency_db": {
+                str(float(band)): float(loss)
+                for band, loss in dict(self.heatmap_settings.default_floor_attenuation_by_frequency_db).items()
+            },
+            "default_wall_attenuation_by_material_db": profile_block(self.heatmap_settings.default_wall_attenuation_by_material_db),
+            "default_door_attenuation_by_material_db": profile_block(self.heatmap_settings.default_door_attenuation_by_material_db),
+            "default_window_attenuation_by_material_db": profile_block(self.heatmap_settings.default_window_attenuation_by_material_db),
+            "default_ifc_element_attenuation_by_type_db": profile_block(self.heatmap_settings.default_ifc_element_attenuation_by_type_db),
+        }
+
+    def _apply_rf_preset_defaults_dict(self, data: Dict[str, object]):
+        def material_profiles(raw: object, fallback: Dict[str, Dict[float, float]]) -> Dict[str, Dict[float, float]]:
+            if not isinstance(raw, dict):
+                return fallback
+            parsed: Dict[str, Dict[float, float]] = {}
+            for name, profile in raw.items():
+                if isinstance(profile, dict):
+                    parsed[str(name).strip().lower()] = {float(band): float(loss) for band, loss in profile.items()}
+            return parsed or fallback
+
+        floor_raw = data.get("default_floor_attenuation_by_frequency_db")
+        if isinstance(floor_raw, dict):
+            self.heatmap_settings.default_floor_attenuation_by_frequency_db = {
+                float(band): float(loss) for band, loss in floor_raw.items()
+            }
+        self.heatmap_settings.default_wall_attenuation_by_material_db = material_profiles(
+            data.get("default_wall_attenuation_by_material_db"),
+            self.heatmap_settings.default_wall_attenuation_by_material_db,
+        )
+        self.heatmap_settings.default_door_attenuation_by_material_db = material_profiles(
+            data.get("default_door_attenuation_by_material_db"),
+            self.heatmap_settings.default_door_attenuation_by_material_db,
+        )
+        self.heatmap_settings.default_window_attenuation_by_material_db = material_profiles(
+            data.get("default_window_attenuation_by_material_db"),
+            self.heatmap_settings.default_window_attenuation_by_material_db,
+        )
+        self.heatmap_settings.default_ifc_element_attenuation_by_type_db = material_profiles(
+            data.get("default_ifc_element_attenuation_by_type_db"),
+            self.heatmap_settings.default_ifc_element_attenuation_by_type_db,
+        )
+
+    def _save_rf_preset_defaults(self, path: Path):
+        path = Path(path)
+        data: Dict[str, object] = {}
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if isinstance(loaded, dict):
+                data = loaded
+        data.update(self._rf_preset_defaults_dict())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+        self.heatmap_settings_path = path
+
+    def show_rf_preset_editor(self):
+        dialog = RFPresetEditorDialog(
+            self,
+            self.heatmap_settings,
+            self._frequency_bands(),
+            settings_path=self.heatmap_settings_path,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        dialog.apply_to(self.heatmap_settings)
+        self._apply_frequency_settings_to_model(replace_existing=False)
+        self._load_slab_attenuation_to_ui()
+        self._configure_wall_table_headers()
+        self.populate_wall_table()
+        saved_text = ""
+        if dialog.save_global_defaults.isChecked() and self.heatmap_settings_path is not None:
+            try:
+                self._save_rf_preset_defaults(self.heatmap_settings_path)
+                saved_text = f" Saved to {self.heatmap_settings_path.name}."
+            except Exception as exc:
+                QMessageBox.warning(self, "RF preset save failed", str(exc))
+        self.statusBar().showMessage(f"RF presets updated.{saved_text}")
+
     def show_bulk_ifc_attenuation(self):
         groups = self._attenuation_groups()
         if not groups:
@@ -17594,6 +18061,7 @@ out tags geom;
                 str(floor): [float(value) for value in extent]
                 for floor, extent in sorted(getattr(self, "rssi_calculation_extents", {}).items())
             },
+            "rf_preset_defaults": self._rf_preset_defaults_dict(),
             "auto_planner_settings": self.auto_planner_settings.to_dict(),
             "custom_radio_profiles": copy.deepcopy(getattr(self.heatmap_settings, "custom_radio_profiles", {})),
             "propagation_model": self.heatmap_settings.propagation_model_dict(),
@@ -17965,6 +18433,10 @@ out tags geom;
                     continue
                 if maxx > minx and maxy > miny:
                     self.rssi_calculation_extents[str(floor_name)] = (minx, miny, maxx, maxy)
+        preset_defaults = data.get("rf_preset_defaults", {})
+        if isinstance(preset_defaults, dict):
+            self._apply_rf_preset_defaults_dict(preset_defaults)
+            self._apply_frequency_settings_to_model(replace_existing=True)
         alignment_data = data.get("ifc_alignment", {}) or {}
         try:
             target_alignment = AlignmentTransform(
@@ -18778,7 +19250,8 @@ out tags geom;
         return max(1.0, float(configured_size))
 
     def _add_upright_text(self, scene: QGraphicsScene, text: str, x: float, y: float, colour: QColor,
-                          font_size: int, z_value: float, bold: bool = False, rotation_deg: float = 0.0):
+                          font_size: int, z_value: float, bold: bool = False, rotation_deg: float = 0.0,
+                          max_width: Optional[float] = None, max_height: Optional[float] = None):
         """Add model-scaled text that zooms with the plan but remains upright.
 
         The view uses ``scale(1, -1)`` so normal text would be mirrored/upside
@@ -18791,7 +19264,20 @@ out tags geom;
         font = QFont(QApplication.font())
         font.setPointSizeF(self._font_point_size(font_size))
         font.setBold(bool(bold))
+        scale = max(0.001, float(getattr(self.heatmap_settings, "text_model_scale", 0.035)))
         item.setFont(font)
+        rect = item.boundingRect()
+        width_limit = float(max_width) if max_width is not None else None
+        height_limit = float(max_height) if max_height is not None else None
+        if rect.width() > 0.0 and rect.height() > 0.0 and (width_limit is not None or height_limit is not None):
+            fit = 1.0
+            if width_limit is not None:
+                fit = min(fit, max(0.05, width_limit) / max(0.001, rect.width() * scale))
+            if height_limit is not None:
+                fit = min(fit, max(0.05, height_limit) / max(0.001, rect.height() * scale))
+            if fit < 1.0:
+                font.setPointSizeF(max(1.0, self._font_point_size(font_size) * fit * 0.92))
+                item.setFont(font)
         item.setBrush(QBrush(colour))
         item.setZValue(z_value)
         item.setFlag(QGraphicsItem.ItemIsSelectable, False)
@@ -18799,7 +19285,6 @@ out tags geom;
         scene.addItem(item)
 
         rect = item.boundingRect()
-        scale = max(0.001, float(getattr(self.heatmap_settings, "text_model_scale", 0.035)))
         angle = self._normalise_text_angle(rotation_deg)
 
         # Build a local transform about the text centre:
@@ -20161,10 +20646,14 @@ out tags geom;
                     label += " (user)"
                 if space.ap_planning_selected:
                     label += " [AP]"
+                minx, miny, maxx, maxy = space.polygon.bounds
+                label_width = max(0.25, float(maxx) - float(minx)) * 0.82
+                label_height = max(0.20, float(maxy) - float(miny)) * 0.55
                 self._add_upright_text(
                     scene, label, cx, cy,
                     QColor("#B45309") if space.ap_planning_selected else (QColor("#007A5A") if space.is_inferred else (QColor("#1D4ED8") if space.is_user_created else colours["space_text"])),
-                    self.heatmap_settings.space_label_font_size, Z_TEXT, bold=True
+                    self.heatmap_settings.space_label_font_size, Z_TEXT, bold=True,
+                    max_width=label_width, max_height=label_height,
                 )
 
         generic_element_pen_colour = QColor("#526D82") if not getattr(self, "dark_theme", False) else QColor("#88A6BC")
@@ -20238,7 +20727,7 @@ out tags geom;
         visible_aps = [a for a in self.aps if a.floor == self.floor.name or self.include_inter_floor.isChecked()]
         for ap in visible_aps:
             same_floor = ap.floor == self.floor.name
-            radius = 0.75 if same_floor else 0.45
+            radius = 0.48 if same_floor else 0.30
             colour = colours["ap_same_floor"] if same_floor else colours["ap_other_floor"]
 
             if same_floor:
@@ -20277,7 +20766,7 @@ out tags geom;
                     dot.add_move_follower(cut_item)
 
             # Keep the boresight arrow parented to the AP symbol so it follows live drag movement.
-            length = 5.0 if same_floor else 3.0
+            length = 3.2 if same_floor else 2.0
             ang = math.radians(ap.azimuth_deg)
             arrow_path = QPainterPath(QPointF(0.0, 0.0))
             arrow_path.lineTo(length * math.cos(ang), length * math.sin(ang))
@@ -21286,19 +21775,43 @@ out tags geom;
                     pass
 
     def _cancel_rssi_calculation(self):
+        if self._rssi_calculation_cancel_requested:
+            return
+        self._rssi_calculation_cancel_requested = True
         event = self._rssi_calculation_cancel_event
         if event is not None:
             event.set()
         future = self._rssi_calculation_future
-        if future is not None and not future.running():
-            future.cancel()
+        if future is not None and not future.done():
+            try:
+                future.set_exception(RuntimeError("RSSI calculation cancelled"))
+            except Exception:
+                try:
+                    future.cancel()
+                except Exception:
+                    pass
+        threading.Thread(
+            target=lambda: _shutdown_rf_process_executor(wait=False, terminate=True),
+            name="rf-cancel-worker-shutdown",
+            daemon=True,
+        ).start()
         progress = self._rssi_calculation_progress_dialog
         if progress is not None:
+            progress.setAutoClose(False)
+            progress.setAutoReset(False)
+            progress.show()
+            cancel_button = getattr(progress, "_rf_cancel_button", None)
+            if cancel_button is not None:
+                try:
+                    cancel_button.setEnabled(False)
+                    cancel_button.setText("Cancelling...")
+                except RuntimeError:
+                    pass
             progress.setLabelText(
-                "Cancelling RSSI calculation after the current GPU kernel/worker tile..."
+                "Cancelling RSSI calculation and stopping worker processes..."
             )
         self.statusBar().showMessage(
-            "Cancelling RSSI calculation after the current GPU kernel/worker tile..."
+            "Cancelling RSSI calculation and stopping worker processes..."
         )
 
     def _persist_snapshot_results(
@@ -21458,9 +21971,6 @@ out tags geom;
             self._rssi_calculation_poll_timer.stop()
             return
 
-        if progress is not None and progress.wasCanceled():
-            self._cancel_rssi_calculation()
-
         with self._rssi_calculation_state_lock:
             state = dict(self._rssi_calculation_progress_state)
             partial = self._rssi_calculation_partial_results
@@ -21530,6 +22040,7 @@ out tags geom;
         self._rssi_calculation_future = None
         self._rssi_calculation_thread = None
         self._rssi_calculation_cancel_event = None
+        self._rssi_calculation_cancel_requested = False
         self._rssi_calculation_progress_dialog = None
         self._rssi_calculation_partial_results = None
         self._rssi_calculation_partial_floor_name = ""
@@ -21744,15 +22255,17 @@ out tags geom;
         }
 
         progress = QProgressDialog(
-            "Preparing multi-floor RSSI calculation...", "Cancel", 0, 100, self
+            "Preparing multi-floor RSSI calculation...", None, 0, 100, self
         )
+        cancel_button = QPushButton("Cancel", progress)
+        progress.setCancelButton(cancel_button)
+        progress._rf_cancel_button = cancel_button
         progress.setWindowTitle("RSSI calculation")
         progress.setWindowModality(Qt.NonModal)
         progress.setMinimumDuration(0)
         progress.setAutoClose(False)
         progress.setAutoReset(False)
         progress.setValue(0)
-        progress.canceled.connect(self._cancel_rssi_calculation)
         progress.show()
 
         cancel_event = threading.Event()
@@ -21772,6 +22285,8 @@ out tags geom;
         self._rssi_calculation_previous_results = dict(self.rssi_results_by_frequency)
         self._rssi_calculation_previous_last_result = self.last_result
         self._rssi_calculation_results_persisted = False
+        self._rssi_calculation_cancel_requested = False
+        cancel_button.clicked.connect(self._cancel_rssi_calculation)
         self._rssi_calculation_partial_applied = 0.0
         self._rssi_calculation_partial_floor_name = ""
         total_progress_units = max(1, len(floor_items) * 1000)
@@ -21803,7 +22318,7 @@ out tags geom;
             persisted_any = False
             try:
                 for floor_index, (floor_name, floor) in enumerate(floor_items):
-                    if cancel_event.is_set():
+                    if cancel_event.is_set() or future.done():
                         raise RuntimeError("RSSI calculation cancelled")
                     worker_progressive_fraction = {"value": 0.0}
 
@@ -21874,9 +22389,11 @@ out tags geom;
                 with self._rssi_calculation_state_lock:
                     self._rssi_calculation_results_persisted = persisted_any
             except BaseException as exc:
-                future.set_exception(exc)
+                if not future.done():
+                    future.set_exception(exc)
             else:
-                future.set_result(all_results)
+                if not future.done():
+                    future.set_result(all_results)
 
         self._set_rssi_calculation_ui(True)
         self.statusBar().showMessage(
@@ -21904,7 +22421,7 @@ out tags geom;
             future.cancel()
         self._rssi_calculation_thread = None
         self._shutdown_ifc_process_executor()
-        _shutdown_rf_process_executor(wait=False)
+        _shutdown_rf_process_executor(wait=False, terminate=True)
         super().closeEvent(event)
 
     def load_pattern_csv_path(self, path: Path) -> str:
@@ -22651,7 +23168,7 @@ out tags geom;
 def main():
     multiprocessing.freeze_support()
     app = QApplication(sys.argv)
-    app.aboutToQuit.connect(lambda: _shutdown_rf_process_executor(wait=False))
+    app.aboutToQuit.connect(lambda: _shutdown_rf_process_executor(wait=False, terminate=True))
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
