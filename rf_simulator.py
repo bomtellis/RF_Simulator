@@ -185,6 +185,37 @@ except Exception as exc:  # pragma: no cover
 
 
 
+# ITU-R P.525-5 equation (6) uses f in MHz and d in km.
+# The simulator stores scene distances in metres, so the 1 m anchor is
+# 32.4 + 20 log10(f_MHz) - 60 = 20 log10(f_MHz) - 27.6.
+P525_FSPL_CONSTANT_DB = 32.4
+P525_ONE_METRE_MHZ_CONSTANT_DB = P525_FSPL_CONSTANT_DB - 60.0
+
+def _normalise_radio_frequency_mhz(value: object, label: str = "") -> float:
+    """Return a sane radio frequency in MHz for Wi-Fi/AP radio inputs.
+
+    Saved/imported AP records sometimes use GHz-looking values such as 2.4,
+    5 or 6 despite the internal field being named ``frequency_mhz``. Those
+    values would reduce P.525 free-space loss by 60 dB and make RSSI
+    unrealistically high. Keep ordinary MHz inputs such as 433, 868, 2400,
+    5000 and 6000 unchanged, but convert obvious GHz aliases used in AP radio
+    profile names.
+    """
+    try:
+        frequency = float(value)
+    except Exception:
+        return 2400.0
+    if not math.isfinite(frequency) or frequency <= 0.0:
+        return 2400.0
+    text = str(label or "").lower()
+    ghz_named = "ghz" in text or "wi-fi" in text or "wifi" in text or "wi fi" in text
+    mhz_named = "mhz" in text
+    common_ghz_alias = any(abs(frequency - candidate) <= 1.0e-9 for candidate in (2.4, 5.0, 5.2, 5.8, 6.0))
+    if 0.3 <= frequency < 30.0 and (ghz_named or (common_ghz_alias and not mhz_named)):
+        return frequency * 1000.0
+    return frequency
+
+
 VEGETATION_RF_KEYWORDS = (
     "vegetation", "tree", "trees", "canopy", "foliage", "leaf", "leaves",
     "hedge", "hedgerow", "shrub", "shrubs", "bush", "bushes", "plant",
@@ -675,6 +706,11 @@ class APRadio:
     channel_width_mhz: float = 20.0
     spectrum_occupancy_percent: float = 0.0
 
+    def __post_init__(self):
+        self.frequency_mhz = _normalise_radio_frequency_mhz(
+            self.frequency_mhz, f"{self.name} {self.antenna_pattern} {self.channel}"
+        )
+
 
 @dataclass
 class AccessPoint:
@@ -698,6 +734,11 @@ class AccessPoint:
     radios: List[APRadio] = field(default_factory=list)
     max_clients: int = 50
     planned: bool = False
+
+    def __post_init__(self):
+        self.frequency_mhz = _normalise_radio_frequency_mhz(
+            self.frequency_mhz, f"{self.name} {self.antenna_pattern} {self.ap_type}"
+        )
 
     def active_radios(self) -> List[APRadio]:
         if not self.radios:
@@ -729,6 +770,11 @@ class PlannerRadioRequirement:
     spectrum_occupancy_percent: float = 20.0
     minimum_rssi_dbm: float = -67.0
     cutoff_radius_m: float = 0.0
+
+    def __post_init__(self):
+        self.frequency_mhz = _normalise_radio_frequency_mhz(
+            self.frequency_mhz, f"{self.name} {self.antenna_pattern}"
+        )
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -1071,29 +1117,41 @@ class HeatmapSettings:
     ap_cutoff_zone_line_width: float = 0.12
     ap_cutoff_zone_alpha: int = 120
     default_floor_attenuation_by_frequency_db: Dict[float, float] = field(default_factory=lambda: {
-        433.0: 8.0,
-        868.0: 10.0,
-        2400.0: 35.0,
-        5000.0: 55.1581,
-        6000.0: 60.0,
+        433.0: 15.0,
+        868.0: 20.0,
+        2400.0: 31.0,
+        5000.0: 55.0,
+        6000.0: 63.0,
     })
     enable_synthetic_floor_entities: bool = True
     synthetic_floor_entity_thickness_m: float = 0.30
     default_wall_attenuation_by_material_db: Dict[str, Dict[float, float]] = field(default_factory=lambda: {
         "default": {433.0: 2.0, 868.0: 3.0, 2400.0: 5.0, 5000.0: 7.0, 6000.0: 8.0},
-        "concrete": {433.0: 5.0, 868.0: 7.0, 2400.0: 12.0, 5000.0: 55.1581, 6000.0: 60.0},
-        "reinforced concrete": {433.0: 5.0, 868.0: 7.0, 2400.0: 12.0, 5000.0: 53.7989, 6000.0: 58.0},
-        "brick-faced concrete": {433.0: 5.0, 868.0: 7.0, 2400.0: 12.0, 5000.0: 39.8953, 6000.0: 44.0},
-        "brick-faced masonry block": {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 32.6320, 6000.0: 36.0},
-        "brick": {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 15.2806, 6000.0: 18.0},
-        "masonry": {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 14.9250, 6000.0: 18.0},
-        "masonry block": {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 14.9250, 6000.0: 18.0},
-        "timber": {433.0: 1.0, 868.0: 1.5, 2400.0: 3.0, 5000.0: 3.2778, 6000.0: 4.0},
-        "glass": {433.0: 1.0, 868.0: 2.0, 2400.0: 3.0, 5000.0: 0.0688, 6000.0: 1.0},
-        "drywall": {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0},
-        "plywood": {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0},
-        "plasterboard": {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0},
-        "partition": {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0},
+        "concrete": {433.0: 6.0, 868.0: 8.0, 2400.0: 15.0, 5000.0: 22.0, 6000.0: 25.0},
+        "concrete 102mm": {433.0: 6.0, 868.0: 8.0, 2400.0: 15.0, 5000.0: 22.0, 6000.0: 25.0},
+        "102mm concrete": {433.0: 6.0, 868.0: 8.0, 2400.0: 15.0, 5000.0: 22.0, 6000.0: 25.0},
+        "concrete 203mm": {433.0: 12.0, 868.0: 16.0, 2400.0: 29.0, 5000.0: 48.0, 6000.0: 54.0},
+        "203mm concrete": {433.0: 12.0, 868.0: 16.0, 2400.0: 29.0, 5000.0: 48.0, 6000.0: 54.0},
+        "concrete 200mm": {433.0: 12.0, 868.0: 16.0, 2400.0: 29.0, 5000.0: 48.0, 6000.0: 54.0},
+        "reinforced concrete": {433.0: 15.0, 868.0: 20.0, 2400.0: 31.0, 5000.0: 55.0, 6000.0: 63.0},
+        "reinforced concrete slab": {433.0: 15.0, 868.0: 20.0, 2400.0: 31.0, 5000.0: 55.0, 6000.0: 63.0},
+        "brick-faced concrete": {433.0: 5.0, 868.0: 7.0, 2400.0: 18.0, 5000.0: 41.0, 6000.0: 48.0},
+        "brick faced concrete": {433.0: 5.0, 868.0: 7.0, 2400.0: 18.0, 5000.0: 41.0, 6000.0: 48.0},
+        "brick-faced masonry block": {433.0: 5.0, 868.0: 7.0, 2400.0: 10.0, 5000.0: 32.0, 6000.0: 43.0},
+        "brick faced masonry block": {433.0: 5.0, 868.0: 7.0, 2400.0: 10.0, 5000.0: 32.0, 6000.0: 43.0},
+        "brick": {433.0: 2.0, 868.0: 3.0, 2400.0: 6.0, 5000.0: 15.0, 6000.0: 15.0},
+        "masonry": {433.0: 4.0, 868.0: 6.0, 2400.0: 11.0, 5000.0: 15.0, 6000.0: 16.0},
+        "masonry block": {433.0: 4.0, 868.0: 6.0, 2400.0: 11.0, 5000.0: 15.0, 6000.0: 16.0},
+        "blockwork": {433.0: 4.0, 868.0: 6.0, 2400.0: 11.0, 5000.0: 15.0, 6000.0: 16.0},
+        "concrete block": {433.0: 4.0, 868.0: 6.0, 2400.0: 11.0, 5000.0: 15.0, 6000.0: 16.0},
+        "timber": {433.0: 1.0, 868.0: 2.0, 2400.0: 3.0, 5000.0: 4.0, 6000.0: 4.0},
+        "lumber": {433.0: 1.0, 868.0: 2.0, 2400.0: 3.0, 5000.0: 4.0, 6000.0: 4.0},
+        "wood": {433.0: 1.0, 868.0: 2.0, 2400.0: 3.0, 5000.0: 4.0, 6000.0: 4.0},
+        "glass": {433.0: 0.5, 868.0: 1.0, 2400.0: 1.0, 5000.0: 1.0, 6000.0: 1.0},
+        "drywall": {433.0: 0.5, 868.0: 0.5, 2400.0: 0.9, 5000.0: 0.9, 6000.0: 0.9},
+        "plywood": {433.0: 0.5, 868.0: 1.0, 2400.0: 0.9, 5000.0: 0.9, 6000.0: 0.9},
+        "plasterboard": {433.0: 0.5, 868.0: 0.5, 2400.0: 0.9, 5000.0: 0.9, 6000.0: 0.9},
+        "partition": {433.0: 0.5, 868.0: 0.5, 2400.0: 0.9, 5000.0: 0.9, 6000.0: 0.9},
         "metal": {433.0: 12.0, 868.0: 16.0, 2400.0: 20.0, 5000.0: 28.0, 6000.0: 35.0},
         "steel": {433.0: 12.0, 868.0: 16.0, 2400.0: 20.0, 5000.0: 28.0, 6000.0: 35.0}
     })
@@ -1123,25 +1181,37 @@ class HeatmapSettings:
     # activate or override any category/type across the complete project.
     default_ifc_element_attenuation_by_type_db: Dict[str, Dict[float, float]] = field(default_factory=lambda: {
         "default": {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0},
-        "slab": {433.0: 8.0, 868.0: 10.0, 2400.0: 35.0, 5000.0: 55.1581, 6000.0: 60.0},
+        "slab": {433.0: 15.0, 868.0: 20.0, 2400.0: 31.0, 5000.0: 55.0, 6000.0: 63.0},
         "roof": {433.0: 5.0, 868.0: 7.0, 2400.0: 9.0, 5000.0: 13.0, 6000.0: 16.0},
         "column": {433.0: 3.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 12.0, 6000.0: 15.0},
         "beam": {433.0: 2.0, 868.0: 4.0, 2400.0: 6.0, 5000.0: 9.0, 6000.0: 12.0},
-        "curtain_wall": {433.0: 1.0, 868.0: 2.0, 2400.0: 3.0, 5000.0: 5.0, 6000.0: 7.0},
+        "curtain_wall": {433.0: 0.5, 868.0: 1.0, 2400.0: 1.0, 5000.0: 1.0, 6000.0: 1.0},
         "covering": {433.0: 0.5, 868.0: 0.8, 2400.0: 1.0, 5000.0: 1.5, 6000.0: 2.0},
         "plate": {433.0: 2.0, 868.0: 3.0, 2400.0: 5.0, 5000.0: 8.0, 6000.0: 10.0},
         "member": {433.0: 1.0, 868.0: 2.0, 2400.0: 3.0, 5000.0: 5.0, 6000.0: 7.0},
-        "concrete": {433.0: 5.0, 868.0: 7.0, 2400.0: 12.0, 5000.0: 55.1581, 6000.0: 60.0},
-        "reinforced concrete": {433.0: 5.0, 868.0: 7.0, 2400.0: 12.0, 5000.0: 53.7989, 6000.0: 58.0},
-        "brick-faced concrete": {433.0: 5.0, 868.0: 7.0, 2400.0: 12.0, 5000.0: 39.8953, 6000.0: 44.0},
-        "brick-faced masonry block": {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 32.6320, 6000.0: 36.0},
-        "brick": {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 15.2806, 6000.0: 18.0},
-        "masonry": {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 14.9250, 6000.0: 18.0},
-        "masonry block": {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 14.9250, 6000.0: 18.0},
-        "timber": {433.0: 1.0, 868.0: 1.5, 2400.0: 3.0, 5000.0: 3.2778, 6000.0: 4.0},
-        "glass": {433.0: 1.0, 868.0: 2.0, 2400.0: 3.0, 5000.0: 0.0688, 6000.0: 1.0},
-        "drywall": {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0},
-        "plywood": {433.0: 0.0, 868.0: 0.0, 2400.0: 0.0, 5000.0: 0.0, 6000.0: 0.0},
+        "concrete": {433.0: 6.0, 868.0: 8.0, 2400.0: 15.0, 5000.0: 22.0, 6000.0: 25.0},
+        "concrete 102mm": {433.0: 6.0, 868.0: 8.0, 2400.0: 15.0, 5000.0: 22.0, 6000.0: 25.0},
+        "102mm concrete": {433.0: 6.0, 868.0: 8.0, 2400.0: 15.0, 5000.0: 22.0, 6000.0: 25.0},
+        "concrete 203mm": {433.0: 12.0, 868.0: 16.0, 2400.0: 29.0, 5000.0: 48.0, 6000.0: 54.0},
+        "203mm concrete": {433.0: 12.0, 868.0: 16.0, 2400.0: 29.0, 5000.0: 48.0, 6000.0: 54.0},
+        "concrete 200mm": {433.0: 12.0, 868.0: 16.0, 2400.0: 29.0, 5000.0: 48.0, 6000.0: 54.0},
+        "reinforced concrete": {433.0: 15.0, 868.0: 20.0, 2400.0: 31.0, 5000.0: 55.0, 6000.0: 63.0},
+        "reinforced concrete slab": {433.0: 15.0, 868.0: 20.0, 2400.0: 31.0, 5000.0: 55.0, 6000.0: 63.0},
+        "brick-faced concrete": {433.0: 5.0, 868.0: 7.0, 2400.0: 18.0, 5000.0: 41.0, 6000.0: 48.0},
+        "brick faced concrete": {433.0: 5.0, 868.0: 7.0, 2400.0: 18.0, 5000.0: 41.0, 6000.0: 48.0},
+        "brick-faced masonry block": {433.0: 5.0, 868.0: 7.0, 2400.0: 10.0, 5000.0: 32.0, 6000.0: 43.0},
+        "brick faced masonry block": {433.0: 5.0, 868.0: 7.0, 2400.0: 10.0, 5000.0: 32.0, 6000.0: 43.0},
+        "brick": {433.0: 2.0, 868.0: 3.0, 2400.0: 6.0, 5000.0: 15.0, 6000.0: 15.0},
+        "masonry": {433.0: 4.0, 868.0: 6.0, 2400.0: 11.0, 5000.0: 15.0, 6000.0: 16.0},
+        "masonry block": {433.0: 4.0, 868.0: 6.0, 2400.0: 11.0, 5000.0: 15.0, 6000.0: 16.0},
+        "blockwork": {433.0: 4.0, 868.0: 6.0, 2400.0: 11.0, 5000.0: 15.0, 6000.0: 16.0},
+        "concrete block": {433.0: 4.0, 868.0: 6.0, 2400.0: 11.0, 5000.0: 15.0, 6000.0: 16.0},
+        "timber": {433.0: 1.0, 868.0: 2.0, 2400.0: 3.0, 5000.0: 4.0, 6000.0: 4.0},
+        "lumber": {433.0: 1.0, 868.0: 2.0, 2400.0: 3.0, 5000.0: 4.0, 6000.0: 4.0},
+        "wood": {433.0: 1.0, 868.0: 2.0, 2400.0: 3.0, 5000.0: 4.0, 6000.0: 4.0},
+        "glass": {433.0: 0.5, 868.0: 1.0, 2400.0: 1.0, 5000.0: 1.0, 6000.0: 1.0},
+        "drywall": {433.0: 0.5, 868.0: 0.5, 2400.0: 0.9, 5000.0: 0.9, 6000.0: 0.9},
+        "plywood": {433.0: 0.5, 868.0: 1.0, 2400.0: 0.9, 5000.0: 0.9, 6000.0: 0.9},
         "metal": {433.0: 12.0, 868.0: 16.0, 2400.0: 20.0, 5000.0: 28.0, 6000.0: 35.0},
         "steel": {433.0: 12.0, 868.0: 16.0, 2400.0: 20.0, 5000.0: 28.0, 6000.0: 35.0},
         "vegetation": _vegetation_attenuation_profile_for_text("vegetation"),
@@ -2606,21 +2676,25 @@ class IFCModelLoader:
         if "metal" in text or "steel" in text:
             return {433.0: 12.0, 868.0: 16.0, 2400.0: 20.0, 5000.0: 28.0, 6000.0: 35.0}
         if "reinforced concrete" in text:
-            return {433.0: 5.0, 868.0: 7.0, 2400.0: 12.0, 5000.0: 53.7989, 6000.0: 58.0}
-        if "brick-faced concrete" in text:
-            return {433.0: 5.0, 868.0: 7.0, 2400.0: 12.0, 5000.0: 39.8953, 6000.0: 44.0}
-        if "brick-faced masonry block" in text:
-            return {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 32.6320, 6000.0: 36.0}
-        if "concrete" in text:
-            return {433.0: 5.0, 868.0: 7.0, 2400.0: 12.0, 5000.0: 55.1581, 6000.0: 60.0}
+            return {433.0: 15.0, 868.0: 20.0, 2400.0: 31.0, 5000.0: 55.0, 6000.0: 63.0}
+        if "brick-faced concrete" in text or "brick faced concrete" in text:
+            return {433.0: 5.0, 868.0: 7.0, 2400.0: 18.0, 5000.0: 41.0, 6000.0: 48.0}
+        if "brick-faced masonry block" in text or "brick faced masonry block" in text:
+            return {433.0: 5.0, 868.0: 7.0, 2400.0: 10.0, 5000.0: 32.0, 6000.0: 43.0}
+        if "203" in text and "concrete" in text:
+            return {433.0: 12.0, 868.0: 16.0, 2400.0: 29.0, 5000.0: 48.0, 6000.0: 54.0}
+        if "200" in text and "concrete" in text:
+            return {433.0: 12.0, 868.0: 16.0, 2400.0: 29.0, 5000.0: 48.0, 6000.0: 54.0}
         if "block" in text:
-            return {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 14.9250, 6000.0: 18.0}
+            return {433.0: 4.0, 868.0: 6.0, 2400.0: 11.0, 5000.0: 15.0, 6000.0: 16.0}
+        if "concrete" in text:
+            return {433.0: 6.0, 868.0: 8.0, 2400.0: 15.0, 5000.0: 22.0, 6000.0: 25.0}
         if "brick" in text or "masonry" in text:
-            return {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 15.2806 if "brick" in text else 14.9250, 6000.0: 18.0}
+            return {433.0: 2.0, 868.0: 3.0, 2400.0: 6.0, 5000.0: 15.0, 6000.0: 15.0} if "brick" in text else {433.0: 4.0, 868.0: 6.0, 2400.0: 11.0, 5000.0: 15.0, 6000.0: 16.0}
         if "glass" in text or category == "curtain_wall":
-            return {433.0: 1.0, 868.0: 2.0, 2400.0: 3.0, 5000.0: 0.0688, 6000.0: 1.0}
+            return {433.0: 0.5, 868.0: 1.0, 2400.0: 1.0, 5000.0: 1.0, 6000.0: 1.0}
         category_profiles = {
-            "slab": {433.0: 8.0, 868.0: 10.0, 2400.0: 35.0, 5000.0: 55.1581, 6000.0: 60.0},
+            "slab": {433.0: 15.0, 868.0: 20.0, 2400.0: 31.0, 5000.0: 55.0, 6000.0: 63.0},
             "roof": {433.0: 5.0, 868.0: 7.0, 2400.0: 9.0, 5000.0: 13.0, 6000.0: 16.0},
             "column": {433.0: 3.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 12.0, 6000.0: 15.0},
             "beam": {433.0: 2.0, 868.0: 4.0, 2400.0: 6.0, 5000.0: 9.0, 6000.0: 12.0},
@@ -2661,14 +2735,28 @@ class IFCModelLoader:
         same construction.
         """
         text = f"{material} {type_name}".lower()
-        if "concrete" in text or "block" in text:
-            return {433.0: 5.0, 868.0: 7.0, 2400.0: 12.0, 5000.0: 16.0, 6000.0: 20.0}
+        if "reinforced concrete" in text:
+            return {433.0: 15.0, 868.0: 20.0, 2400.0: 31.0, 5000.0: 55.0, 6000.0: 63.0}
+        if "brick-faced concrete" in text or "brick faced concrete" in text:
+            return {433.0: 5.0, 868.0: 7.0, 2400.0: 18.0, 5000.0: 41.0, 6000.0: 48.0}
+        if "brick-faced masonry block" in text or "brick faced masonry block" in text:
+            return {433.0: 5.0, 868.0: 7.0, 2400.0: 10.0, 5000.0: 32.0, 6000.0: 43.0}
+        if ("203" in text or "200" in text) and "concrete" in text:
+            return {433.0: 12.0, 868.0: 16.0, 2400.0: 29.0, 5000.0: 48.0, 6000.0: 54.0}
+        if "block" in text:
+            return {433.0: 4.0, 868.0: 6.0, 2400.0: 11.0, 5000.0: 15.0, 6000.0: 16.0}
+        if "concrete" in text:
+            return {433.0: 6.0, 868.0: 8.0, 2400.0: 15.0, 5000.0: 22.0, 6000.0: 25.0}
         if "brick" in text or "masonry" in text:
-            return {433.0: 4.0, 868.0: 5.0, 2400.0: 8.0, 5000.0: 11.0, 6000.0: 14.0}
+            return {433.0: 2.0, 868.0: 3.0, 2400.0: 6.0, 5000.0: 15.0, 6000.0: 15.0} if "brick" in text else {433.0: 4.0, 868.0: 6.0, 2400.0: 11.0, 5000.0: 15.0, 6000.0: 16.0}
         if "glass" in text:
-            return {433.0: 1.0, 868.0: 2.0, 2400.0: 3.0, 5000.0: 5.0, 6000.0: 7.0}
+            return {433.0: 0.5, 868.0: 1.0, 2400.0: 1.0, 5000.0: 1.0, 6000.0: 1.0}
         if "plaster" in text or "drywall" in text or "partition" in text:
-            return {433.0: 1.0, 868.0: 1.5, 2400.0: 3.0, 5000.0: 4.0, 6000.0: 5.0}
+            return {433.0: 0.5, 868.0: 0.5, 2400.0: 0.9, 5000.0: 0.9, 6000.0: 0.9}
+        if "plywood" in text:
+            return {433.0: 0.5, 868.0: 1.0, 2400.0: 0.9, 5000.0: 0.9, 6000.0: 0.9}
+        if "timber" in text or "wood" in text or "lumber" in text:
+            return {433.0: 1.0, 868.0: 2.0, 2400.0: 3.0, 5000.0: 4.0, 6000.0: 4.0}
         if "metal" in text or "steel" in text:
             return {433.0: 12.0, 868.0: 16.0, 2400.0: 20.0, 5000.0: 28.0, 6000.0: 35.0}
         return {433.0: 2.0, 868.0: 3.0, 2400.0: 5.0, 5000.0: 7.0, 6000.0: 8.0}
@@ -2910,11 +2998,11 @@ class RFEngine:
         """ITU-R P.525 free-space basic transmission loss.
 
         The equivalent engineering form is:
-        Lbf(dB) = 32.44 + 20 log10(distance_km) + 20 log10(frequency_MHz).
+        Lbf(dB) = 32.4 + 20 log10(distance_km) + 20 log10(frequency_MHz).
         """
         frequency_mhz = max(float(frequency_mhz), 1.0)
         distance_km = max(float(distance_m), 1.0) / 1000.0
-        return 32.44 + 20.0 * math.log10(distance_km) + 20.0 * math.log10(frequency_mhz)
+        return P525_FSPL_CONSTANT_DB + 20.0 * math.log10(distance_km) + 20.0 * math.log10(frequency_mhz)
 
     @staticmethod
     @functools.lru_cache(maxsize=64)
@@ -4375,7 +4463,7 @@ class RFEngine:
         if settings is None:
             return "none"
         return stable_digest({
-            "methodology": "exact-inspect-compatible-rssi-v4-point-pattern-gpu",
+            "methodology": "exact-inspect-compatible-rssi-v7-oriented-footprint-gpu",
             "profile": getattr(settings, "rf_calculation_profile", "balanced"),
             "cutoff": [
                 getattr(settings, "enable_ap_cutoff_zones", True),
@@ -4596,30 +4684,53 @@ class RFEngine:
         )
 
     @staticmethod
-    def _attenuation_segment_rows_for_floor(
-        floor: FloorModel,
+    def _attenuation_segment_rows_for_floors(
+        path_floors: Iterable[FloorModel],
         frequency_mhz: float,
         heatmap_settings: Optional[HeatmapSettings] = None,
     ) -> np.ndarray:
-        """Flatten RF wall/element polygon edges for CUDA/Numba ray tests.
+        """Flatten path-floor RF barrier footprints for CUDA/Numba ray tests.
 
-        The GPU path evaluates line-of-sight path loss and adds attenuation for
-        each RF barrier edge crossed by the AP-to-sample ray. This keeps the
-        expensive per-grid RSSI pass on the GPU while preserving user wall and
-        IFC element attenuation as a first-order RF planning approximation.
+        The scalar/right-click model treats a wall or IFC element as one solid
+        RF obstruction whenever the 3D AP-to-receiver line intersects its
+        footprint/height volume.  For GPU work, preserve the oriented IFC/user
+        footprint edges instead of expanding rotated objects to axis-aligned
+        boxes; those boxes can add barriers that the CPU/right-click path does
+        not actually cross.  Each closed footprint normally contributes two
+        edge hits, so each edge carries half the object loss.
         """
-        rows: List[Tuple[float, float, float, float, float, float, float]] = []
+        rows: List[Tuple[float, float, float, float, float, float, float, float]] = []
+        seen_walls: set = set()
+        seen_elements: set = set()
+
+        def normalised_z_range(obj, floor: FloorModel) -> Tuple[float, float]:
+            try:
+                z_min = float(getattr(obj, "z_min", floor.elevation))
+                z_max = float(getattr(obj, "z_max", floor.elevation + 3.0))
+            except Exception:
+                z_min = float(floor.elevation)
+                z_max = float(floor.elevation) + 3.0
+            if abs(z_max - z_min) <= 1.0e-9:
+                # User-created RF obstructions and some lightweight imports may
+                # not carry a vertical extent.  Give them the current storey
+                # height so CUDA does not incorrectly miss same-floor barriers.
+                z_min = float(floor.elevation)
+                z_max = float(floor.elevation) + 3.0
+            if z_max < z_min:
+                z_min, z_max = z_max, z_min
+            return z_min, z_max
 
         def add_polygon_edges(polygon, z_min: float, z_max: float, loss: float):
             if polygon is None or getattr(polygon, "is_empty", True) or abs(float(loss)) <= 1e-9:
                 return
-            # The exact link-budget path counts one wall/element attenuation
-            # when its solid footprint intersects the ray. A closed polygon
-            # boundary is normally crossed twice (entry and exit), so each edge
-            # carries half the object loss to keep the accelerated grid aligned
-            # with the right-click loss breakdown.
+            if not all(math.isfinite(v) for v in (z_min, z_max)):
+                return
             edge_loss = float(loss) * 0.5
-            polygons = [polygon] if getattr(polygon, "geom_type", "") == "Polygon" else list(getattr(polygon, "geoms", []) or [])
+            polygons = (
+                [polygon]
+                if getattr(polygon, "geom_type", "") == "Polygon"
+                else list(getattr(polygon, "geoms", []) or [])
+            )
             for poly in polygons:
                 if getattr(poly, "geom_type", "") != "Polygon":
                     continue
@@ -4630,32 +4741,81 @@ class RFEngine:
                     for a, b in zip(coords, coords[1:]):
                         x1, y1 = float(a[0]), float(a[1])
                         x2, y2 = float(b[0]), float(b[1])
+                        if not all(math.isfinite(v) for v in (x1, y1, x2, y2)):
+                            continue
                         if math.hypot(x2 - x1, y2 - y1) < 1.0e-6:
                             continue
-                        rows.append((x1, y1, x2, y2, float(z_min), float(z_max), edge_loss))
+                        rows.append((x1, y1, x2, y2, float(z_min), float(z_max), edge_loss, 0.0))
 
-        for wall in list(getattr(floor, "walls", []) or []):
-            add_polygon_edges(
-                getattr(wall, "polygon", None),
-                float(getattr(wall, "z_min", floor.elevation)),
-                float(getattr(wall, "z_max", floor.elevation + 3.0)),
-                float(wall.attenuation_db_for_frequency(frequency_mhz)),
-            )
-        for element in list(getattr(floor, "elements", []) or []):
-            if not bool(getattr(element, "is_rf_barrier", False)):
+        for path_floor in list(path_floors or []):
+            if path_floor is None:
                 continue
-            category = str(getattr(element, "rf_category", "other") or "other").lower()
-            if category in {"slab", "roof", "covering"}:
-                continue
-            add_polygon_edges(
-                getattr(element, "polygon", None),
-                float(getattr(element, "z_min", floor.elevation)),
-                float(getattr(element, "z_max", floor.elevation + 3.0)),
-                float(RFEngine._element_nominal_penetration_loss_db(element, frequency_mhz, heatmap_settings)),
-            )
+            for wall in list(getattr(path_floor, "walls", []) or []):
+                wall_key = RFEngine._wall_identity(wall)
+                if wall_key in seen_walls:
+                    continue
+                seen_walls.add(wall_key)
+                z_min, z_max = normalised_z_range(wall, path_floor)
+                add_polygon_edges(
+                    getattr(wall, "polygon", None),
+                    z_min,
+                    z_max,
+                    float(wall.attenuation_db_for_frequency(frequency_mhz)),
+                )
+            for element in list(getattr(path_floor, "elements", []) or []):
+                if not bool(getattr(element, "is_rf_barrier", False)):
+                    continue
+                category = str(getattr(element, "rf_category", "other") or "other").lower()
+                if category in {"slab", "roof", "covering"}:
+                    continue
+                element_key = RFEngine._element_identity(element)
+                if element_key in seen_elements:
+                    continue
+                seen_elements.add(element_key)
+                z_min, z_max = normalised_z_range(element, path_floor)
+                add_polygon_edges(
+                    getattr(element, "polygon", None),
+                    z_min,
+                    z_max,
+                    float(RFEngine._element_nominal_penetration_loss_db(element, frequency_mhz, heatmap_settings)),
+                )
         if not rows:
-            return np.zeros((0, 7), dtype=np.float32)
+            return np.zeros((0, 8), dtype=np.float32)
         return np.asarray(rows, dtype=np.float32)
+
+    @staticmethod
+    def _attenuation_segment_rows_for_floor(
+        floor: FloorModel,
+        frequency_mhz: float,
+        heatmap_settings: Optional[HeatmapSettings] = None,
+    ) -> np.ndarray:
+        return RFEngine._attenuation_segment_rows_for_floors([floor], frequency_mhz, heatmap_settings)
+
+    @staticmethod
+    def _attenuation_segment_rows_for_links(
+        receiver_floor: FloorModel,
+        floors: Dict[str, FloorModel],
+        links: Sequence[Tuple[AccessPoint, APRadio]],
+        frequency_mhz: float,
+        heatmap_settings: Optional[HeatmapSettings] = None,
+    ) -> np.ndarray:
+        """Return CUDA RF barriers for every floor crossed by a batch of AP links."""
+        ordered: List[FloorModel] = []
+        seen: set = set()
+        for ap, _radio in list(links or []):
+            ap_floor = floors.get(ap.floor)
+            path_floors = (
+                RFEngine.floors_between_inclusive(receiver_floor, ap_floor, floors)
+                if ap_floor is not None else [receiver_floor]
+            )
+            for path_floor in path_floors:
+                if path_floor is None or path_floor.name in seen:
+                    continue
+                seen.add(path_floor.name)
+                ordered.append(path_floor)
+        if not ordered:
+            ordered = [receiver_floor]
+        return RFEngine._attenuation_segment_rows_for_floors(ordered, frequency_mhz, heatmap_settings)
 
     @staticmethod
     def _direct_accelerator_ap_rows(
@@ -4815,7 +4975,9 @@ class RFEngine:
                 if ap_rows.size == 0:
                     continue
                 frequency = float(ap_rows[0, 6])
-                segments = RFEngine._attenuation_segment_rows_for_floor(floor, frequency, heatmap_settings)
+                segments = RFEngine._attenuation_segment_rows_for_links(
+                    floor, floors, link_batch, frequency, heatmap_settings
+                )
                 accelerated = None
                 try:
                     if gpu_enabled:
@@ -4908,7 +5070,7 @@ class RFEngine:
                 if gpu_used else
                 "direct RSSI grid calculated with Numba parallel CPU fallback because GPU execution was unavailable or below the configured workload threshold"
             )
-            note += "; attenuation uses GPU/Numba ray intersections against IFC/user RF barrier edges"
+            note += "; attenuation uses GPU/Numba oriented-footprint edge crossings against path-floor IFC/user RF barriers"
             if receiver_z_grid is not None and terrain_elevation_grid is not None:
                 note += "; terrain receiver heights and ground obstruction loss included in the direct-grid batch"
             if patterns:
@@ -5034,6 +5196,7 @@ class RFEngine:
         ys: np.ndarray,
         overlay: Optional["SatelliteOverlay"],
         terrain_model: Optional["TerrainModel"],
+        floor_elevation_m: float = 0.0,
     ) -> Optional[np.ndarray]:
         if overlay is None or terrain_model is None or not bool(getattr(terrain_model, "enabled", True)):
             return None
@@ -5073,7 +5236,7 @@ class RFEngine:
         if reference is None:
             reference = float(elevation_grid[0, 0])
         model_ground = float(getattr(terrain_model, "model_ground_elevation_m", 0.0))
-        return elevation_grid - float(reference) + model_ground + receiver_height
+        return float(floor_elevation_m) + elevation_grid - float(reference) + model_ground + receiver_height
 
     @staticmethod
     def _sample_regular_grid_value(xs: np.ndarray, ys: np.ndarray, values: np.ndarray, x: float, y: float) -> Optional[float]:
@@ -5195,13 +5358,15 @@ class RFEngine:
                 raise ValueError("Adaptive evaluation mask does not match RF grid")
             if boundary_mask is not None:
                 work_mask &= boundary_mask
-        receiver_z_grid = RFEngine._terrain_receiver_z_grid(xs, ys, map_overlay, terrain_model)
+        receiver_z_grid = RFEngine._terrain_receiver_z_grid(
+            xs, ys, map_overlay, terrain_model, float(floor.elevation)
+        )
         terrain_elevation_grid = None
         terrain_note = ""
         if receiver_z_grid is not None:
             terrain_elevation_grid = receiver_z_grid - max(0.0, float(getattr(terrain_model, "receiver_height_m", 1.0)))
             terrain_note = (
-                f"; terrain receiver height {float(getattr(terrain_model, 'receiver_height_m', 1.0)):g} m above ground "
+                f"; terrain receiver height {float(getattr(terrain_model, 'receiver_height_m', 1.0)):g} m above ground, offset by IFC floor elevation "
                 f"from {getattr(terrain_model, 'source_name', 'terrain')}; ground obstruction loss "
                 f"{float(getattr(terrain_model, 'ground_attenuation_db', 80.0)):g} dB; "
                 f"P.527 surface {getattr(terrain_model, 'ground_surface_type', 'average_ground')} "
@@ -8033,7 +8198,7 @@ class BulkAccessPointDialog(QDialog):
         gain = QDoubleSpinBox(); gain.setRange(-50.0, 100.0); gain.setSuffix(" dBi")
         add_field("antenna_gain_dbi", "Additional antenna gain", gain)
         frequency = QDoubleSpinBox(); frequency.setRange(1.0, 100000.0); frequency.setValue(5000.0); frequency.setSuffix(" MHz")
-        add_field("frequency_mhz", "Radio frequency", frequency)
+        add_field("frequency_mhz", "Radio frequency (MHz, e.g. 5000 for 5 GHz)", frequency)
         pattern = QComboBox(); pattern.addItems(pattern_names)
         add_field("antenna_pattern", "Antenna pattern", pattern)
         channel = QComboBox(); channel.setEditable(True); channel.addItems(["1", "6", "11", "36", "40", "44", "48", "5", "21", "37"])
@@ -8078,7 +8243,7 @@ class BulkAccessPointDialog(QDialog):
 class AutoPlannerSettingsDialog(QDialog):
     """Configure predictive AP coverage, capacity, channel and radio requirements."""
 
-    HEADERS = ["Enabled", "Name", "Frequency MHz", "Pattern", "TX dBm", "Gain dBi", "Width MHz", "Channels", "Occupancy %", "Min RSSI dBm", "Cut-off m"]
+    HEADERS = ["Enabled", "Name", "Frequency (MHz)", "Pattern", "TX dBm", "Gain dBi", "Width MHz", "Channels", "Occupancy %", "Min RSSI dBm", "Cut-off m"]
 
     def __init__(self, parent, settings: AutoPlannerSettings, pattern_names: List[str]):
         super().__init__(parent)
@@ -17590,8 +17755,11 @@ out tags geom;
     def _planner_rssi(self, x: float, y: float, ap: AccessPoint, radio: APRadio, wall_tree, walls: List[Wall2D]) -> float:
         if not self.floor:
             return -200.0
+        ap_floor = self.floors.get(ap.floor, self.floor)
         dx = float(x) - float(ap.x); dy = float(y) - float(ap.y)
-        dz = float(ap.mount_height_m) - float(ap.rx_height_m)
+        ap_z = float(ap_floor.elevation) + float(ap.mount_height_m)
+        rx_z = float(self.floor.elevation) + float(ap.rx_height_m)
+        dz = ap_z - rx_z
         distance = max(1.0, math.sqrt(dx * dx + dy * dy + dz * dz))
         radius = RFEngine.cutoff_radius_m_for_radio(radio, self.heatmap_settings)
         if radius > 0.0 and distance > radius:
@@ -17605,7 +17773,7 @@ out tags geom;
         bearing = math.degrees(math.atan2(dy, dx))
         az_rel = bearing - float(ap.azimuth_deg)
         horizontal_distance = max(1e-9, math.hypot(dx, dy))
-        elevation = math.degrees(math.atan2(float(ap.rx_height_m) - float(ap.mount_height_m), horizontal_distance))
+        elevation = math.degrees(math.atan2(rx_z - ap_z, horizontal_distance))
         el_rel = elevation + float(ap.downtilt_deg)
         pattern = self.antenna_patterns.get(radio.antenna_pattern)
         pattern_gain = pattern.gain_dbi(az_rel, el_rel) if pattern else 0.0
@@ -18710,7 +18878,7 @@ out tags geom;
     @staticmethod
     def _radio_from_dict(data: Dict[str, object]) -> APRadio:
         return APRadio(
-            name=str(data.get("name", "Radio")), frequency_mhz=float(data.get("frequency_mhz", 2400.0)),
+            name=str(data.get("name", "Radio")), frequency_mhz=_normalise_radio_frequency_mhz(data.get("frequency_mhz", 2400.0), str(data.get("name", "Radio"))),
             tx_power_dbm=float(data.get("tx_power_dbm", 20.0)), antenna_pattern=str(data.get("antenna_pattern", "Omni ceiling AP")),
             enabled=bool(data.get("enabled", True)), cutoff_radius_m=float(data.get("cutoff_radius_m", 0.0)),
             antenna_gain_dbi=float(data.get("antenna_gain_dbi", 0.0)), channel=str(data.get("channel", "")),
@@ -18987,7 +19155,7 @@ out tags geom;
         invalidate a saved result when inter-floor propagation is disabled.
         """
         return {
-            "format": 1,
+            "format": 2,
             "resolution_m": round(float(self.resolution.value()), 6),
             "include_inter_floor": bool(self.include_inter_floor.isChecked()),
             "settings": RFEngine._settings_revision(self.heatmap_settings),
@@ -19599,7 +19767,7 @@ out tags geom;
             radios = [self._radio_from_dict(v) for v in item.get("radios", []) if isinstance(v, dict)]
             self.aps.append(AccessPoint(
                 name=str(item.get("name", self._next_ap_name())), x=float(item.get("x", 0.0)), y=float(item.get("y", 0.0)), floor=str(item.get("floor", "")),
-                tx_power_dbm=float(item.get("tx_power_dbm", 20.0)), frequency_mhz=float(item.get("frequency_mhz", 2400.0)),
+                tx_power_dbm=float(item.get("tx_power_dbm", 20.0)), frequency_mhz=_normalise_radio_frequency_mhz(item.get("frequency_mhz", 2400.0), str(item.get("name", ""))),
                 reference_loss_db_at_1m=float(item.get("reference_loss_db_at_1m", 40.0)), path_loss_exponent=float(item.get("path_loss_exponent", 2.2)),
                 antenna_pattern=str(item.get("antenna_pattern", "Omni ceiling AP")), azimuth_deg=float(item.get("azimuth_deg", 0.0)),
                 downtilt_deg=float(item.get("downtilt_deg", 0.0)), mount_height_m=float(item.get("mount_height_m", 2.7)),
@@ -19863,11 +20031,18 @@ out tags geom;
         y: float,
         floors: Dict[str, FloorModel],
         aps: Sequence[AccessPoint],
+        match_displayed_heatmap: bool = True,
     ) -> Tuple[Optional[float], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], Optional[TerrainModel], str]:
         terrain_model = self._active_terrain_model()
         map_overlay = self._active_terrain_overlay()
         if terrain_model is None or map_overlay is None:
             return None, None, None, None, None, ""
+        if match_displayed_heatmap:
+            result = getattr(self, "last_result", None)
+            if result is not None:
+                note = str(getattr(result, "performance_note", "") or "").lower()
+                if "terrain receiver height" not in note and "terrain receiver heights" not in note:
+                    return None, None, None, None, None, ""
         xs_values = [float(x)]
         ys_values = [float(y)]
         for ap in aps:
@@ -19882,7 +20057,8 @@ out tags geom;
         xs = np.linspace(min_x, max_x, 33, dtype=float)
         ys = np.linspace(min_y, max_y, 33, dtype=float)
         try:
-            receiver_grid = RFEngine._terrain_receiver_z_grid(xs, ys, map_overlay, terrain_model)
+            floor_elevation = float(self.floor.elevation) if self.floor is not None else 0.0
+            receiver_grid = RFEngine._terrain_receiver_z_grid(xs, ys, map_overlay, terrain_model, floor_elevation)
         except Exception as exc:
             return None, None, None, None, terrain_model, f"Terrain model unavailable for this inspection: {exc}"
         if receiver_grid is None:
@@ -20044,7 +20220,9 @@ out tags geom;
             )
             if ap_rows.size == 0 or len(terms) != len(group_links):
                 continue
-            segments = RFEngine._attenuation_segment_rows_for_floor(receiver_floor, float(frequency_key))
+            segments = RFEngine._attenuation_segment_rows_for_links(
+                receiver_floor, floors, group_links, float(frequency_key), self.heatmap_settings
+            )
             gpu_result = gpu_inspect_direct_paths(
                 x, y, ap_rows, segments,
                 float(getattr(self.heatmap_settings, "disconnected_rssi_dbm", -120.0)),
@@ -20141,11 +20319,11 @@ out tags geom;
 
         aps = [ap for ap, _ in links]
         receiver_z_override, terrain_xs, terrain_ys, terrain_elevation, terrain_model, terrain_note = self._terrain_inspection_grid(
-            x, y, floors, aps
+            x, y, floors, aps, match_displayed_heatmap=True
         )
         if terrain_model is not None and not terrain_note:
             terrain_note = (
-                f"Terrain receiver height: {float(getattr(terrain_model, 'receiver_height_m', 1.0)):g} m above ground; "
+                f"Terrain receiver height: {float(getattr(terrain_model, 'receiver_height_m', 1.0)):g} m above ground, offset by IFC floor elevation; "
                 f"P.527 surface {getattr(terrain_model, 'ground_surface_type', 'average_ground')} "
                 f"epsr={float(getattr(terrain_model, 'ground_relative_permittivity', 15.0)):g}, "
                 f"sigma={float(getattr(terrain_model, 'ground_conductivity_s_per_m', 0.005)):g} S/m"

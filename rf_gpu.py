@@ -16,6 +16,10 @@ from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+# ITU-R P.525-5 Eq. (6): Lbf = 32.4 + 20log10(f_MHz) + 20log10(d_km).
+# At d = 1 m = 0.001 km this becomes 20log10(f_MHz) - 27.6.
+P525_ONE_METRE_MHZ_CONSTANT_DB = -27.6
+
 try:
     from numba import float32, njit, prange  # type: ignore
 except Exception:  # pragma: no cover
@@ -292,6 +296,57 @@ if cuda is not None:
             output[gid, 2] = colours[selected, 2]
             output[gid, 3] = colours[selected, 3]
 
+    @cuda.jit(device=True, inline=True)
+    def _cuda_line_box_z_hit(ax, ay, az, dx, dy, z_delta, min_x, max_x, min_y, max_y, z_min, z_max):
+        t0 = 0.0
+        t1 = 1.0
+        eps = 1.0e-7
+        if dx > -eps and dx < eps:
+            if ax < min_x or ax > max_x:
+                return 0
+        else:
+            inv_dx = 1.0 / dx
+            tx1 = (min_x - ax) * inv_dx
+            tx2 = (max_x - ax) * inv_dx
+            if tx1 > tx2:
+                tmp = tx1
+                tx1 = tx2
+                tx2 = tmp
+            if tx1 > t0:
+                t0 = tx1
+            if tx2 < t1:
+                t1 = tx2
+            if t0 > t1:
+                return 0
+        if dy > -eps and dy < eps:
+            if ay < min_y or ay > max_y:
+                return 0
+        else:
+            inv_dy = 1.0 / dy
+            ty1 = (min_y - ay) * inv_dy
+            ty2 = (max_y - ay) * inv_dy
+            if ty1 > ty2:
+                tmp = ty1
+                ty1 = ty2
+                ty2 = tmp
+            if ty1 > t0:
+                t0 = ty1
+            if ty2 < t1:
+                t1 = ty2
+            if t0 > t1:
+                return 0
+        if t1 < 0.0 or t0 > 1.0:
+            return 0
+        if t0 < 0.0:
+            t0 = 0.0
+        if t1 > 1.0:
+            t1 = 1.0
+        za = az + z_delta * t0
+        zb = az + z_delta * t1
+        zlo = za if za < zb else zb
+        zhi = zb if zb > za else za
+        return 1 if (zhi >= z_min and zlo <= z_max) else 0
+
     @cuda.jit(cache=True, fastmath=True)
     def _cuda_direct_rssi_paths(xs, ys, valid, ap_data, segments, segment_indices, segment_offsets,
                                 receiver_z, terrain_z, terrain_enabled, ground_loss_db, terrain_clearance,
@@ -352,6 +407,14 @@ if cuda is not None:
                 # more expensive ray/segment intersection arithmetic.
                 if (segments[si, 8] < ray_min_x - 1.0e-5 or segments[si, 7] > ray_max_x + 1.0e-5 or
                         segments[si, 10] < ray_min_y - 1.0e-5 or segments[si, 9] > ray_max_y + 1.0e-5):
+                    continue
+                if segments[si, 11] >= 0.5:
+                    if _cuda_line_box_z_hit(
+                        ax, ay, az, dx, dy, z_delta,
+                        segments[si, 7], segments[si, 8], segments[si, 9], segments[si, 10],
+                        segments[si, 4], segments[si, 5],
+                    ) != 0:
+                        wall_loss += segments[si, 6]
                     continue
                 x1 = segments[si, 0]
                 y1 = segments[si, 1]
@@ -467,6 +530,14 @@ if cuda is not None:
                     si = segment_indices[packed_index]
                     if (segments[si, 8] < ray_min_x - 1.0e-5 or segments[si, 7] > ray_max_x + 1.0e-5 or
                             segments[si, 10] < ray_min_y - 1.0e-5 or segments[si, 9] > ray_max_y + 1.0e-5):
+                        continue
+                    if segments[si, 11] >= 0.5:
+                        if _cuda_line_box_z_hit(
+                            ax, ay, az, dx, dy, z_delta,
+                            segments[si, 7], segments[si, 8], segments[si, 9], segments[si, 10],
+                            segments[si, 4], segments[si, 5],
+                        ) != 0:
+                            partial_loss += segments[si, 6]
                         continue
                     x1 = segments[si, 0]
                     y1 = segments[si, 1]
@@ -600,6 +671,14 @@ if cuda is not None:
                 if (segments[si, 8] < ray_min_x - 1.0e-5 or segments[si, 7] > ray_max_x + 1.0e-5 or
                         segments[si, 10] < ray_min_y - 1.0e-5 or segments[si, 9] > ray_max_y + 1.0e-5):
                     continue
+                if segments[si, 11] >= 0.5:
+                    if _cuda_line_box_z_hit(
+                        ax, ay, az, dx, dy, z_delta,
+                        segments[si, 7], segments[si, 8], segments[si, 9], segments[si, 10],
+                        segments[si, 4], segments[si, 5],
+                    ) != 0:
+                        wall_loss += segments[si, 6]
+                    continue
                 x1 = segments[si, 0]
                 y1 = segments[si, 1]
                 sdx = segments[si, 2]
@@ -653,9 +732,9 @@ class NumbaCUDARFAccelerator:
         self.info = records[self.device_index]
         self._lock = threading.RLock()
         # 128 threads limits register pressure in the barrier-heavy kernels and
-        # still gives four complete warps per block.  The grid is deliberately
-        # capped to a deep queue per SM; grid-stride loops consume the remaining
-        # work without the scheduling overhead of millions of tiny blocks.
+        # still gives four complete warps per block.  The grid is capped to a
+        # deep queue per SM; direct RSSI batches also use several CUDA streams
+        # so bounded chunks can stay queued without reusing temporary buffers.
         self.threads_per_block = 128
         self._sm_count = max(1, int(self.info.compute_units or 1))
         self._blocks_per_sm = 24
@@ -924,11 +1003,29 @@ class NumbaCUDARFAccelerator:
                 max_points_by_cancel = max(1024, int(
                     max_barrier_checks / max(1.0, ap_count * average_segments)
                 ))
-                effective_queue_depth = 1
-            chunk_points = max(1, min(total, auto_target, max_points_by_temp, max_points_by_cancel))
+                # Keep cooperative barrier chunks bounded for cancellation, but
+                # still queue a small number on independent streams.  The old
+                # single-stream path often under-fed the GPU on large IFCs when
+                # each chunk contained fewer blocks than the adapter could keep
+                # resident.
+                effective_queue_depth = max(1, min(queue_depth, 4))
+            # Each queued stream needs its own AP/point temporary field.
+            # Divide the memory-derived point budget by the actual stream count
+            # so queue depth improves utilisation without oversubscribing VRAM.
+            max_points_by_temp_stream = max(4096, int(max_points_by_temp / max(1, effective_queue_depth)))
+            chunk_points = max(1, min(total, auto_target, max_points_by_temp_stream, max_points_by_cancel))
             max_path_items = chunk_points * ap_count
             d_rssi, d_counts, d_path_rssi = self._ensure_direct_buffers(total, max_path_items, stream)
             stream.synchronize()
+
+            streams = [stream]
+            path_buffers = [d_path_rssi]
+            if effective_queue_depth > 1:
+                streams = [cuda.stream() for _ in range(effective_queue_depth)]
+                path_buffers = [
+                    cuda.device_array(max_path_items, dtype=np.float32, stream=batch_stream)
+                    for batch_stream in streams
+                ]
 
             queued_chunks = 0
             chunk_count = 0
@@ -937,27 +1034,30 @@ class NumbaCUDARFAccelerator:
                     raise RuntimeError("RSSI calculation cancelled")
                 work_count = min(chunk_points, total - start_gid)
                 path_items = work_count * ap_count
+                batch_index = chunk_count % len(streams)
+                batch_stream = streams[batch_index]
+                batch_path_rssi = path_buffers[batch_index]
                 if use_block_kernel:
                     path_blocks, threads = self._block_launch_shape(path_items, cooperative_threads)
-                    _cuda_direct_rssi_paths_block[path_blocks, threads, stream](
+                    _cuda_direct_rssi_paths_block[path_blocks, threads, batch_stream](
                         d_xs, d_ys, d_valid, d_aps, d_segments, d_segment_indices, d_offsets,
                         d_receiver_z, d_terrain_z, np.int32(1 if terrain_enabled else 0),
                         np.float32(ground_loss_db), np.float32(terrain_clearance_m),
                         np.float32(disconnected), np.int64(start_gid), np.int64(work_count),
-                        d_path_rssi, np.int32(cols), np.int32(rows),
+                        batch_path_rssi, np.int32(cols), np.int32(rows),
                     )
                 else:
                     path_blocks, threads = self._launch_shape(path_items)
-                    _cuda_direct_rssi_paths[path_blocks, threads, stream](
+                    _cuda_direct_rssi_paths[path_blocks, threads, batch_stream](
                         d_xs, d_ys, d_valid, d_aps, d_segments, d_segment_indices, d_offsets,
                         d_receiver_z, d_terrain_z, np.int32(1 if terrain_enabled else 0),
                         np.float32(ground_loss_db), np.float32(terrain_clearance_m),
                         np.float32(disconnected), np.int64(start_gid), np.int64(work_count),
-                        d_path_rssi, np.int32(cols), np.int32(rows),
+                        batch_path_rssi, np.int32(cols), np.int32(rows),
                     )
                 reduce_blocks, reduce_threads = self._launch_shape(work_count)
-                _cuda_reduce_rssi_paths[reduce_blocks, reduce_threads, stream](
-                    d_valid, d_path_rssi, np.int32(ap_count), np.float32(disconnected),
+                _cuda_reduce_rssi_paths[reduce_blocks, reduce_threads, batch_stream](
+                    d_valid, batch_path_rssi, np.int32(ap_count), np.float32(disconnected),
                     np.int32(combine_mode), np.int64(start_gid), np.int64(work_count),
                     d_rssi, d_counts,
                 )
@@ -968,7 +1068,8 @@ class NumbaCUDARFAccelerator:
                 # They use one stream, so the temporary buffer is reused safely
                 # while the GPU remains continuously fed.
                 if queued_chunks >= effective_queue_depth or is_last:
-                    stream.synchronize()
+                    for batch_stream in streams:
+                        batch_stream.synchronize()
                     queued_chunks = 0
                     if self._cancelled(settings):
                         raise RuntimeError("RSSI calculation cancelled")
@@ -992,7 +1093,9 @@ class NumbaCUDARFAccelerator:
                 "cooperative_threads": int(cooperative_threads if use_block_kernel else 1),
                 "chunk_points": int(chunk_points),
                 "chunks": int(chunk_count),
+                "chunk_memory_budget_points": int(max_points_by_temp_stream),
                 "queue_depth": int(effective_queue_depth),
+                "streams": int(len(streams)),
                 "max_barrier_checks_per_launch": int(max_barrier_checks),
                 "path_items": int(total * ap_count),
                 "temporary_mb": float(max_path_items * 4 / (1024 * 1024)),
@@ -1069,6 +1172,20 @@ __kernel void colourise(__global const float *values,const int points,__global c
   if(selected<0)selected=v>=maxs[hi]?hi:lo;out[gid]=colours[selected];
  }
 }
+
+inline int line_box_z_hit(const float ax,const float ay,const float az,const float dx,const float dy,const float z_delta,
+ const float min_x,const float max_x,const float min_y,const float max_y,const float z_min,const float z_max){
+ float t0=0.0f,t1=1.0f;
+ if(fabs(dx)<1.0e-7f){if(ax<min_x||ax>max_x)return 0;}
+ else{float tx1=(min_x-ax)/dx,tx2=(max_x-ax)/dx;if(tx1>tx2){float tmp=tx1;tx1=tx2;tx2=tmp;}
+  if(tx1>t0)t0=tx1;if(tx2<t1)t1=tx2;if(t0>t1)return 0;}
+ if(fabs(dy)<1.0e-7f){if(ay<min_y||ay>max_y)return 0;}
+ else{float ty1=(min_y-ay)/dy,ty2=(max_y-ay)/dy;if(ty1>ty2){float tmp=ty1;ty1=ty2;ty2=tmp;}
+  if(ty1>t0)t0=ty1;if(ty2<t1)t1=ty2;if(t0>t1)return 0;}
+ if(t1<0.0f||t0>1.0f)return 0;if(t0<0.0f)t0=0.0f;if(t1>1.0f)t1=1.0f;
+ const float za=az+z_delta*t0,zb=az+z_delta*t1;const float zlo=fmin(za,zb),zhi=fmax(za,zb);
+ return (zhi>=z_min&&zlo<=z_max)?1:0;
+}
 __kernel void direct_rssi_paths(__global const float *xs,__global const float *ys,
  __global const uchar *valid,__global const float *aps,__global const float *segments,
  __global const int *segment_indices,__global const int *offsets,__global const float *receiver_z,
@@ -1089,8 +1206,9 @@ __kernel void direct_rssi_paths(__global const float *xs,__global const float *y
   if(cutoff2>0.0f&&d2xy>cutoff2){path_rssi[path_index]=NAN;continue;}
   float d3=sqrt(d2xy+dz2);d3=fmax(d3,1.0f);float wall_loss=0.0f;
   const float ray_min_x=fmin(ax,x),ray_max_x=fmax(ax,x),ray_min_y=fmin(ay,y),ray_max_y=fmax(ay,y);
-  for(int pi=offsets[ai];pi<offsets[ai+1];++pi){const int si=segment_indices[pi];const int sb=si*11;
+  for(int pi=offsets[ai];pi<offsets[ai+1];++pi){const int si=segment_indices[pi];const int sb=si*12;
    if(segments[sb+8]<ray_min_x-1.0e-5f||segments[sb+7]>ray_max_x+1.0e-5f||segments[sb+10]<ray_min_y-1.0e-5f||segments[sb+9]>ray_max_y+1.0e-5f)continue;
+   if(segments[sb+11]>=0.5f){if(line_box_z_hit(ax,ay,az,dx,dy,z_delta,segments[sb+7],segments[sb+8],segments[sb+9],segments[sb+10],segments[sb+4],segments[sb+5]))wall_loss+=segments[sb+6];continue;}
    const float x1=segments[sb],y1=segments[sb+1],sdx=segments[sb+2],sdy=segments[sb+3];
    const float den=dx*sdy-dy*sdx;if(fabs(den)<1.0e-7f)continue;
    const float t=((x1-ax)*sdy-(y1-ay)*sdx)/den;
@@ -1136,8 +1254,9 @@ __kernel void inspect_direct_paths(__global const float *aps,__global const floa
   if(cutoff2>0.0f&&d2xy>cutoff2){out[ob]=disconnected;out[ob+1]=sqrt(fmax(d2xy+dz2,1.0f));out[ob+2]=0.0f;out[ob+3]=0.0f;continue;}
   const float d3=fmax(sqrt(d2xy+dz2),1.0f);float wall_loss=0.0f;
   const float ray_min_x=fmin(ax,x),ray_max_x=fmax(ax,x),ray_min_y=fmin(ay,y),ray_max_y=fmax(ay,y);
-  for(int pi=offsets[ai];pi<offsets[ai+1];++pi){const int si=segment_indices[pi];const int sb=si*11;
+  for(int pi=offsets[ai];pi<offsets[ai+1];++pi){const int si=segment_indices[pi];const int sb=si*12;
    if(segments[sb+8]<ray_min_x-1.0e-5f||segments[sb+7]>ray_max_x+1.0e-5f||segments[sb+10]<ray_min_y-1.0e-5f||segments[sb+9]>ray_max_y+1.0e-5f)continue;
+   if(segments[sb+11]>=0.5f){if(line_box_z_hit(ax,ay,az,dx,dy,z_delta,segments[sb+7],segments[sb+8],segments[sb+9],segments[sb+10],segments[sb+4],segments[sb+5]))wall_loss+=segments[sb+6];continue;}
    const float x1=segments[sb],y1=segments[sb+1],sdx=segments[sb+2],sdy=segments[sb+3];
    const float den=dx*sdy-dy*sdx;if(fabs(den)<1.0e-7f)continue;
    const float t=((x1-ax)*sdy-(y1-ay)*sdx)/den;
@@ -1411,7 +1530,23 @@ def _prepare_direct_inputs(ap_data: np.ndarray, segments: np.ndarray, dtype=np.f
     aps = np.ascontiguousarray(np.asarray(ap_data, dtype=np.float64).reshape(-1, column_count))
     if aps.shape[1] < 10:
         raise ValueError("Direct RSSI AP data must contain at least 10 columns")
-    raw_segments = np.ascontiguousarray(np.asarray(segments, dtype=np.float64).reshape(-1, 7))
+    raw_segment_array = np.asarray(segments, dtype=np.float64)
+    if raw_segment_array.size == 0:
+        raw_segments = np.zeros((0, 8), dtype=np.float64)
+    else:
+        raw_segment_array = np.ascontiguousarray(raw_segment_array)
+        if raw_segment_array.ndim == 1:
+            if raw_segment_array.size % 8 == 0:
+                raw_segments = raw_segment_array.reshape(-1, 8)
+            else:
+                raw_segments = raw_segment_array.reshape(-1, 7)
+        else:
+            raw_segments = raw_segment_array.reshape(-1, raw_segment_array.shape[-1])
+        if raw_segments.shape[1] < 8:
+            raw_segments = np.column_stack([raw_segments[:, :7], np.zeros(raw_segments.shape[0], dtype=np.float64)])
+        elif raw_segments.shape[1] > 8:
+            raw_segments = raw_segments[:, :8]
+        raw_segments = np.ascontiguousarray(raw_segments, dtype=np.float64)
     dtype = np.dtype(dtype)
     cache_key = (dtype.str, _prepared_array_signature(aps), _prepared_array_signature(raw_segments))
     with _PREPARED_INPUT_CACHE_LOCK:
@@ -1422,11 +1557,13 @@ def _prepare_direct_inputs(ap_data: np.ndarray, segments: np.ndarray, dtype=np.f
 
     segment_count = raw_segments.shape[0]
     if segment_count:
+        mode = raw_segments[:, 7]
+        solid = mode >= 0.5
         min_x = np.minimum(raw_segments[:, 0], raw_segments[:, 2])
         max_x = np.maximum(raw_segments[:, 0], raw_segments[:, 2])
         min_y = np.minimum(raw_segments[:, 1], raw_segments[:, 3])
         max_y = np.maximum(raw_segments[:, 1], raw_segments[:, 3])
-        prepared_segments = np.empty((segment_count, 11), dtype=dtype)
+        prepared_segments = np.empty((segment_count, 12), dtype=dtype)
         prepared_segments[:, 0] = raw_segments[:, 0]
         prepared_segments[:, 1] = raw_segments[:, 1]
         prepared_segments[:, 2] = raw_segments[:, 2] - raw_segments[:, 0]
@@ -1436,11 +1573,12 @@ def _prepare_direct_inputs(ap_data: np.ndarray, segments: np.ndarray, dtype=np.f
         prepared_segments[:, 8] = max_x
         prepared_segments[:, 9] = min_y
         prepared_segments[:, 10] = max_y
+        prepared_segments[:, 11] = mode
         nonzero_loss = np.abs(raw_segments[:, 6]) > 1.0e-12
     else:
         # Some OpenCL runtimes reject zero-byte buffers. Offsets remain zero,
         # so this dummy row is never read.
-        prepared_segments = np.zeros((1, 11), dtype=dtype)
+        prepared_segments = np.zeros((1, 12), dtype=dtype)
         min_x = max_x = min_y = max_y = np.zeros(0, dtype=np.float64)
         nonzero_loss = np.zeros(0, dtype=bool)
 
@@ -1450,7 +1588,7 @@ def _prepare_direct_inputs(ap_data: np.ndarray, segments: np.ndarray, dtype=np.f
     packed_total = 0
     for ai in range(aps.shape[0]):
         ax, ay, az, rz, tx, gain, freq_mhz, ple, cutoff2, floor_loss = aps[ai, :10]
-        fspl_1m = 20.0 * math.log10(max(freq_mhz, 1.0e-12)) - 27.55
+        fspl_1m = 20.0 * math.log10(max(freq_mhz, 1.0e-12)) + P525_ONE_METRE_MHZ_CONSTANT_DB
         compact[ai] = (
             ax, ay, az, rz - az, tx + gain - fspl_1m - floor_loss, 10.0 * ple, cutoff2,
             (rz - az) * (rz - az),
@@ -1531,6 +1669,55 @@ if njit is not None:
                     if (segments[si, 8] < ray_min_x - 1.0e-5 or segments[si, 7] > ray_max_x + 1.0e-5 or
                             segments[si, 10] < ray_min_y - 1.0e-5 or segments[si, 9] > ray_max_y + 1.0e-5):
                         continue
+                    if segments[si, 11] >= 0.5:
+                        t0 = 0.0
+                        t1 = 1.0
+                        hit_box = True
+                        min_x = segments[si, 7]; max_x = segments[si, 8]
+                        min_y = segments[si, 9]; max_y = segments[si, 10]
+                        if dx > -1.0e-7 and dx < 1.0e-7:
+                            if ax < min_x or ax > max_x:
+                                hit_box = False
+                        else:
+                            inv_dx = 1.0 / dx
+                            tx1 = (min_x - ax) * inv_dx
+                            tx2 = (max_x - ax) * inv_dx
+                            if tx1 > tx2:
+                                tmp = tx1; tx1 = tx2; tx2 = tmp
+                            if tx1 > t0:
+                                t0 = tx1
+                            if tx2 < t1:
+                                t1 = tx2
+                            if t0 > t1:
+                                hit_box = False
+                        if hit_box:
+                            if dy > -1.0e-7 and dy < 1.0e-7:
+                                if ay < min_y or ay > max_y:
+                                    hit_box = False
+                            else:
+                                inv_dy = 1.0 / dy
+                                ty1 = (min_y - ay) * inv_dy
+                                ty2 = (max_y - ay) * inv_dy
+                                if ty1 > ty2:
+                                    tmp = ty1; ty1 = ty2; ty2 = tmp
+                                if ty1 > t0:
+                                    t0 = ty1
+                                if ty2 < t1:
+                                    t1 = ty2
+                                if t0 > t1:
+                                    hit_box = False
+                        if hit_box and not (t1 < 0.0 or t0 > 1.0):
+                            if t0 < 0.0:
+                                t0 = 0.0
+                            if t1 > 1.0:
+                                t1 = 1.0
+                            za = az + z_delta * t0
+                            zb = az + z_delta * t1
+                            zlo = za if za < zb else zb
+                            zhi = zb if zb > za else za
+                            if zhi >= segments[si, 4] and zlo <= segments[si, 5]:
+                                wall_loss += segments[si, 6]
+                        continue
                     x1 = segments[si, 0]; y1 = segments[si, 1]
                     sdx = segments[si, 2]; sdy = segments[si, 3]
                     den = (x - ax) * sdy - (y - ay) * sdx
@@ -1593,7 +1780,10 @@ def gpu_direct_rssi_grid(xs: np.ndarray, ys: np.ndarray, ap_data: np.ndarray, se
         chunks = int(stats.get("chunks", 1) or 1)
         chunk_points = int(stats.get("chunk_points", 0) or 0)
         cooperative_threads = int(stats.get("cooperative_threads", 1) or 1)
+        streams = int(stats.get("streams", 1) or 1)
         detail = f"; {kernel}, {chunks} launch chunk(s), {chunk_points:,} points/chunk"
+        if streams > 1:
+            detail += f", {streams} streams"
         if cooperative_threads > 1:
             detail += f", {cooperative_threads} threads/path"
     return rssi, counts, f"{backend_name}: {label}{detail}"
