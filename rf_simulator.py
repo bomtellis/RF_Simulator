@@ -760,6 +760,47 @@ class AccessPoint:
 
 
 @dataclass
+class WirelessClient:
+    name: str
+    x: float
+    y: float
+    floor: str
+    frequency_mhz: float = 5000.0
+    minimum_rssi_dbm: float = -67.0
+
+    def __post_init__(self):
+        self.frequency_mhz = _normalise_radio_frequency_mhz(
+            self.frequency_mhz, f"{self.name} wireless client"
+        )
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "name": str(self.name),
+            "x": float(self.x),
+            "y": float(self.y),
+            "floor": str(self.floor),
+            "frequency_mhz": float(self.frequency_mhz),
+            "minimum_rssi_dbm": float(self.minimum_rssi_dbm),
+        }
+
+    @classmethod
+    def from_dict(cls, data: object) -> Optional["WirelessClient"]:
+        if not isinstance(data, dict):
+            return None
+        try:
+            return cls(
+                name=str(data.get("name", "Client")),
+                x=float(data.get("x", 0.0)),
+                y=float(data.get("y", 0.0)),
+                floor=str(data.get("floor", "")),
+                frequency_mhz=float(data.get("frequency_mhz", 5000.0)),
+                minimum_rssi_dbm=float(data.get("minimum_rssi_dbm", -67.0)),
+            )
+        except Exception:
+            return None
+
+
+@dataclass
 class PlannerRadioRequirement:
     name: str = "5 GHz"
     enabled: bool = True
@@ -9633,25 +9674,42 @@ class PlannerRunSelectionDialog(QDialog):
         radio_profile_names: Optional[Sequence[str]] = None,
         radio_profile_definitions: Optional[Dict[str, List[Dict[str, object]]]] = None,
         default_ap_radios: Optional[Sequence[Dict[str, object]]] = None,
+        planner_settings: Optional[AutoPlannerSettings] = None,
+        pattern_names: Optional[Sequence[str]] = None,
+        current_frequency_mhz: float = 5000.0,
     ):
         super().__init__(parent)
-        self.setWindowTitle("Predict AP locations - floors and radios")
-        self.resize(820, 600)
+        self.setWindowTitle("Predict AP locations")
+        self.resize(900, 760)
         self._current_floor_name = str(current_floor_name or "")
+        self._planner_settings = copy.deepcopy(planner_settings or AutoPlannerSettings())
+        self._pattern_names = list(pattern_names or [])
         self._radio_profile_definitions = {
             str(name): [dict(radio) for radio in radios if isinstance(radio, dict)]
             for name, radios in (radio_profile_definitions or RADIO_PROFILE_PRESETS).items()
         }
         self._default_ap_radios = [dict(radio) for radio in (default_ap_radios or []) if isinstance(radio, dict)]
+        active_requirements = [radio for radio in self._planner_settings.radio_requirements if radio.enabled]
+        self._default_min_rssi_requirement = min(
+            active_requirements or self._planner_settings.radio_requirements or [PlannerRadioRequirement()],
+            key=lambda radio: abs(float(radio.frequency_mhz) - float(current_frequency_mhz)),
+        )
 
         layout = QVBoxLayout(self)
         intro = QLabel(
-            "Select the floors to plan and the radio definitions to install in each predicted AP. "
-            "A planned AP can contain several selected radios operating at different frequencies. "
-            "Coverage, handover and client-capacity targets are evaluated independently on each floor."
+            "Select the floors to plan, then choose the prediction method and the data needed by that method. "
+            "Both methods use the same RSSI-driven placement engine and permitted planning area."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
+
+        method_form = QFormLayout()
+        self.method_combo = QComboBox()
+        self.method_combo.addItem("Planner radio requirements", "radio_requirements")
+        self.method_combo.addItem("Minimum RSSI at frequency", "minimum_rssi")
+        self.method_combo.addItem("Defined wireless clients", "wireless_clients")
+        method_form.addRow("Prediction method", self.method_combo)
+        layout.addLayout(method_form)
 
         columns = QHBoxLayout()
         layout.addLayout(columns, 1)
@@ -9699,12 +9757,12 @@ class PlannerRunSelectionDialog(QDialog):
             self.radio_list.addItem(item)
         radio_column.addWidget(self.radio_list, 1)
         radio_buttons = QHBoxLayout()
-        radio_all = QPushButton("All")
-        radio_all.clicked.connect(lambda: self._set_all_checked(self.radio_list, True))
-        radio_none = QPushButton("None")
-        radio_none.clicked.connect(lambda: self._set_all_checked(self.radio_list, False))
-        radio_buttons.addWidget(radio_all)
-        radio_buttons.addWidget(radio_none)
+        self.radio_all_button = QPushButton("All")
+        self.radio_all_button.clicked.connect(lambda: self._set_all_checked(self.radio_list, True))
+        self.radio_none_button = QPushButton("None")
+        self.radio_none_button.clicked.connect(lambda: self._set_all_checked(self.radio_list, False))
+        radio_buttons.addWidget(self.radio_all_button)
+        radio_buttons.addWidget(self.radio_none_button)
         radio_buttons.addStretch(1)
         radio_column.addLayout(radio_buttons)
         columns.addLayout(radio_column, 1)
@@ -9722,18 +9780,169 @@ class PlannerRunSelectionDialog(QDialog):
         profile_row.addRow("AP radio profile", self.radio_profile)
         layout.addLayout(profile_row)
 
+        self.minimum_rssi_panel = QFrame()
+        min_form = QFormLayout(self.minimum_rssi_panel)
+        requirement = self._default_min_rssi_requirement
+        self.min_frequency = QDoubleSpinBox()
+        self.min_frequency.setRange(1.0, 100000.0)
+        self.min_frequency.setDecimals(3)
+        self.min_frequency.setSuffix(" MHz")
+        self.min_frequency.setValue(float(requirement.frequency_mhz))
+        self.min_rssi = QDoubleSpinBox()
+        self.min_rssi.setRange(-150.0, -10.0)
+        self.min_rssi.setDecimals(1)
+        self.min_rssi.setSuffix(" dBm")
+        self.min_rssi.setValue(float(requirement.minimum_rssi_dbm))
+        self.min_target = QDoubleSpinBox()
+        self.min_target.setRange(1.0, 100.0)
+        self.min_target.setDecimals(1)
+        self.min_target.setSuffix(" %")
+        self.min_target.setValue(float(self._planner_settings.target_coverage_percent))
+        self.min_tx_power = QDoubleSpinBox()
+        self.min_tx_power.setRange(-50.0, 100.0)
+        self.min_tx_power.setDecimals(1)
+        self.min_tx_power.setSuffix(" dBm")
+        self.min_tx_power.setValue(float(requirement.tx_power_dbm))
+        self.min_antenna_gain = QDoubleSpinBox()
+        self.min_antenna_gain.setRange(-50.0, 100.0)
+        self.min_antenna_gain.setDecimals(1)
+        self.min_antenna_gain.setSuffix(" dBi")
+        self.min_antenna_gain.setValue(float(requirement.antenna_gain_dbi))
+        self.min_pattern = QComboBox()
+        self.min_pattern.addItems(self._pattern_names)
+        self.min_pattern.setEditable(True)
+        self.min_pattern.setCurrentText(str(requirement.antenna_pattern or "Omni ceiling AP"))
+        self.min_channel_width = QDoubleSpinBox()
+        self.min_channel_width.setRange(0.01, 1000.0)
+        self.min_channel_width.setDecimals(1)
+        self.min_channel_width.setSuffix(" MHz")
+        self.min_channel_width.setValue(float(requirement.channel_width_mhz))
+        self.min_channels = QLineEdit(", ".join(requirement.channels or ["1"]))
+        self.min_sample_spacing = QDoubleSpinBox()
+        self.min_sample_spacing.setRange(0.5, 25.0)
+        self.min_sample_spacing.setDecimals(2)
+        self.min_sample_spacing.setSuffix(" m")
+        self.min_sample_spacing.setValue(float(self._planner_settings.sample_spacing_m))
+        self.min_candidate_spacing = QDoubleSpinBox()
+        self.min_candidate_spacing.setRange(1.0, 50.0)
+        self.min_candidate_spacing.setDecimals(2)
+        self.min_candidate_spacing.setSuffix(" m")
+        self.min_candidate_spacing.setValue(float(self._planner_settings.candidate_spacing_m))
+        self.min_ap_spacing = QDoubleSpinBox()
+        self.min_ap_spacing.setRange(0.0, 100.0)
+        self.min_ap_spacing.setDecimals(2)
+        self.min_ap_spacing.setSuffix(" m")
+        self.min_ap_spacing.setValue(float(self._planner_settings.minimum_ap_spacing_m))
+        self.min_maximum_aps = QSpinBox()
+        self.min_maximum_aps.setRange(1, 10_000)
+        self.min_maximum_aps.setValue(int(self._planner_settings.maximum_aps))
+        self.min_keep_existing = QCheckBox("Count and retain manually placed APs on each planned floor")
+        self.min_keep_existing.setChecked(bool(self._planner_settings.keep_existing_aps))
+        self.min_remove_planned = QCheckBox("Replace APs created by the previous planner run")
+        self.min_remove_planned.setChecked(bool(self._planner_settings.remove_previous_planned_aps))
+        min_form.addRow("Frequency", self.min_frequency)
+        min_form.addRow("Minimum RSSI", self.min_rssi)
+        min_form.addRow("Target floor coverage", self.min_target)
+        min_form.addRow("Transmit power", self.min_tx_power)
+        min_form.addRow("Additional antenna gain", self.min_antenna_gain)
+        min_form.addRow("Antenna pattern", self.min_pattern)
+        min_form.addRow("Channel width", self.min_channel_width)
+        min_form.addRow("Allowed channels", self.min_channels)
+        min_form.addRow("Coverage sample spacing", self.min_sample_spacing)
+        min_form.addRow("Candidate AP spacing", self.min_candidate_spacing)
+        min_form.addRow("Minimum AP separation", self.min_ap_spacing)
+        min_form.addRow("Maximum planned APs", self.min_maximum_aps)
+        min_form.addRow(self.min_keep_existing)
+        min_form.addRow(self.min_remove_planned)
+        layout.addWidget(self.minimum_rssi_panel)
+
+        self.client_method_panel = QFrame()
+        client_form = QFormLayout(self.client_method_panel)
+        self.client_target = QDoubleSpinBox()
+        self.client_target.setRange(1.0, 100.0)
+        self.client_target.setDecimals(1)
+        self.client_target.setSuffix(" %")
+        self.client_target.setValue(100.0)
+        self.client_candidate_spacing = QDoubleSpinBox()
+        self.client_candidate_spacing.setRange(1.0, 50.0)
+        self.client_candidate_spacing.setDecimals(2)
+        self.client_candidate_spacing.setSuffix(" m")
+        self.client_candidate_spacing.setValue(float(self._planner_settings.candidate_spacing_m))
+        self.client_ap_spacing = QDoubleSpinBox()
+        self.client_ap_spacing.setRange(0.0, 100.0)
+        self.client_ap_spacing.setDecimals(2)
+        self.client_ap_spacing.setSuffix(" m")
+        self.client_ap_spacing.setValue(float(self._planner_settings.minimum_ap_spacing_m))
+        self.client_maximum_aps = QSpinBox()
+        self.client_maximum_aps.setRange(1, 10_000)
+        self.client_maximum_aps.setValue(int(self._planner_settings.maximum_aps))
+        self.client_tx_power = QDoubleSpinBox()
+        self.client_tx_power.setRange(-50.0, 100.0)
+        self.client_tx_power.setDecimals(1)
+        self.client_tx_power.setSuffix(" dBm")
+        self.client_tx_power.setValue(float(self._default_min_rssi_requirement.tx_power_dbm))
+        self.client_antenna_gain = QDoubleSpinBox()
+        self.client_antenna_gain.setRange(-50.0, 100.0)
+        self.client_antenna_gain.setDecimals(1)
+        self.client_antenna_gain.setSuffix(" dBi")
+        self.client_antenna_gain.setValue(float(self._default_min_rssi_requirement.antenna_gain_dbi))
+        self.client_pattern = QComboBox()
+        self.client_pattern.addItems(self._pattern_names)
+        self.client_pattern.setEditable(True)
+        self.client_pattern.setCurrentText(str(self._default_min_rssi_requirement.antenna_pattern or "Omni ceiling AP"))
+        self.client_channel_width = QDoubleSpinBox()
+        self.client_channel_width.setRange(0.01, 1000.0)
+        self.client_channel_width.setDecimals(1)
+        self.client_channel_width.setSuffix(" MHz")
+        self.client_channel_width.setValue(float(self._default_min_rssi_requirement.channel_width_mhz))
+        self.client_channels = QLineEdit(", ".join(self._default_min_rssi_requirement.channels or ["1"]))
+        self.client_keep_existing = QCheckBox("Count and retain manually placed APs on each planned floor")
+        self.client_keep_existing.setChecked(bool(self._planner_settings.keep_existing_aps))
+        self.client_remove_planned = QCheckBox("Replace APs created by the previous planner run")
+        self.client_remove_planned.setChecked(bool(self._planner_settings.remove_previous_planned_aps))
+        client_form.addRow("Required client coverage", self.client_target)
+        client_form.addRow("Candidate AP spacing", self.client_candidate_spacing)
+        client_form.addRow("Minimum AP separation", self.client_ap_spacing)
+        client_form.addRow("Maximum planned APs", self.client_maximum_aps)
+        client_form.addRow("Transmit power", self.client_tx_power)
+        client_form.addRow("Additional antenna gain", self.client_antenna_gain)
+        client_form.addRow("Antenna pattern", self.client_pattern)
+        client_form.addRow("Channel width", self.client_channel_width)
+        client_form.addRow("Allowed channels", self.client_channels)
+        client_form.addRow(self.client_keep_existing)
+        client_form.addRow(self.client_remove_planned)
+        layout.addWidget(self.client_method_panel)
+
         self.summary = QLabel()
         self.summary.setWordWrap(True)
         layout.addWidget(self.summary)
         self.floor_list.itemChanged.connect(self._update_summary)
         self.radio_list.itemChanged.connect(self._update_summary)
         self.radio_profile.currentTextChanged.connect(self._radio_profile_changed)
+        self.method_combo.currentIndexChanged.connect(self._method_changed)
+        for widget in (
+            self.min_frequency, self.min_rssi, self.min_target, self.min_tx_power, self.min_antenna_gain,
+            self.min_pattern, self.min_channel_width, self.min_channels, self.min_sample_spacing,
+            self.min_candidate_spacing, self.min_ap_spacing, self.min_maximum_aps,
+            self.min_keep_existing, self.min_remove_planned,
+            self.client_target, self.client_candidate_spacing, self.client_ap_spacing,
+            self.client_maximum_aps, self.client_tx_power, self.client_antenna_gain,
+            self.client_pattern, self.client_channel_width, self.client_channels,
+            self.client_keep_existing, self.client_remove_planned,
+        ):
+            if hasattr(widget, "valueChanged"):
+                widget.valueChanged.connect(self._update_summary)
+            elif hasattr(widget, "textChanged"):
+                widget.textChanged.connect(self._update_summary)
+            elif hasattr(widget, "toggled"):
+                widget.toggled.connect(self._update_summary)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
         self._radio_profile_changed(self.radio_profile.currentText())
+        self._method_changed()
 
     def _set_all_checked(self, list_widget: QListWidget, checked: bool):
         state = Qt.Checked if checked else Qt.Unchecked
@@ -9776,6 +9985,101 @@ class PlannerRunSelectionDialog(QDialog):
     def selected_radio_profile(self) -> str:
         return str(self.radio_profile.currentText() or "Predictive planner").strip() or "Predictive planner"
 
+    def selected_prediction_method(self) -> str:
+        return str(self.method_combo.currentData() or "radio_requirements")
+
+    def minimum_rssi_requirement(self) -> PlannerRadioRequirement:
+        channels = [
+            value.strip()
+            for value in self.min_channels.text().replace(";", ",").split(",")
+            if value.strip()
+        ]
+        return PlannerRadioRequirement(
+            name=f"{float(self.min_frequency.value()):g} MHz",
+            enabled=True,
+            frequency_mhz=float(self.min_frequency.value()),
+            tx_power_dbm=float(self.min_tx_power.value()),
+            antenna_pattern=str(self.min_pattern.currentText() or "Omni ceiling AP").strip() or "Omni ceiling AP",
+            antenna_gain_dbi=float(self.min_antenna_gain.value()),
+            channel_width_mhz=float(self.min_channel_width.value()),
+            channels=channels or ["1"],
+            spectrum_occupancy_percent=0.0,
+            minimum_rssi_dbm=float(self.min_rssi.value()),
+            cutoff_radius_m=0.0,
+        )
+
+    def minimum_rssi_settings(self, base: AutoPlannerSettings) -> AutoPlannerSettings:
+        settings = copy.deepcopy(base)
+        settings.target_coverage_percent = float(self.min_target.value())
+        settings.coverage_mode = "all"
+        settings.handover_enabled = False
+        settings.target_handover_percent = 0.0
+        settings.expected_clients = 0
+        settings.sample_spacing_m = float(self.min_sample_spacing.value())
+        settings.candidate_spacing_m = float(self.min_candidate_spacing.value())
+        settings.minimum_ap_spacing_m = float(self.min_ap_spacing.value())
+        settings.maximum_aps = int(self.min_maximum_aps.value())
+        settings.keep_existing_aps = bool(self.min_keep_existing.isChecked())
+        settings.remove_previous_planned_aps = bool(self.min_remove_planned.isChecked())
+        settings.include_inter_floor_rf = False
+        settings.ap_radio_profile = "Predictive planner"
+        settings.radio_requirements = [self.minimum_rssi_requirement()]
+        return settings
+
+    def wireless_client_settings(self, base: AutoPlannerSettings, clients: Sequence[WirelessClient]) -> Tuple[AutoPlannerSettings, List[PlannerRadioRequirement], List[Tuple[float, float]], List[np.ndarray]]:
+        channels = [
+            value.strip()
+            for value in self.client_channels.text().replace(";", ",").split(",")
+            if value.strip()
+        ] or ["1"]
+        floor_clients = list(clients)
+        frequencies = sorted({float(client.frequency_mhz) for client in floor_clients})
+        requirements: List[PlannerRadioRequirement] = []
+        thresholds_by_radio: List[np.ndarray] = []
+        for frequency in frequencies:
+            matching_thresholds = [
+                float(client.minimum_rssi_dbm)
+                for client in floor_clients
+                if abs(float(client.frequency_mhz) - frequency) < 1e-6
+            ]
+            requirement = PlannerRadioRequirement(
+                name=f"Client {frequency:g} MHz",
+                enabled=True,
+                frequency_mhz=float(frequency),
+                tx_power_dbm=float(self.client_tx_power.value()),
+                antenna_pattern=str(self.client_pattern.currentText() or "Omni ceiling AP").strip() or "Omni ceiling AP",
+                antenna_gain_dbi=float(self.client_antenna_gain.value()),
+                channel_width_mhz=float(self.client_channel_width.value()),
+                channels=list(channels),
+                spectrum_occupancy_percent=0.0,
+                minimum_rssi_dbm=max(matching_thresholds) if matching_thresholds else -67.0,
+                cutoff_radius_m=0.0,
+            )
+            requirements.append(requirement)
+            thresholds_by_radio.append(np.asarray([
+                float(client.minimum_rssi_dbm)
+                if abs(float(client.frequency_mhz) - frequency) < 1e-6
+                else -1_000_000.0
+                for client in floor_clients
+            ], dtype=np.float32))
+        settings = copy.deepcopy(base)
+        settings.target_coverage_percent = float(self.client_target.value())
+        settings.coverage_mode = "all"
+        settings.handover_enabled = False
+        settings.target_handover_percent = 0.0
+        settings.expected_clients = 0
+        settings.sample_spacing_m = 1.0
+        settings.candidate_spacing_m = float(self.client_candidate_spacing.value())
+        settings.minimum_ap_spacing_m = float(self.client_ap_spacing.value())
+        settings.maximum_aps = int(self.client_maximum_aps.value())
+        settings.keep_existing_aps = bool(self.client_keep_existing.isChecked())
+        settings.remove_previous_planned_aps = bool(self.client_remove_planned.isChecked())
+        settings.include_inter_floor_rf = False
+        settings.ap_radio_profile = "Predictive planner"
+        settings.radio_requirements = [copy.deepcopy(requirement) for requirement in requirements]
+        samples = [(float(client.x), float(client.y)) for client in floor_clients]
+        return settings, requirements, samples, thresholds_by_radio
+
     def _profile_frequencies(self, profile_name: str) -> List[float]:
         profile_name = str(profile_name or "Predictive planner")
         if profile_name == "Predictive planner":
@@ -9809,25 +10113,49 @@ class PlannerRunSelectionDialog(QDialog):
                 self.radio_list.blockSignals(False)
         self._update_summary()
 
+    def _method_changed(self, *_):
+        method = self.selected_prediction_method()
+        simple_mode = method in {"minimum_rssi", "wireless_clients"}
+        self.radio_list.setEnabled(not simple_mode)
+        self.radio_profile.setEnabled(not simple_mode)
+        self.radio_all_button.setEnabled(not simple_mode)
+        self.radio_none_button.setEnabled(not simple_mode)
+        self.minimum_rssi_panel.setVisible(method == "minimum_rssi")
+        self.client_method_panel.setVisible(method == "wireless_clients")
+        self._update_summary()
+
     def _update_summary(self, *_):
         floor_count = len(self.selected_floor_names())
-        radio_count = len(self.selected_radio_indices())
-        profile_name = self.selected_radio_profile()
-        self.summary.setText(
-            f"Selected: {floor_count} floor{'s' if floor_count != 1 else ''}; "
-            f"each predicted AP will contain {radio_count} radio{'s' if radio_count != 1 else ''}; "
-            f"AP radio profile: {profile_name}."
-        )
+        method = self.selected_prediction_method()
+        if method == "minimum_rssi":
+            self.summary.setText(
+                f"Selected: {floor_count} floor{'s' if floor_count != 1 else ''}; "
+                f"minimum RSSI method at {float(self.min_frequency.value()):g} MHz, "
+                f"{float(self.min_rssi.value()):.1f} dBm target, "
+                f"{float(self.min_target.value()):.1f}% coverage."
+            )
+        elif method == "wireless_clients":
+            self.summary.setText(
+                f"Selected: {floor_count} floor{'s' if floor_count != 1 else ''}; "
+                f"defined wireless clients method, {float(self.client_target.value()):.1f}% of client requirements."
+            )
+        else:
+            radio_count = len(self.selected_radio_indices())
+            profile_name = self.selected_radio_profile()
+            self.summary.setText(
+                f"Selected: {floor_count} floor{'s' if floor_count != 1 else ''}; "
+                f"each predicted AP will contain {radio_count} radio{'s' if radio_count != 1 else ''}; "
+                f"AP radio profile: {profile_name}."
+            )
 
     def accept(self):
         if not self.selected_floor_names():
             QMessageBox.warning(self, "No floors selected", "Select at least one floor for AP prediction.")
             return
-        if not self.selected_radio_indices():
+        if self.selected_prediction_method() == "radio_requirements" and not self.selected_radio_indices():
             QMessageBox.warning(self, "No radios selected", "Select at least one planner radio.")
             return
         super().accept()
-
 
 class RadioProfileManagerDialog(QDialog):
     HEADERS = ["Enabled", "Name", "Frequency MHz", "Pattern", "TX dBm", "Gain dBi", "Width MHz", "Channel", "Occupancy %", "Cut-off m"]
@@ -10394,11 +10722,22 @@ class PDFExportSelectionDialog(QDialog):
         frequency_column.addLayout(frequency_buttons)
         columns.addLayout(frequency_column, 1)
 
+        scale_row = QHBoxLayout()
+        scale_row.addWidget(QLabel("Plan scale"))
+        self.scale_combo = QComboBox()
+        for denominator in (100, 200, 500, 1000):
+            self.scale_combo.addItem(f"1:{denominator}", int(denominator))
+        self.scale_combo.setCurrentIndex(2)
+        scale_row.addWidget(self.scale_combo)
+        scale_row.addStretch(1)
+        layout.addLayout(scale_row)
+
         self.summary = QLabel()
         self.summary.setWordWrap(True)
         layout.addWidget(self.summary)
         self.floor_list.itemChanged.connect(self._update_summary)
         self.frequency_list.itemChanged.connect(self._update_summary)
+        self.scale_combo.currentIndexChanged.connect(self._update_summary)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -10467,6 +10806,9 @@ class PDFExportSelectionDialog(QDialog):
             if self.frequency_list.item(index).checkState() == Qt.Checked
         ]
 
+    def selected_plan_scale_denominator(self) -> int:
+        return int(self.scale_combo.currentData() or 500)
+
     def _update_summary(self, *_):
         floor_count = len(self.selected_floor_names())
         frequency_count = len(self.selected_frequencies())
@@ -10474,7 +10816,8 @@ class PDFExportSelectionDialog(QDialog):
         self.summary.setText(
             f"Selected: {floor_count} floor{'s' if floor_count != 1 else ''}, "
             f"{frequency_count} frequenc{'ies' if frequency_count != 1 else 'y'}, "
-            f"{page_count} PDF page{'s' if page_count != 1 else ''}."
+            f"{page_count} PDF page{'s' if page_count != 1 else ''}, "
+            f"plan scale 1:{self.selected_plan_scale_denominator()}."
         )
 
     def accept(self):
@@ -12423,6 +12766,104 @@ class AccessPointGraphicsItem(QGraphicsPathItem):
             self.main.apply_radio_profile_to_ap(self.ap, profile_actions[chosen])
         event.accept()
 
+
+class WirelessClientDialog(QDialog):
+    def __init__(self, parent, client: Optional[WirelessClient] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Wireless client")
+        self.resize(420, 260)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.name = QLineEdit(str(getattr(client, "name", "Client") or "Client"))
+        self.frequency = QDoubleSpinBox()
+        self.frequency.setRange(1.0, 100000.0)
+        self.frequency.setDecimals(3)
+        self.frequency.setSuffix(" MHz")
+        self.frequency.setValue(float(getattr(client, "frequency_mhz", 5000.0)))
+        self.minimum_rssi = QDoubleSpinBox()
+        self.minimum_rssi.setRange(-150.0, -10.0)
+        self.minimum_rssi.setDecimals(1)
+        self.minimum_rssi.setSuffix(" dBm")
+        self.minimum_rssi.setValue(float(getattr(client, "minimum_rssi_dbm", -67.0)))
+        form.addRow("Name", self.name)
+        form.addRow("Frequency", self.frequency)
+        form.addRow("Minimum RSSI", self.minimum_rssi)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def apply_to(self, client: WirelessClient):
+        client.name = str(self.name.text() or "Client").strip() or "Client"
+        client.frequency_mhz = float(self.frequency.value())
+        client.minimum_rssi_dbm = float(self.minimum_rssi.value())
+
+
+class WirelessClientGraphicsItem(QGraphicsPathItem):
+    def __init__(self, main, client: WirelessClient, radius: float = 0.34):
+        path = QPainterPath()
+        path.addEllipse(-radius, -radius, radius * 2.0, radius * 2.0)
+        path.moveTo(-radius * 0.72, 0.0)
+        path.lineTo(radius * 0.72, 0.0)
+        path.moveTo(0.0, -radius * 0.72)
+        path.lineTo(0.0, radius * 0.72)
+        super().__init__(path)
+        self.main = main
+        self.client = client
+        self.setPos(float(client.x), float(client.y))
+        self.setBrush(QBrush(QColor("#F97316")))
+        pen = QPen(QColor("#7C2D12"), 0.16)
+        pen.setCosmetic(True)
+        self.setPen(pen)
+        self.setZValue(Z_AP + 4)
+        self.setFlags(
+            QGraphicsItem.ItemIsMovable |
+            QGraphicsItem.ItemIsSelectable |
+            QGraphicsItem.ItemSendsGeometryChanges
+        )
+        self.setAcceptedMouseButtons(Qt.LeftButton | Qt.RightButton)
+        self.setCursor(Qt.OpenHandCursor)
+        self._dragged = False
+        self._refresh_tooltip()
+
+    def _refresh_tooltip(self):
+        self.setToolTip(
+            f"{self.client.name}\n"
+            f"Frequency: {float(self.client.frequency_mhz):g} MHz\n"
+            f"Minimum RSSI: {float(self.client.minimum_rssi_dbm):.1f} dBm\n"
+            "Drag to move; right-click for actions."
+        )
+
+    def mouseMoveEvent(self, event):
+        self._dragged = True
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        pos = self.scenePos()
+        self.client.x = float(pos.x())
+        self.client.y = float(pos.y())
+        self.main.populate_client_table()
+        self.main._clear_rssi_results()
+        self.main._preserve_view_on_redraw = True
+        QTimer.singleShot(0, self.main.draw_floor)
+
+    def mouseDoubleClickEvent(self, event):
+        self.main.edit_wireless_client(self.client)
+        event.accept()
+
+    def contextMenuEvent(self, event):
+        menu = QMenu()
+        edit_action = menu.addAction("Edit wireless client")
+        delete_action = menu.addAction("Delete wireless client")
+        chosen = menu.exec(event.screenPos())
+        if chosen == edit_action:
+            self.main.edit_wireless_client(self.client)
+        elif chosen == delete_action:
+            self.main.delete_wireless_client(self.client)
+        event.accept()
+
 # ----------------------------- GUI -----------------------------
 
 class PlanView(QGraphicsView):
@@ -12618,6 +13059,17 @@ class PlanView(QGraphicsView):
             if event.button() == Qt.LeftButton:
                 pos = self.mapToScene(event.position().toPoint())
                 self.main.handle_ap_placement_click(pos)
+                event.accept()
+                return
+
+        if getattr(self.main, "client_placement_mode", False):
+            if event.button() == Qt.RightButton:
+                self.main.cancel_client_placement()
+                event.accept()
+                return
+            if event.button() == Qt.LeftButton:
+                pos = self.mapToScene(event.position().toPoint())
+                self.main.add_wireless_client(float(pos.x()), float(pos.y()))
                 event.accept()
                 return
 
@@ -12822,6 +13274,8 @@ class MainWindow(QMainWindow):
         self.satellite_overlay: Optional[SatelliteOverlay] = None
         self.terrain_model: Optional[TerrainModel] = None
         self.estate_buildings: List[EstateBuilding] = []
+        self.wireless_clients: List[WirelessClient] = []
+        self.client_placement_mode: bool = False
         self.rssi_calculation_extents: Dict[str, Tuple[float, float, float, float]] = {}
         self.ifc_alignment = AlignmentTransform()
         self.alignment_pick_mode: Optional[str] = None
@@ -12854,6 +13308,11 @@ class MainWindow(QMainWindow):
             "TX dBm", "Gain dBi", "Freq MHz", "Channel", "Width MHz", "Occupancy %", "Clients/AP"
         ])
         self.ap_table.itemChanged.connect(self._ap_table_changed)
+        self.client_table = QTableWidget(0, 6)
+        self.client_table.setHorizontalHeaderLabels([
+            "Client", "Floor", "X", "Y", "Freq MHz", "Min RSSI dBm"
+        ])
+        self.client_table.itemChanged.connect(self._client_table_changed)
 
         self.resolution = QDoubleSpinBox()
         self.resolution.setRange(0.5, 10.0)
@@ -13029,6 +13488,14 @@ class MainWindow(QMainWindow):
         self.inspector_tabs.setDocumentMode(True)
         self.inspector_tabs.addTab(settings_scroll, "Settings")
         self.inspector_tabs.addTab(ap_panel, "Access points")
+        client_panel = QWidget()
+        client_panel_layout = QVBoxLayout(client_panel)
+        client_panel_layout.setContentsMargins(4, 4, 4, 4)
+        client_help = QLabel("Define fixed wireless client locations and their required minimum RSSI. Only clients on the active floor are shown on the plan.")
+        client_help.setWordWrap(True)
+        client_panel_layout.addWidget(client_help)
+        client_panel_layout.addWidget(self.client_table, 1)
+        self.inspector_tabs.addTab(client_panel, "Wireless clients")
         self.inspector_tabs.addTab(wall_panel, "Attenuation types")
 
         side = QWidget()
@@ -13039,8 +13506,10 @@ class MainWindow(QMainWindow):
         side_layout.addWidget(self.inspector_tabs, 1)
 
         self.ap_table.setAlternatingRowColors(True)
+        self.client_table.setAlternatingRowColors(True)
         self.wall_table.setAlternatingRowColors(True)
         self.ap_table.verticalHeader().setVisible(False)
+        self.client_table.verticalHeader().setVisible(False)
         self.wall_table.verticalHeader().setVisible(False)
 
         model_panel = QWidget()
@@ -13116,6 +13585,11 @@ class MainWindow(QMainWindow):
         self.place_ap_action = QAction("Place access points", self)
         self.place_ap_action.setCheckable(True)
         self.place_ap_action.toggled.connect(self.toggle_single_ap_placement)
+        self.place_client_action = QAction("Place wireless clients", self)
+        self.place_client_action.setCheckable(True)
+        self.place_client_action.toggled.connect(self.toggle_client_placement)
+        self.clear_clients_action = QAction("Clear floor clients", self)
+        self.clear_clients_action.triggered.connect(self.clear_current_floor_clients)
         self.array_ap_action = QAction("Place AP array", self)
         self.array_ap_action.triggered.connect(self.start_ap_array_placement)
         self.space_ap_action = QAction("Place APs from spaces", self)
@@ -13681,6 +14155,7 @@ out tags geom;
             InferredSpaceGraphicsItem,
             SpaceGraphicsItem,
             WallGraphicsItem,
+            WirelessClientGraphicsItem,
         )
         seen = set()
         selectable: List[QGraphicsItem] = []
@@ -13703,6 +14178,8 @@ out tags geom;
     def _scene_item_selection_label(self, item: QGraphicsItem) -> str:
         if isinstance(item, AccessPointGraphicsItem):
             return f"Access point: {item.ap.name}"
+        if isinstance(item, WirelessClientGraphicsItem):
+            return f"Wireless client: {item.client.name}"
         if isinstance(item, PlannerBoundaryGraphicsItem):
             return f"Planner boundary: {item.boundary.name}"
         if isinstance(item, InferredSpaceGraphicsItem):
@@ -13763,6 +14240,9 @@ out tags geom;
         if isinstance(item, AccessPointGraphicsItem):
             self.statusBar().showMessage(f"Selected access point '{item.ap.name}'")
             return
+        if isinstance(item, WirelessClientGraphicsItem):
+            self.statusBar().showMessage(f"Selected wireless client '{item.client.name}'")
+            return
         if isinstance(item, PlannerBoundaryGraphicsItem):
             self.statusBar().showMessage(f"Selected planner boundary '{item.boundary.name}'. Right-click for actions.")
             return
@@ -13786,10 +14266,11 @@ out tags geom;
                 InferredSpaceGraphicsItem,
                 SpaceGraphicsItem,
                 WallGraphicsItem,
+                WirelessClientGraphicsItem,
             ))
         ]
         if not selected_items:
-            self.statusBar().showMessage("Select an AP, wall, space, IFC element or boundary before pressing Delete")
+            self.statusBar().showMessage("Select an AP, client, wall, space, IFC element or boundary before pressing Delete")
             return False
 
         # A rubber-band/selection-window can select several overlapping graphics
@@ -13806,6 +14287,14 @@ out tags geom;
                 seen.add(key)
                 self.aps = [ap for ap in self.aps if ap is not item.ap]
                 deleted_labels.append(f"access point '{item.ap.name}'")
+                continue
+            if isinstance(item, WirelessClientGraphicsItem):
+                key = ("client", id(item.client))
+                if key in seen:
+                    continue
+                seen.add(key)
+                self.wireless_clients = [client for client in self.wireless_clients if client is not item.client]
+                deleted_labels.append(f"wireless client '{item.client.name}'")
                 continue
             if isinstance(item, PlannerBoundaryGraphicsItem):
                 key = ("boundary", id(item.boundary))
@@ -13873,6 +14362,7 @@ out tags geom;
         self.last_result = None
         self.draw_floor()
         self.populate_ap_table()
+        self.populate_client_table()
         self.populate_wall_table()
         if len(deleted_labels) == 1:
             self.statusBar().showMessage(f"Deleted {deleted_labels[0]}")
@@ -14185,6 +14675,14 @@ out tags geom;
                 "Single placement", "Enter continuous single-click access point placement mode. Right-click or press the cancel tool to finish.",
                 "plus-circle", "Ctrl+Alt+P"
             ),
+            "place_client_action": (
+                "Place clients", "Enter continuous wireless-client placement mode for the current floor. Each client stores its own frequency and minimum RSSI.",
+                "person-plus", ""
+            ),
+            "clear_clients_action": (
+                "Clear clients", "Remove wireless clients from the current floor.",
+                "trash", ""
+            ),
             "array_ap_action": (
                 "Array placement", "Place a configurable AP array using independent axial and transverse distances.",
                 "grid-3x3-gap", ""
@@ -14408,6 +14906,7 @@ out tags geom;
         ribbon.addTab(self._make_ribbon_page([
             ("Interaction", ["ap_interaction_action", "ap_ruler_action", "copy_ap_action", "paste_ap_action", "bulk_ap_action", "export_ap_positions_action", "cancel_ap_tool_action"]),
             ("Manual placement", ["place_ap_action", "array_ap_action"]),
+            ("Wireless clients", ["place_client_action", "clear_clients_action"]),
             ("Space-assisted placement", ["space_ap_action", "select_ap_spaces_action"]),
         ]), "Access points")
         ribbon.addTab(self._make_ribbon_page([
@@ -14783,6 +15282,8 @@ out tags geom;
         action.blockSignals(False)
 
     def _cancel_other_drawing_tools_for_ap(self):
+        if getattr(self, "client_placement_mode", False):
+            self.cancel_client_placement(show_status=False)
         if getattr(self, "wall_draw_mode", False):
             self.cancel_user_wall_drawing()
         if getattr(self, "space_draw_mode", False):
@@ -14798,6 +15299,8 @@ out tags geom;
     def _disable_ap_tools_for_geometry_mode(self):
         if self.ap_placement_mode:
             self.cancel_ap_placement(show_status=False)
+        if getattr(self, "client_placement_mode", False):
+            self.cancel_client_placement(show_status=False)
         changed = False
         if self.ap_interaction_mode:
             self.ap_interaction_mode = False
@@ -14881,6 +15384,7 @@ out tags geom;
                 self.place_ap_action.blockSignals(False)
                 return
             self._ensure_ap_interaction_enabled()
+            self.cancel_client_placement(show_status=False)
             self.ap_placement_mode = "single"
             self.view.setCursor(Qt.CrossCursor)
             self.statusBar().showMessage("Single AP placement: left-click to place repeatedly; right-click or Cancel AP tool to finish.")
@@ -14897,6 +15401,34 @@ out tags geom;
         self.view.setCursor(Qt.ArrowCursor)
         if show_status:
             self.statusBar().showMessage("Access point placement tool cancelled")
+
+    def toggle_client_placement(self, enabled: bool):
+        if enabled:
+            if not self.floor:
+                QMessageBox.information(self, "No floor selected", "Load a model and select a floor before placing wireless clients.")
+                self.place_client_action.blockSignals(True)
+                self.place_client_action.setChecked(False)
+                self.place_client_action.blockSignals(False)
+                return
+            if self.ap_placement_mode:
+                self.cancel_ap_placement(show_status=False)
+            self.client_placement_mode = True
+            self.view.setCursor(Qt.CrossCursor)
+            self.statusBar().showMessage("Wireless client placement: left-click to add clients on the current floor; right-click to finish.")
+        else:
+            self.cancel_client_placement(show_status=False)
+
+    def cancel_client_placement(self, show_status: bool = True):
+        self.client_placement_mode = False
+        action = getattr(self, "place_client_action", None)
+        if action is not None:
+            action.blockSignals(True)
+            action.setChecked(False)
+            action.blockSignals(False)
+        if not getattr(self, "ap_placement_mode", ""):
+            self.view.setCursor(Qt.ArrowCursor)
+        if show_status:
+            self.statusBar().showMessage("Wireless client placement tool cancelled")
 
     def start_ap_array_placement(self):
         if not self.floor:
@@ -14928,6 +15460,61 @@ out tags geom;
         if self.ap_placement_mode == "array":
             self.place_ap_array(float(pos.x()), float(pos.y()), self._array_placement_settings)
             self.cancel_ap_placement(show_status=False)
+
+    def add_wireless_client(self, x: float, y: float) -> Optional[WirelessClient]:
+        if not self.floor:
+            return None
+        client = WirelessClient(
+            name=f"Client-{len(self.wireless_clients) + 1}",
+            x=float(x),
+            y=float(y),
+            floor=str(self.floor.name),
+            frequency_mhz=float(self.freq.value()),
+            minimum_rssi_dbm=float(self.heatmap_settings.minimum_client_rssi_dbm),
+        )
+        dialog = WirelessClientDialog(self, client)
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        dialog.apply_to(client)
+        self.wireless_clients.append(client)
+        self._clear_rssi_results()
+        self.populate_client_table()
+        self._preserve_view_on_redraw = True
+        self.draw_floor()
+        self.statusBar().showMessage(f"Added {client.name} on {client.floor}")
+        return client
+
+    def edit_wireless_client(self, client: WirelessClient):
+        dialog = WirelessClientDialog(self, client)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        dialog.apply_to(client)
+        self._clear_rssi_results()
+        self.populate_client_table()
+        self._preserve_view_on_redraw = True
+        self.draw_floor()
+
+    def delete_wireless_client(self, client: WirelessClient):
+        self.wireless_clients = [candidate for candidate in self.wireless_clients if candidate is not client]
+        self._clear_rssi_results()
+        self.populate_client_table()
+        self._preserve_view_on_redraw = True
+        self.draw_floor()
+
+    def clear_current_floor_clients(self):
+        if not self.floor:
+            return
+        before = len(self.wireless_clients)
+        self.wireless_clients = [
+            client for client in self.wireless_clients
+            if str(client.floor) != str(self.floor.name)
+        ]
+        removed = before - len(self.wireless_clients)
+        self._clear_rssi_results()
+        self.populate_client_table()
+        self._preserve_view_on_redraw = True
+        self.draw_floor()
+        self.statusBar().showMessage(f"Removed {removed} wireless client(s) from {self.floor.name}")
 
     def place_ap_array(self, origin_x: float, origin_y: float, settings: Dict[str, object]):
         axial_count = max(1, int(settings.get("axial_count", 1)))
@@ -18454,17 +19041,19 @@ out tags geom;
     def _planner_rssi_deficit(
         values_by_radio: List[np.ndarray], requirements: List[PlannerRadioRequirement],
         mode: str, threshold_margin_db: float = 0.0,
+        thresholds_by_radio: Optional[List[np.ndarray]] = None,
     ) -> np.ndarray:
         """Return per-sample dB shortfall against the configured RSSI targets."""
         if not values_by_radio:
             return np.zeros(0, dtype=np.float32)
-        deficits = np.vstack([
-            np.maximum(
-                0.0,
-                float(requirement.minimum_rssi_dbm) - float(threshold_margin_db) - values,
-            )
-            for requirement, values in zip(requirements, values_by_radio)
-        ]).astype(np.float32, copy=False)
+        rows = []
+        for index, (requirement, values) in enumerate(zip(requirements, values_by_radio)):
+            if thresholds_by_radio is not None and index < len(thresholds_by_radio):
+                threshold = np.asarray(thresholds_by_radio[index], dtype=np.float32) - float(threshold_margin_db)
+            else:
+                threshold = float(requirement.minimum_rssi_dbm) - float(threshold_margin_db)
+            rows.append(np.maximum(0.0, threshold - values))
+        deficits = np.vstack(rows).astype(np.float32, copy=False)
         if str(mode).lower() == "any":
             return np.min(deficits, axis=0)
         return np.sum(deficits, axis=0)
@@ -18472,15 +19061,17 @@ out tags geom;
     def _planner_top_rssi_masks(
         self, strongest_by_radio: List[np.ndarray], second_by_radio: List[np.ndarray],
         requirements: List[PlannerRadioRequirement], settings: AutoPlannerSettings, sample_count: int,
+        thresholds_by_radio: Optional[List[np.ndarray]] = None,
     ) -> Tuple[List[np.ndarray], List[np.ndarray], np.ndarray, np.ndarray]:
-        coverage_by_radio = [
-            strongest >= float(requirement.minimum_rssi_dbm)
-            for requirement, strongest in zip(requirements, strongest_by_radio)
-        ]
-        secondary_by_radio = [
-            second >= float(requirement.minimum_rssi_dbm) - float(settings.handover_margin_db)
-            for requirement, second in zip(requirements, second_by_radio)
-        ]
+        coverage_by_radio = []
+        secondary_by_radio = []
+        for index, (requirement, strongest, second) in enumerate(zip(requirements, strongest_by_radio, second_by_radio)):
+            if thresholds_by_radio is not None and index < len(thresholds_by_radio):
+                threshold = np.asarray(thresholds_by_radio[index], dtype=np.float32)
+            else:
+                threshold = float(requirement.minimum_rssi_dbm)
+            coverage_by_radio.append(strongest >= threshold)
+            secondary_by_radio.append(second >= threshold - float(settings.handover_margin_db))
         overall = self._combine_frequency_masks(coverage_by_radio, settings.coverage_mode, sample_count)
         handover = self._combine_frequency_masks(secondary_by_radio, settings.coverage_mode, sample_count)
         # Handover is meaningful only where the primary service requirement is met.
@@ -18651,15 +19242,14 @@ out tags geom;
             if requirement.enabled
         ]
         if not enabled_radio_items:
-            QMessageBox.information(
-                self, "No planner radios",
-                "Enable at least one radio in Planner settings.",
-            )
-            return
+            enabled_radio_items = list(enumerate(settings.radio_requirements))
 
         floor_items = sorted(
             self.floors.items(), key=lambda item: (float(item[1].elevation), item[0])
         )
+        current_frequency = self._selected_rssi_view_frequency()
+        if current_frequency is None:
+            current_frequency = float(enabled_radio_items[0][1].frequency_mhz) if enabled_radio_items else 5000.0
         selection = PlannerRunSelectionDialog(
             self,
             floor_items,
@@ -18669,24 +19259,62 @@ out tags geom;
             self._radio_profile_names(),
             self._radio_profile_definitions(),
             self.heatmap_settings.default_ap_radios,
+            settings,
+            list(self.antenna_patterns.keys()),
+            float(current_frequency),
         )
         if selection.exec() != QDialog.Accepted:
             return
+        prediction_method = selection.selected_prediction_method()
         selected_floor_names = set(selection.selected_floor_names())
-        selected_radio_indices = set(selection.selected_radio_indices())
-        selected_radio_profile = selection.selected_radio_profile()
-        settings.ap_radio_profile = selected_radio_profile
-        self.heatmap_settings.auto_planner_settings = settings.to_dict()
-        selected_requirements = [
-            copy.deepcopy(requirement)
-            for index, requirement in enumerate(settings.radio_requirements)
-            if index in selected_radio_indices and requirement.enabled
-        ]
+        original_settings = self.auto_planner_settings
+        if prediction_method == "minimum_rssi":
+            run_settings = selection.minimum_rssi_settings(settings)
+            selected_radio_profile = "Predictive planner"
+            selected_requirements = [copy.deepcopy(run_settings.radio_requirements[0])]
+            method_text = (
+                f"Minimum RSSI at {float(selected_requirements[0].frequency_mhz):g} MHz "
+                f"({float(selected_requirements[0].minimum_rssi_dbm):.1f} dBm)"
+            )
+        elif prediction_method == "wireless_clients":
+            run_settings = copy.deepcopy(settings)
+            selected_radio_profile = "Predictive planner"
+            selected_requirements = []
+            method_text = "Defined wireless clients"
+        else:
+            if not any(requirement.enabled for requirement in settings.radio_requirements):
+                QMessageBox.information(
+                    self,
+                    "No planner radios",
+                    "Enable at least one radio in Planner settings, or choose the minimum RSSI method.",
+                )
+                return
+            selected_radio_indices = set(selection.selected_radio_indices())
+            selected_radio_profile = selection.selected_radio_profile()
+            run_settings = copy.deepcopy(settings)
+            run_settings.ap_radio_profile = selected_radio_profile
+            selected_requirements = [
+                copy.deepcopy(requirement)
+                for index, requirement in enumerate(settings.radio_requirements)
+                if index in selected_radio_indices and requirement.enabled
+            ]
+            if not selected_requirements:
+                QMessageBox.information(
+                    self,
+                    "No planner radios",
+                    "Select at least one enabled planner radio, or choose the minimum RSSI method.",
+                )
+                return
+            settings.ap_radio_profile = selected_radio_profile
+            self.heatmap_settings.auto_planner_settings = settings.to_dict()
+            method_text = "Planner radio requirements"
         selected_floors = [
             floor for floor_name, floor in floor_items
             if floor_name in selected_floor_names
         ]
-        if not selected_floors or not selected_requirements:
+        if not selected_floors:
+            return
+        if prediction_method != "wireless_clients" and not selected_requirements:
             return
 
         original_floor = self.floor
@@ -18697,7 +19325,7 @@ out tags geom;
             "Preparing predictive AP planner...",
             "Cancel",
             0,
-            max(1, len(selected_floors) * max(1, int(settings.maximum_aps))),
+            max(1, len(selected_floors) * max(1, int(run_settings.maximum_aps))),
             self,
         )
         batch_progress.setWindowTitle("Predictive AP planner")
@@ -18706,6 +19334,9 @@ out tags geom;
         batch_progress.setAutoClose(False)
         batch_progress.setAutoReset(False)
         batch_progress.show()
+        self.auto_planner_settings = run_settings
+        if prediction_method == "minimum_rssi":
+            self.heatmap_settings.auto_planner_settings = run_settings.to_dict()
         try:
             for floor_index, floor in enumerate(selected_floors, start=1):
                 if batch_progress.wasCanceled():
@@ -18719,17 +19350,38 @@ out tags geom;
                 batch_progress.setLabelText(
                     f"Floor {floor_index}/{len(selected_floors)}: preparing {floor.name}..."
                 )
-                batch_progress.setValue((floor_index - 1) * max(1, int(settings.maximum_aps)))
+                batch_progress.setValue((floor_index - 1) * max(1, int(run_settings.maximum_aps)))
                 QApplication.processEvents()
+                floor_requirements = selected_requirements
+                floor_samples_override = None
+                floor_thresholds_by_radio = None
+                if prediction_method == "wireless_clients":
+                    floor_clients = [
+                        client for client in getattr(self, "wireless_clients", []) or []
+                        if str(client.floor) == str(floor.name)
+                    ]
+                    if not floor_clients:
+                        failed_floors.append(f"{floor.name} (no wireless clients)")
+                        continue
+                    (
+                        run_settings,
+                        floor_requirements,
+                        floor_samples_override,
+                        floor_thresholds_by_radio,
+                    ) = selection.wireless_client_settings(settings, floor_clients)
+                    self.auto_planner_settings = run_settings
+                    self.heatmap_settings.auto_planner_settings = run_settings.to_dict()
                 report = self._run_auto_planner_current_floor(
-                    requirements_override=selected_requirements,
+                    requirements_override=floor_requirements,
                     radio_profile=selected_radio_profile,
                     refresh_ui=False,
                     show_summary=False,
                     progress_dialog=batch_progress,
-                    progress_value_offset=(floor_index - 1) * max(1, int(settings.maximum_aps)),
+                    progress_value_offset=(floor_index - 1) * max(1, int(run_settings.maximum_aps)),
                     progress_floor_index=floor_index,
                     progress_floor_count=len(selected_floors),
+                    samples_override=floor_samples_override,
+                    thresholds_by_radio_override=floor_thresholds_by_radio,
                 )
                 if report is None:
                     message = self.statusBar().currentMessage().lower()
@@ -18741,6 +19393,9 @@ out tags geom;
                 reports.append(report)
         finally:
             self.floor = original_floor
+            self.auto_planner_settings = original_settings
+            if prediction_method == "minimum_rssi":
+                self.heatmap_settings.auto_planner_settings = original_settings.to_dict()
             batch_progress.close()
 
         self._invalidate_interactive_preview_requests()
@@ -18761,10 +19416,13 @@ out tags geom;
             return
 
         total_added = sum(int(report.get("added_aps", 0)) for report in reports)
-        radio_text = ", ".join(
-            f"{req.name} ({float(req.frequency_mhz):g} MHz)"
-            for req in selected_requirements
-        )
+        if prediction_method == "wireless_clients":
+            radio_text = "derived from each floor's defined wireless clients"
+        else:
+            radio_text = ", ".join(
+                f"{req.name} ({float(req.frequency_mhz):g} MHz)"
+                for req in selected_requirements
+            )
         floor_lines = []
         for report in reports:
             floor_lines.append(
@@ -18782,6 +19440,7 @@ out tags geom;
             self,
             "Predictive AP plan complete",
             f"Added {total_added} RSSI-predicted AP(s) across {len(reports)} floor(s).\n"
+            f"Prediction method: {method_text}.\n"
             f"AP radio profile: {selected_radio_profile}.\n"
             f"Selected radios fitted to each new AP: {radio_text}.\n\n"
             + "\n".join(floor_lines)
@@ -18799,6 +19458,8 @@ out tags geom;
         progress_value_offset: int = 0,
         progress_floor_index: int = 1,
         progress_floor_count: int = 1,
+        samples_override: Optional[List[Tuple[float, float]]] = None,
+        thresholds_by_radio_override: Optional[List[np.ndarray]] = None,
     ) -> Optional[Dict[str, object]]:
         self._invalidate_interactive_preview_requests()
         self._rssi_result_stale = False
@@ -18862,7 +19523,13 @@ out tags geom;
         wall_indexes = RFEngine._build_wall_indexes(self.floors) if include_inter_floor_rf else None
         opening_indexes = RFEngine._build_opening_indexes(self.floors) if include_inter_floor_rf else None
 
-        samples = self._planner_grid_points(area, settings.sample_spacing_m, wall_tree, walls, 5000)
+        if samples_override is not None:
+            samples = [
+                (float(x), float(y))
+                for x, y in samples_override
+            ]
+        else:
+            samples = self._planner_grid_points(area, settings.sample_spacing_m, wall_tree, walls, 5000)
         candidate_location_limit = min(20_000, max(1200, int(settings.maximum_aps) * 40))
         candidates = self._planner_grid_points(
             area, settings.candidate_spacing_m, wall_tree, walls, candidate_location_limit
@@ -18888,7 +19555,8 @@ out tags geom;
                 ):
                     candidates.append(candidate)
                 if (
-                    inside_area
+                    samples_override is None
+                    and inside_area
                     and candidate not in samples
                     and not self._planner_point_is_blocked(point, wall_tree, walls)
                 ):
@@ -18898,6 +19566,15 @@ out tags geom;
         if not samples or not candidates:
             QMessageBox.warning(self, "No planner points", "The selected floor did not produce usable coverage samples and AP candidates.")
             return
+        thresholds_by_radio = None
+        if thresholds_by_radio_override is not None:
+            thresholds_by_radio = [
+                np.asarray(values, dtype=np.float32)
+                for values in thresholds_by_radio_override
+            ]
+            if any(len(values) != len(samples) for values in thresholds_by_radio):
+                QMessageBox.warning(self, "Client planner data", "Wireless client threshold data did not match the client locations for this floor.")
+                return
 
         directional = any(not req.antenna_pattern.lower().startswith("omni") for req in requirements)
         azimuths = list(range(0, 360, 45)) if directional else [0]
@@ -18992,13 +19669,16 @@ out tags geom;
                 return cached
 
             coverage_by_radio, secondary_by_radio, overall, handover_overall = self._planner_top_rssi_masks(
-                strongest_by_radio, second_by_radio, requirements, settings, len(samples)
+                strongest_by_radio, second_by_radio, requirements, settings, len(samples),
+                thresholds_by_radio,
             )
             coverage_deficit = self._planner_rssi_deficit(
-                strongest_by_radio, requirements, settings.coverage_mode
+                strongest_by_radio, requirements, settings.coverage_mode,
+                thresholds_by_radio=thresholds_by_radio,
             )
             handover_deficit = self._planner_rssi_deficit(
-                second_by_radio, requirements, settings.coverage_mode, settings.handover_margin_db
+                second_by_radio, requirements, settings.coverage_mode, settings.handover_margin_db,
+                thresholds_by_radio=thresholds_by_radio,
             )
             target_fraction = settings.target_coverage_percent / 100.0
             handover_target_fraction = settings.target_handover_percent / 100.0
@@ -19233,19 +19913,36 @@ out tags geom;
                         before_strongest,
                         np.maximum(before_second, candidate_values),
                     )
-                    threshold = float(req.minimum_rssi_dbm)
+                    if thresholds_by_radio is not None and req_index < len(thresholds_by_radio):
+                        threshold = np.asarray(thresholds_by_radio[req_index][focus_subset], dtype=np.float32)[None, :]
+                    else:
+                        threshold = float(req.minimum_rssi_dbm)
                     handover_threshold = threshold - float(settings.handover_margin_db)
                     proposed_strongest.append(after_strongest)
                     proposed_second.append(after_second)
                     coverage_masks.append(after_strongest >= threshold)
                     handover_masks.append(after_second >= handover_threshold)
                 coverage_shortfalls = [
-                    np.maximum(0.0, float(req.minimum_rssi_dbm) - values)
-                    for req, values in zip(requirements, proposed_strongest)
+                    np.maximum(
+                        0.0,
+                        (
+                            np.asarray(thresholds_by_radio[index][focus_subset], dtype=np.float32)[None, :]
+                            if thresholds_by_radio is not None and index < len(thresholds_by_radio)
+                            else float(req.minimum_rssi_dbm)
+                        ) - values,
+                    )
+                    for index, (req, values) in enumerate(zip(requirements, proposed_strongest))
                 ]
                 handover_shortfalls = [
-                    np.maximum(0.0, float(req.minimum_rssi_dbm) - float(settings.handover_margin_db) - values)
-                    for req, values in zip(requirements, proposed_second)
+                    np.maximum(
+                        0.0,
+                        (
+                            np.asarray(thresholds_by_radio[index][focus_subset], dtype=np.float32)[None, :]
+                            if thresholds_by_radio is not None and index < len(thresholds_by_radio)
+                            else float(req.minimum_rssi_dbm)
+                        ) - float(settings.handover_margin_db) - values,
+                    )
+                    for index, (req, values) in enumerate(zip(requirements, proposed_second))
                 ]
                 if str(settings.coverage_mode).lower() == "any":
                     proposed_coverage_deficit = np.minimum.reduce(coverage_shortfalls)
@@ -19357,7 +20054,7 @@ out tags geom;
                 ])
                 gpu_scores = None
                 quick_work_items = len(candidate_xy) * max(1, len(focus_subset)) * max(1, len(requirements))
-                if quick_work_items >= 300_000:
+                if quick_work_items >= 300_000 and thresholds_by_radio is None:
                     try:
                         gpu_result = gpu_planner_candidate_scores(
                             candidate_xy,
@@ -19434,10 +20131,10 @@ out tags geom;
                 proposed_second: List[np.ndarray] = []
                 proposed_coverage_masks: List[np.ndarray] = []
                 proposed_handover_masks: List[np.ndarray] = []
-                for req, current_strongest, current_second, ref_loss_1m, cutoff_radius, pattern, is_directional in zip(
+                for req_index, (req, current_strongest, current_second, ref_loss_1m, cutoff_radius, pattern, is_directional) in enumerate(zip(
                     requirements, strongest_by_radio, second_by_radio,
                     quick_reference_loss_1m, quick_cutoff_radius, quick_patterns, quick_directional
-                ):
+                )):
                     before_strongest = np.asarray(current_strongest[subset], dtype=np.float32)
                     before_second = np.asarray(current_second[subset], dtype=np.float32)
                     path_loss = (
@@ -19470,7 +20167,10 @@ out tags geom;
                         before_strongest,
                         np.maximum(before_second, candidate_values),
                     )
-                    threshold = float(req.minimum_rssi_dbm)
+                    if thresholds_by_radio is not None and req_index < len(thresholds_by_radio):
+                        threshold = np.asarray(thresholds_by_radio[req_index][subset], dtype=np.float32)
+                    else:
+                        threshold = float(req.minimum_rssi_dbm)
                     handover_threshold = threshold - float(settings.handover_margin_db)
                     proposed_strongest.append(after_strongest)
                     proposed_second.append(after_second)
@@ -19478,10 +20178,18 @@ out tags geom;
                     proposed_handover_masks.append(after_second >= handover_threshold)
 
                 proposed_coverage_deficit = self._planner_rssi_deficit(
-                    proposed_strongest, requirements, settings.coverage_mode
+                    proposed_strongest, requirements, settings.coverage_mode,
+                    thresholds_by_radio=[
+                        np.asarray(values[subset], dtype=np.float32)
+                        for values in thresholds_by_radio
+                    ] if thresholds_by_radio is not None else None,
                 )
                 proposed_handover_deficit = self._planner_rssi_deficit(
-                    proposed_second, requirements, settings.coverage_mode, settings.handover_margin_db
+                    proposed_second, requirements, settings.coverage_mode, settings.handover_margin_db,
+                    thresholds_by_radio=[
+                        np.asarray(values[subset], dtype=np.float32)
+                        for values in thresholds_by_radio
+                    ] if thresholds_by_radio is not None else None,
                 )
                 coverage_improvement = np.maximum(
                     0.0, np.asarray(coverage_deficit[subset], dtype=np.float32) - proposed_coverage_deficit
@@ -19525,13 +20233,16 @@ out tags geom;
                 proposed_strongest = [pair[0] for pair in inserted]
                 proposed_second = [pair[1] for pair in inserted]
                 proposed_coverage_by_radio, proposed_secondary_by_radio, proposed_overall, proposed_handover = self._planner_top_rssi_masks(
-                    proposed_strongest, proposed_second, requirements, settings, len(samples)
+                    proposed_strongest, proposed_second, requirements, settings, len(samples),
+                    thresholds_by_radio,
                 )
                 proposed_coverage_deficit = self._planner_rssi_deficit(
-                    proposed_strongest, requirements, settings.coverage_mode
+                    proposed_strongest, requirements, settings.coverage_mode,
+                    thresholds_by_radio=thresholds_by_radio,
                 )
                 proposed_handover_deficit = self._planner_rssi_deficit(
-                    proposed_second, requirements, settings.coverage_mode, settings.handover_margin_db
+                    proposed_second, requirements, settings.coverage_mode, settings.handover_margin_db,
+                    thresholds_by_radio=thresholds_by_radio,
                 )
                 return (
                     proposed_strongest, proposed_second,
@@ -20069,6 +20780,10 @@ out tags geom;
                 "max_clients": ap.max_clients, "planned": ap.planned,
                 "radios": [self._radio_to_dict(radio) for radio in ap.radios],
             })
+        wireless_clients = [
+            client.to_dict()
+            for client in getattr(self, "wireless_clients", []) or []
+        ]
         user_walls = []
         user_elements = []
         overrides = []
@@ -20211,7 +20926,8 @@ out tags geom;
             "selected_ap_spaces": selected_ap_spaces,
             "user_spaces": user_spaces,
             "inferred_spaces": inferred_spaces,
-            "access_points": aps, "user_walls": user_walls, "user_elements": user_elements, "wall_overrides": overrides,
+            "access_points": aps, "wireless_clients": wireless_clients,
+            "user_walls": user_walls, "user_elements": user_elements, "wall_overrides": overrides,
             "element_overrides": element_overrides,
         }
 
@@ -20857,6 +21573,11 @@ out tags geom;
                 ap_type=str(item.get("ap_type", "Ceiling AP")), radio_profile=str(item.get("radio_profile", "Project default radios")),
                 radios=radios, max_clients=int(item.get("max_clients", 50)), planned=bool(item.get("planned", False)),
             ))
+        self.wireless_clients = []
+        for item in data.get("wireless_clients", []):
+            client = WirelessClient.from_dict(item)
+            if client is not None:
+                self.wireless_clients.append(client)
         self.auto_planner_settings = AutoPlannerSettings.from_dict(data.get("auto_planner_settings", {}))
         custom_profiles = data.get("custom_radio_profiles", data.get("radio_profile_presets", {}))
         if isinstance(custom_profiles, dict):
@@ -20902,7 +21623,7 @@ out tags geom;
                 selected_frequency = self._selected_rssi_view_frequency()
                 self.last_result = restored.get(selected_frequency) or restored[sorted(restored)[0]]
                 loaded_count = len(restored)
-        self.populate_ap_table(); self.populate_wall_table(); self.draw_floor()
+        self.populate_ap_table(); self.populate_client_table(); self.populate_wall_table(); self.draw_floor()
         self.statusBar().showMessage(
             f"Loaded RF plan and {loaded_count} saved floor/frequency simulation(s)"
             if loaded_count else "Loaded RF plan"
@@ -23014,7 +23735,7 @@ out tags geom;
         self.clear_ap_action.setEnabled(not loading)
         self.load_pattern_action.setEnabled(not loading)
         for action_name in (
-            "planner_settings_action", "propagation_settings_action", "predict_aps_action", "bulk_ap_action", "draw_wall_action", "draw_vegetation_action", "bulk_attenuation_action", "attenuation_review_action", "draw_space_action", "select_ap_spaces_action", "inferred_space_interaction_action",
+            "planner_settings_action", "propagation_settings_action", "predict_aps_action", "bulk_ap_action", "place_client_action", "clear_clients_action", "draw_wall_action", "draw_vegetation_action", "bulk_attenuation_action", "attenuation_review_action", "draw_space_action", "select_ap_spaces_action", "inferred_space_interaction_action",
             "draw_boundary_action", "draw_polygon_boundary_action", "suggest_external_boundary_action",
             "create_spaces_action", "clear_inferred_spaces_action", "clear_boundaries_action", "ifc_origin_action", "building_3d_view_action",
             "open_satellite_action", "edit_satellite_action", "align_satellite_action",
@@ -23037,6 +23758,8 @@ out tags geom;
             self.cancel_space_drawing()
         if getattr(self, "vegetation_draw_mode", False) or getattr(self, "_vegetation_draw_center", None) is not None:
             self.cancel_vegetation_drawing()
+        if getattr(self, "client_placement_mode", False):
+            self.cancel_client_placement(show_status=False)
         if (
             getattr(self, "boundary_draw_mode", False)
             or getattr(self, "_boundary_draw_start", None) is not None
@@ -23094,6 +23817,7 @@ out tags geom;
         self._load_slab_attenuation_to_ui()
         self.draw_floor()
         self.populate_ap_table()
+        self.populate_client_table()
         self.populate_wall_table()
 
     def _radios_for_profile(self, profile_name: str, ap_type: str) -> List[APRadio]:
@@ -23191,6 +23915,7 @@ out tags geom;
             self._drawing_floor = False
             return
         ifc_opacity = self._opacity_factor("ifc_element_opacity_percent", 55)
+        pdf_pen_scale = 0.45 if pdf_export_rendering else 1.0
         self._draw_satellite_overlay(scene)
         self._draw_rssi_extent_overlay(scene)
         # Draw heatmap first so the building geometry remains visible above it.
@@ -23223,7 +23948,8 @@ out tags geom;
             elif space.is_user_created:
                 fill_colour.setAlpha(65)
             fill_colour = self._scale_colour_alpha(fill_colour, ifc_opacity)
-            pen = QPen(pen_colour, 0.20 if space.ap_planning_selected else (0.16 if (space.is_inferred or space.is_user_created) else 0.12))
+            pen_width = 0.20 if space.ap_planning_selected else (0.16 if (space.is_inferred or space.is_user_created) else 0.12)
+            pen = QPen(pen_colour, max(0.02, pen_width * pdf_pen_scale))
             pen.setCosmetic(True)
             if space.is_inferred:
                 pen.setStyle(Qt.DashLine)
@@ -23285,7 +24011,7 @@ out tags geom;
             else:
                 element_pen_colour = QColor(generic_element_pen_colour)
                 element_fill_colour = QColor(generic_element_fill_colour)
-            element_pen = QPen(element_pen_colour, 0.11 if element.is_rf_barrier else 0.08)
+            element_pen = QPen(element_pen_colour, max(0.02, (0.11 if element.is_rf_barrier else 0.08) * pdf_pen_scale))
             element_pen.setCosmetic(True)
             poly = QPolygonF([QPointF(float(x), float(y)) for x, y in coords])
             item = IFCElementGraphicsItem(self, element, poly, element_pen, QBrush(element_fill_colour))
@@ -23311,7 +24037,7 @@ out tags geom;
             coords = list(wall.polygon.exterior.coords)
             poly = QPolygonF([QPointF(x, y) for x, y in coords])
             wall_pen_colour = QColor("#FF7800") if wall.is_user_created else colours["wall_pen"]
-            wall_pen = QPen(wall_pen_colour, self.heatmap_settings.wall_line_width)
+            wall_pen = QPen(wall_pen_colour, max(0.02, self.heatmap_settings.wall_line_width * pdf_pen_scale))
             wall_pen.setCosmetic(True)
             fill_key = "wall_alt_fill" if getattr(wall, "projected_to_floor", False) else "wall_fill"
             fill_colour = QColor("#FFB45A") if wall.is_user_created else QColor(colours[fill_key])
@@ -23321,7 +24047,10 @@ out tags geom;
             item = WallGraphicsItem(self, wall, poly, wall_pen, QBrush(fill_colour))
             scene.addItem(item)
         pending_ap_selection_ids = set(getattr(self, "_pending_ap_selection_ids", set()))
-        visible_aps = [a for a in self.aps if a.floor == self.floor.name or self.include_inter_floor.isChecked()]
+        if pdf_export_rendering:
+            visible_aps = [a for a in self.aps if a.floor == self.floor.name]
+        else:
+            visible_aps = [a for a in self.aps if a.floor == self.floor.name or self.include_inter_floor.isChecked()]
         for ap in visible_aps:
             same_floor = ap.floor == self.floor.name
             radius = 0.48 if same_floor else 0.30
@@ -23336,7 +24065,7 @@ out tags geom;
                 dot = QGraphicsPathItem(_access_point_symbol_path(ap.ap_type, radius))
                 dot.setPos(float(ap.x), float(ap.y))
                 dot.setBrush(QBrush(colour))
-                other_pen = QPen(colours["ap_outline"], 0.2)
+                other_pen = QPen(colours["ap_outline"], max(0.02, 0.2 * pdf_pen_scale))
                 other_pen.setCosmetic(True)
                 dot.setPen(other_pen)
                 dot.setAcceptedMouseButtons(Qt.NoButton)
@@ -23352,7 +24081,7 @@ out tags geom;
                 for r in sorted(set(round(v, 3) for v in active_radii)):
                     cut_colour = QColor(colours.get("ap_cutoff_zone", colour))
                     cut_colour.setAlpha(self.heatmap_settings.ap_cutoff_zone_alpha)
-                    cut_pen = QPen(cut_colour, self.heatmap_settings.ap_cutoff_zone_line_width)
+                    cut_pen = QPen(cut_colour, max(0.02, self.heatmap_settings.ap_cutoff_zone_line_width * pdf_pen_scale))
                     cut_pen.setCosmetic(True)
                     cut_item = QGraphicsEllipseItem(ap.x - r, ap.y - r, r * 2.0, r * 2.0)
                     cut_item.setPen(cut_pen)
@@ -23368,7 +24097,7 @@ out tags geom;
             arrow_path = QPainterPath(QPointF(0.0, 0.0))
             arrow_path.lineTo(length * math.cos(ang), length * math.sin(ang))
             arrow = QGraphicsPathItem(arrow_path, dot)
-            arrow_pen = QPen(colour, 0.25)
+            arrow_pen = QPen(colour, max(0.02, 0.25 * pdf_pen_scale))
             arrow_pen.setCosmetic(True)
             arrow.setPen(arrow_pen)
             arrow.setBrush(QBrush(Qt.NoBrush))
@@ -23382,6 +24111,25 @@ out tags geom;
             )
             if same_floor:
                 dot.add_move_follower(label_item)
+
+        for client in [
+            candidate for candidate in getattr(self, "wireless_clients", []) or []
+            if self.floor is not None and str(candidate.floor) == str(self.floor.name)
+        ]:
+            item = WirelessClientGraphicsItem(self, client)
+            scene.addItem(item)
+            label_item = self._add_upright_text(
+                scene,
+                f"{client.name}\n{float(client.minimum_rssi_dbm):.0f} dBm",
+                float(client.x) + 0.45,
+                float(client.y) + 0.45,
+                QColor("#C2410C"),
+                self.heatmap_settings.ap_label_font_size,
+                Z_AP_LABEL + 3,
+                bold=True,
+            )
+            if label_item is not None:
+                label_item.setAcceptedMouseButtons(Qt.NoButton)
 
         self._pending_ap_selection_ids = set()
         self._drawing_floor = False
@@ -23538,6 +24286,7 @@ out tags geom;
         """Draw a cached raster heatmap and optional isolines/sample annotations."""
         scene = self.view.scene()
         colours = self._theme_colours()
+        pdf_export_rendering = bool(getattr(self, "_pdf_export_rendering", False))
         if len(result.xs) < 2 or len(result.ys) < 2:
             return
         render_mode = str(
@@ -23669,6 +24418,8 @@ out tags geom;
         contour_line_cosmetic = bool(getattr(self.heatmap_settings, "contour_line_cosmetic", True))
         if contour_line_cosmetic:
             line_width = max(1.0, line_width)
+        if pdf_export_rendering:
+            line_width = max(0.35, line_width * 0.45)
 
         for level in levels:
             lines = line_groups.get(level, [])
@@ -23739,7 +24490,10 @@ out tags geom;
         cross_size = max(0.01, float(self.heatmap_settings.sample_cross_size))
         sample_colour = colours["sample_text"]
         sample_cross_colour = colours["sample_cross"]
-        sample_pen = QPen(sample_cross_colour, max(1.0, float(getattr(self.heatmap_settings, "sample_cross_line_width", 1.0))))
+        sample_line_width = max(1.0, float(getattr(self.heatmap_settings, "sample_cross_line_width", 1.0)))
+        if pdf_export_rendering:
+            sample_line_width = max(0.35, sample_line_width * 0.45)
+        sample_pen = QPen(sample_cross_colour, sample_line_width)
         sample_pen.setCosmetic(True)
         cross_path = QPainterPath()
         for iy in range(0, rows, stride_y):
@@ -23910,6 +24664,7 @@ out tags geom;
         if planner is not None:
             values.update(float(r.frequency_mhz) for r in planner.radio_requirements)
         values.update(float(r.frequency_mhz) for ap in getattr(self, "aps", []) for r in ap.active_radios())
+        values.update(float(client.frequency_mhz) for client in getattr(self, "wireless_clients", []) or [])
         if hasattr(self, "radio_profile_combo") and hasattr(self, "ap_type_combo"):
             try:
                 profile_radios = self._radios_for_profile(
@@ -24039,6 +24794,71 @@ out tags geom;
                     self.ap_table.setItem(row, col, item)
         self.ap_table.resizeColumnsToContents()
         self.ap_table.blockSignals(False)
+
+    def populate_client_table(self):
+        if not hasattr(self, "client_table"):
+            return
+        self.client_table.blockSignals(True)
+        self.client_table.setRowCount(0)
+        try:
+            clients = [
+                client for client in (getattr(self, "wireless_clients", []) or [])
+                if self.floor is None or str(client.floor) == str(self.floor.name)
+            ]
+            clients = sorted(
+                clients,
+                key=lambda client: (str(client.floor), str(client.name), float(client.x), float(client.y)),
+            )
+            for client in clients:
+                row = self.client_table.rowCount()
+                self.client_table.insertRow(row)
+                values = [
+                    str(client.name),
+                    str(client.floor),
+                    f"{float(client.x):.3f}",
+                    f"{float(client.y):.3f}",
+                    f"{float(client.frequency_mhz):g}",
+                    f"{float(client.minimum_rssi_dbm):.1f}",
+                ]
+                for col, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    item.setData(Qt.UserRole, id(client))
+                    self.client_table.setItem(row, col, item)
+        finally:
+            self.client_table.resizeColumnsToContents()
+            self.client_table.blockSignals(False)
+
+    def _client_for_table_item(self, item: QTableWidgetItem) -> Optional[WirelessClient]:
+        try:
+            identity = int(item.data(Qt.UserRole))
+        except Exception:
+            return None
+        for client in getattr(self, "wireless_clients", []) or []:
+            if id(client) == identity:
+                return client
+        return None
+
+    def _client_table_changed(self, item: QTableWidgetItem):
+        client = self._client_for_table_item(item)
+        if client is None:
+            return
+        row = int(item.row())
+        try:
+            client.name = self.client_table.item(row, 0).text().strip() or client.name
+            client.floor = self.client_table.item(row, 1).text().strip() or client.floor
+            client.x = float(self.client_table.item(row, 2).text())
+            client.y = float(self.client_table.item(row, 3).text())
+            client.frequency_mhz = _normalise_radio_frequency_mhz(
+                float(self.client_table.item(row, 4).text()),
+                f"{client.name} wireless client",
+            )
+            client.minimum_rssi_dbm = float(self.client_table.item(row, 5).text())
+        except Exception:
+            self.populate_client_table()
+            return
+        self._clear_rssi_results()
+        self._preserve_view_on_redraw = True
+        self.draw_floor()
 
     def _ap_table_changed(self, item: QTableWidgetItem):
         if not self.floor:
@@ -24343,7 +25163,7 @@ out tags geom;
                 "sim_action", "export_pdf_action", "open_action", "add_action",
                 "align_ifc_action", "clear_dxf_action", "clear_ap_action",
                 "planner_settings_action", "propagation_settings_action",
-                "performance_settings_action", "predict_aps_action", "bulk_ap_action",
+                "performance_settings_action", "predict_aps_action", "bulk_ap_action", "place_client_action", "clear_clients_action",
                 "draw_wall_action", "draw_vegetation_action", "bulk_attenuation_action", "attenuation_review_action", "draw_space_action",
                 "select_ap_spaces_action", "inferred_space_interaction_action",
                 "draw_boundary_action", "draw_polygon_boundary_action",
@@ -25102,6 +25922,105 @@ out tags geom;
             except RuntimeError:
                 continue
 
+    @staticmethod
+    def _rect_from_bounds(bounds: Sequence[float]) -> QRectF:
+        minx, miny, maxx, maxy = [float(value) for value in bounds]
+        return QRectF(minx, miny, max(0.01, maxx - minx), max(0.01, maxy - miny))
+
+    def _pdf_floor_geometry_rect(self, floor: FloorModel) -> QRectF:
+        bounds: List[Tuple[float, float, float, float]] = []
+        for collection in (floor.spaces, floor.walls, getattr(floor, "elements", [])):
+            for obj in collection:
+                polygon = getattr(obj, "polygon", None)
+                if polygon is not None and not polygon.is_empty:
+                    bounds.append(tuple(float(value) for value in polygon.bounds))
+        for boundary in self._planner_boundaries_for_floor(floor):
+            polygon = getattr(boundary, "polygon", None)
+            if polygon is not None and not polygon.is_empty:
+                bounds.append(tuple(float(value) for value in polygon.bounds))
+        if not bounds:
+            floor_aps = [ap for ap in self.aps if ap.floor == floor.name]
+            bounds = [(float(ap.x), float(ap.y), float(ap.x), float(ap.y)) for ap in floor_aps]
+        if not bounds:
+            return QRectF(0.0, 0.0, 1.0, 1.0)
+        return self._rect_from_bounds((
+            min(item[0] for item in bounds),
+            min(item[1] for item in bounds),
+            max(item[2] for item in bounds),
+            max(item[3] for item in bounds),
+        ))
+
+    def _pdf_floor_building_geometry(self, floor: FloorModel):
+        polygons = [
+            space.polygon
+            for space in getattr(floor, "spaces", []) or []
+            if getattr(space, "polygon", None) is not None and not space.polygon.is_empty
+        ]
+        if not polygons:
+            polygons = [
+                obj.polygon
+                for collection in (getattr(floor, "walls", []) or [], getattr(floor, "elements", []) or [])
+                for obj in collection
+                if getattr(obj, "polygon", None) is not None and not obj.polygon.is_empty
+            ]
+        if not polygons:
+            return None
+        try:
+            geometry = unary_union(polygons)
+            if not geometry.is_valid:
+                geometry = geometry.buffer(0)
+            return None if geometry.is_empty else geometry
+        except Exception:
+            return None
+
+    def _pdf_rssi_stats_line(
+        self,
+        label: str,
+        values: np.ndarray,
+        mask: Optional[np.ndarray] = None,
+    ) -> Optional[str]:
+        data = np.asarray(values, dtype=float)
+        if mask is not None:
+            try:
+                data = data[np.asarray(mask, dtype=bool)]
+            except Exception:
+                return None
+        finite = data[np.isfinite(data)]
+        if finite.size == 0:
+            return None
+        return (
+            f"{label} RSSI min / mean / max: "
+            f"{float(np.min(finite)):.1f} / {float(np.mean(finite)):.1f} / {float(np.max(finite)):.1f} dBm"
+        )
+
+    def _pdf_building_rssi_mask(self, floor: FloorModel, result: SimulationResult) -> Optional[np.ndarray]:
+        geometry = self._pdf_floor_building_geometry(floor)
+        if geometry is None:
+            return None
+        try:
+            return RFEngine._boundary_mask(np.asarray(result.xs), np.asarray(result.ys), geometry)
+        except Exception:
+            return None
+
+    def _pdf_scaled_source_rect(self, floor: FloorModel, target_rect: QRectF, scale_denominator: int) -> QRectF:
+        building_rect = self._pdf_floor_geometry_rect(floor)
+        denominator = max(1, int(scale_denominator or 500))
+        pixels_per_metre = max(1e-9, (1000.0 / float(denominator)) * (150.0 / 25.4))
+        visible_width_m = max(0.01, float(target_rect.width()) / pixels_per_metre)
+        visible_height_m = max(0.01, float(target_rect.height()) / pixels_per_metre)
+        aspect = max(0.01, float(target_rect.width()) / max(1.0, float(target_rect.height())))
+        if visible_width_m / max(0.01, visible_height_m) > aspect:
+            visible_width_m = visible_height_m * aspect
+        else:
+            visible_height_m = visible_width_m / aspect
+        center = building_rect.center()
+        return QRectF(
+            center.x() - (visible_width_m * 0.5),
+            center.y() - (visible_height_m * 0.5),
+            visible_width_m,
+            visible_height_m,
+        )
+
     def _render_pdf_plan_scene(self, painter: QPainter, target_rect: QRectF, source_rect: QRectF):
         """Render the full scene with the same Y-up and view rotation as the GUI."""
         scene = self.view.scene()
@@ -25280,8 +26199,17 @@ out tags geom;
             if finite.size:
                 threshold = self._effective_minimum_rssi_for_frequency(frequency_mhz)
                 covered = float(np.count_nonzero(finite >= threshold)) * 100.0 / float(finite.size)
+                building_stats = self._pdf_rssi_stats_line(
+                    "Building",
+                    values,
+                    self._pdf_building_rssi_mask(floor, result),
+                )
+                full_stats = self._pdf_rssi_stats_line("Full RF", values)
+                if building_stats:
+                    propagation_lines.append(building_stats)
+                if full_stats:
+                    propagation_lines.append(full_stats)
                 propagation_lines.extend([
-                    f"RSSI min / mean / max: {float(np.min(finite)):.1f} / {float(np.mean(finite)):.1f} / {float(np.max(finite)):.1f} dBm",
                     f"Area above {threshold:.0f} dBm: {covered:.1f}%",
                 ])
         else:
@@ -25333,6 +26261,7 @@ out tags geom;
 
         selected_floor_names = set(selection.selected_floor_names())
         selected_frequencies = sorted(selection.selected_frequencies())
+        selected_plan_scale_denominator = selection.selected_plan_scale_denominator()
         floor_items = [
             (floor_name, floor)
             for floor_name, floor in all_floor_items
@@ -25523,7 +26452,8 @@ out tags geom;
                     subtitle = (
                         f"RSSI heatmap at {self._pdf_frequency_label(frequency_mhz)} | "
                         f"Floor elevation {float(floor.elevation):g} m | "
-                        f"Grid resolution {float(self.resolution.value()):g} m"
+                        f"Grid resolution {float(self.resolution.value()):g} m | "
+                        f"Plan scale 1:{selected_plan_scale_denominator}"
                     )
                     painter.setPen(QColor("#4B5563"))
                     painter.drawText(
@@ -25538,19 +26468,13 @@ out tags geom;
                     )
 
                     painter.fillRect(plan_rect, QColor("#FFFFFF"))
-                    source_rect = scene.itemsBoundingRect()
-                    if result is not None and result.xs.size and result.ys.size:
-                        result_rect = QRectF(
-                            float(result.xs[0]),
-                            float(result.ys[0]),
-                            max(0.01, float(result.xs[-1] - result.xs[0])),
-                            max(0.01, float(result.ys[-1] - result.ys[0])),
-                        )
-                        source_rect = source_rect.united(result_rect)
+                    source_rect = self._pdf_scaled_source_rect(
+                        floor,
+                        plan_rect,
+                        selected_plan_scale_denominator,
+                    )
                     if source_rect.isEmpty():
                         source_rect = QRectF(0.0, 0.0, 1.0, 1.0)
-                    pad = max(source_rect.width(), source_rect.height()) * 0.025
-                    source_rect = source_rect.adjusted(-pad, -pad, pad, pad)
 
                     painter.save()
                     painter.setClipRect(plan_rect)
